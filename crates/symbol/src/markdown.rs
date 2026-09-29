@@ -6,7 +6,7 @@
 //!
 //! The rendered page is meant to be restyled, so it looks nothing like the
 //! guide at `/`. Front matter in YAML (`---`) or TOML (`+++`) sets the title,
-//! theme and width defaults, adds CSS, stylesheets, scripts or raw `<head>`
+//! theme, font and width defaults, adds CSS, stylesheets, scripts or raw `<head>`
 //! HTML, and toggles features. Raw HTML in the body passes through untouched:
 //! authors can already host arbitrary HTML on this service, so the renderer has
 //! nothing to protect by restricting it, and flexibility is the point.
@@ -24,8 +24,9 @@ use serde_json::{Map, Value};
 pub const RENDER_LIMIT_BYTES: u64 = 4 * 1024 * 1024;
 
 const THEMES: [&str; 4] = ["auto", "light", "dark", "sepia"];
+const FONTS: [&str; 3] = ["sans", "serif", "mono"];
 const WIDTHS: [&str; 3] = ["narrow", "wide", "full"];
-const CONTROLS: [&str; 4] = ["theme", "width", "size", "raw"];
+const CONTROLS: [&str; 5] = ["theme", "font", "width", "size", "raw"];
 
 /// Whether `path` names a Markdown file.
 pub fn is_markdown(path: &str) -> bool {
@@ -231,6 +232,7 @@ struct Settings {
     description: Option<String>,
     lang: Option<String>,
     theme: &'static str,
+    font: &'static str,
     width: &'static str,
     css: Option<String>,
     stylesheets: Vec<String>,
@@ -254,6 +256,7 @@ impl Settings {
             description: reader.string("description"),
             lang: reader.string("lang"),
             theme: reader.choice("theme", &THEMES, "auto"),
+            font: reader.choice("font", &FONTS, "sans"),
             width: reader.choice("width", &WIDTHS, "narrow"),
             css: reader.string("css"),
             stylesheets: reader.strings(&["stylesheets", "stylesheet"]),
@@ -356,7 +359,7 @@ impl Reader<'_> {
             }
             Some(_) => {
                 self.problems.push(
-                    "`controls` must be true, false, or a list of theme, width, size, raw"
+                    "`controls` must be true, false, or a list of theme, font, width, size, raw"
                         .to_string(),
                 );
                 CONTROLS.to_vec()
@@ -639,6 +642,7 @@ fn document(
         (DOCTYPE)
         html lang=(settings.lang.as_deref().unwrap_or("en"))
             data-theme=(settings.theme)
+            data-font=(settings.font)
             data-width=(settings.width)
         {
             head {
@@ -669,7 +673,7 @@ fn document(
             }
             body class=[settings.body_class.as_deref()] {
                 @if !settings.controls.is_empty() {
-                    (controls(settings, page.raw_href, &show))
+                    (controls(page.raw_href, &show))
                 }
                 main class="symbol-markdown" {
                     @if !problems.is_empty() {
@@ -709,35 +713,69 @@ fn document(
 /// Reads the reader's saved theme, width and scale before first paint.
 ///
 /// Kept in step with `static/markdown.js`, which owns the same keys.
-const EARLY_PREFERENCES: &str = r#"(()=>{try{const s=localStorage,r=document.documentElement,o={theme:["auto","light","dark","sepia"],width:["narrow","wide","full"]};for(const k in o){const v=s.getItem("symbol-md-"+k);if(o[k].includes(v))r.dataset[k]=v}const z=[.85,.92,1,1.08,1.17,1.28][Number(s.getItem("symbol-md-scale"))];if(z)r.style.setProperty("--md-scale",String(z))}catch{}})()"#;
+const EARLY_PREFERENCES: &str = r#"(()=>{try{const s=localStorage,r=document.documentElement,o={theme:["auto","light","dark","sepia"],font:["sans","serif","mono"],width:["narrow","wide","full"]};for(const k in o){const v=s.getItem("symbol-md-"+k);if(o[k].includes(v))r.dataset[k]=v}const z=[.85,.92,1,1.08,1.17,1.28][Number(s.getItem("symbol-md-scale"))];if(z)r.style.setProperty("--md-scale",String(z))}catch{}})()"#;
 
-fn controls(settings: &Settings, raw_href: &str, show: &dyn Fn(&str) -> bool) -> Markup {
-    let _ = settings;
+fn controls(raw_href: &str, show: &dyn Fn(&str) -> bool) -> Markup {
+    let settings = ["theme", "font", "width", "size"].into_iter().any(show);
     html! {
         nav class="symbol-controls" aria-label="Reading controls" {
-            // Hidden until markdown.js wires them up; without script only the
-            // plain RAW link, which needs none, is offered.
-            @if show("theme") {
-                button type="button" data-symbol-action="theme" title="Theme" hidden {
-                    "\u{25d0} " span { "Auto" }
-                }
-            }
-            @if show("width") {
-                button type="button" data-symbol-action="width" title="Width" hidden {
-                    "\u{2194} " span { "Narrow" }
-                }
-            }
-            @if show("size") {
-                button type="button" data-symbol-action="smaller" title="Smaller text"
-                    aria-label="Smaller text" hidden { "A\u{2212}" }
-                button type="button" data-symbol-action="larger" title="Larger text"
-                    aria-label="Larger text" hidden { "A+" }
-            }
             @if show("raw") {
-                a class="symbol-raw" href=(raw_href) title="View the Markdown source" { "RAW" }
+                a class="md-button symbol-raw" href=(raw_href) title="View the exact Markdown source" {
+                    "RAW"
+                }
+            }
+            // Hidden until markdown.js wires it up; without script only the
+            // RAW link, which needs none, is offered.
+            @if settings {
+                details class="symbol-settings" hidden {
+                    summary class="md-button" title="Reading settings" aria-label="Reading settings" {
+                        span class="symbol-glyph" aria-hidden="true" { "Aa" }
+                    }
+                    div class="symbol-panel" {
+                        @if show("theme") { (choice_group("theme", "Theme", &THEMES)) }
+                        @if show("font") { (choice_group("font", "Font", &FONTS)) }
+                        @if show("width") { (choice_group("width", "Width", &WIDTHS)) }
+                        @if show("size") {
+                            div class="symbol-choice" role="group" aria-label="Text size" {
+                                span class="symbol-choice-label" aria-hidden="true" { "Size" }
+                                div class="symbol-choice-options" {
+                                    button type="button" class="md-button md-button-plain"
+                                        data-symbol-action="smaller" aria-label="Smaller text" { "A\u{2212}" }
+                                    button type="button" class="md-button md-button-plain"
+                                        data-symbol-action="reset-size" aria-label="Reset text size" { "100%" }
+                                    button type="button" class="md-button md-button-plain"
+                                        data-symbol-action="larger" aria-label="Larger text" { "A+" }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
+}
+
+fn choice_group(key: &str, label: &str, values: &[&str]) -> Markup {
+    html! {
+        div class="symbol-choice" role="group" aria-label=(label) {
+            span class="symbol-choice-label" aria-hidden="true" { (label) }
+            div class="symbol-choice-options" {
+                @for value in values {
+                    button type="button" class="md-button md-button-plain"
+                        data-symbol-set=(key) value=(value) aria-pressed="false" {
+                        (capitalized(value))
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn capitalized(word: &str) -> String {
+    let mut chars = word.chars();
+    chars.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(chars).collect()
+    })
 }
 
 fn table_of_contents(headings: &[Heading]) -> Markup {
@@ -920,15 +958,21 @@ mod tests {
             "{html}"
         );
         assert!(html.contains(r#"<meta name="description" content="A page">"#));
-        assert!(html.contains(r#"<html lang="fr" data-theme="dark" data-width="wide">"#));
+        assert!(
+            html.contains(
+                r#"<html lang="fr" data-theme="dark" data-font="sans" data-width="wide">"#
+            )
+        );
     }
 
     #[test]
     fn toml_front_matter_works_the_same() {
-        let html =
-            page("+++\ntitle = \"Tom\"\ntheme = \"sepia\"\ntoc = true\n+++\n## One\n## Two\n");
+        let html = page(
+            "+++\ntitle = \"Tom\"\ntheme = \"sepia\"\nfont = \"serif\"\ntoc = true\n+++\n## One\n## Two\n",
+        );
         assert!(html.contains("<title>Tom</title>"));
         assert!(html.contains(r#"data-theme="sepia""#));
+        assert!(html.contains(r#"data-font="serif""#));
         assert!(html.contains(r#"class="symbol-toc""#));
     }
 
@@ -977,20 +1021,34 @@ mod tests {
     #[test]
     fn controls_are_rendered_by_default_and_configurable() {
         let html = page("x");
-        for action in ["theme", "width", "smaller", "larger"] {
+        for (key, values) in [("theme", &THEMES[..]), ("font", &FONTS), ("width", &WIDTHS)] {
+            for value in values {
+                assert!(
+                    html.contains(&format!(r#"data-symbol-set="{key}" value="{value}""#)),
+                    "{key}={value}"
+                );
+            }
+        }
+        for action in ["smaller", "reset-size", "larger"] {
             assert!(
                 html.contains(&format!(r#"data-symbol-action="{action}""#)),
                 "{action}"
             );
         }
-        assert!(html.contains(r#"<a class="symbol-raw" href="notes.md/RAW""#));
+        assert!(html.contains(r#"<details class="symbol-settings" hidden>"#));
+        assert!(html.contains(r#"<a class="md-button symbol-raw" href="notes.md/RAW""#));
 
         let none = page("---\ncontrols: false\n---\nx");
         assert!(!none.contains("symbol-controls"));
 
         let some = page("---\ncontrols: [raw]\n---\nx");
         assert!(some.contains("symbol-raw"));
-        assert!(!some.contains(r#"data-symbol-action="theme""#));
+        assert!(!some.contains("symbol-settings"), "no empty settings panel");
+
+        let font_only = page("---\ncontrols: [font]\n---\nx");
+        assert!(font_only.contains(r#"data-symbol-set="font""#));
+        assert!(!font_only.contains(r#"data-symbol-set="theme""#));
+        assert!(!font_only.contains("symbol-raw"));
     }
 
     #[test]

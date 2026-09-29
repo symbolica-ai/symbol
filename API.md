@@ -1544,13 +1544,14 @@ thematic break. Recognised keys:
 | `description` | `<meta name="description">` | none |
 | `lang` | `<html lang>` | `en` |
 | `theme` | `auto`, `light`, `dark`, `sepia` | `auto` |
+| `font` | `sans`, `serif`, `mono` | `sans` |
 | `width` | `narrow`, `wide`, `full` | `narrow` |
 | `css` | inline CSS, appended last | none |
 | `stylesheet`, `stylesheets` | a URL or list of URLs | none |
 | `script`, `scripts` | a URL or list, loaded after the page's own | none |
 | `head` | raw HTML inserted into `<head>` | none |
 | `class` | classes on `<body>` | none |
-| `controls` | `true`, `false`, or any of `theme`, `width`, `size`, `raw` | `true` |
+| `controls` | `true`, `false`, or any of `theme`, `font`, `width`, `size`, `raw` | `true` |
 | `toc` | table of contents from `##` headings down | `false` |
 | `math` | KaTeX | `true` |
 | `highlight` | highlight.js | `true` |
@@ -1562,14 +1563,17 @@ in `<script type="application/json" id="symbol-front-matter">` for a page's own
 scripts to read. A value the renderer cannot use is not silently dropped: the
 page renders with the default and names the problem in a visible note.
 
-The reading controls let a reader cycle the theme and width, change the text
-size, and open the `RAW` source. They persist per origin in `localStorage`, so a
-reader's choice follows them to every Markdown page on this host and overrides
-the page's front-matter default. Without JavaScript only the `RAW` link, which
-needs none, is shown. Every colour, font, and measure is a CSS custom property
-on `:root` — among them `--md-bg`, `--md-fg`, `--md-accent`, `--md-font`,
+The reading controls are a `RAW` button and a settings button that opens a
+panel for theme, font, width, and text size. Choices persist per origin in
+`localStorage`, so a reader's choice follows them to every Markdown page on this
+host and overrides the page's front-matter default. Without JavaScript only the
+`RAW` link, which needs none, is shown. Every colour, font, and measure is a CSS
+custom property on `:root` — among them `--md-bg`, `--md-fg`, `--md-accent`
+(links), `--md-primary` and `--md-primary-edge` (buttons), `--md-font`,
 `--md-mono`, `--md-measure`, and `--md-line-height` — so front-matter `css`
-can retheme a page without replacing its stylesheet.
+can retheme a page without replacing its stylesheet. The controls' raised
+button style is available to page HTML as `class="md-button"`, and plain
+`<button>` elements in a page get it by default.
 
 ```markdown
 ---

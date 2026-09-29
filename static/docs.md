@@ -93,8 +93,8 @@ symbol sync
 ## markdown pages
 
 a `.md` file opens as a styled page in a browser: math, footnotes, highlighted
-code, and controls for theme, width, and text size. curl and the clients still
-get the file itself, and `RAW` always returns the exact bytes.
+code, and tucked-away controls for theme, font, width, and text size. curl and
+the clients still get the file itself, and `RAW` always returns the exact bytes.
 
 publish notes, then read the source back
 

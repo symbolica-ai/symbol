@@ -1,80 +1,151 @@
 /*
  * Rendered Markdown pages.
  *
- * Deliberately unlike the guide's man-page look: this is a reading layout
- * meant to be restyled. Every colour, font and measure is a custom property,
- * so a page can retheme itself from front matter with nothing more than
+ * Deliberately unlike the guide's man-page look: a warm reading layout with
+ * tactile, raised controls, meant to be restyled. Every colour, font and
+ * measure is a custom property, so a page can retheme itself from front
+ * matter with nothing more than
  *
- *     css: ":root { --md-accent: tomato; --md-font: Georgia, serif }"
+ *     css: ":root { --md-primary: tomato; --md-font: Georgia, serif }"
  *
  * Themes select a palette through `data-theme` on <html>: `auto` follows the
- * reader's system, and `light`, `dark` and `sepia` are fixed.
+ * reader's system, and `light`, `dark` and `sepia` are fixed. `data-font`
+ * (`sans`, `serif`, `mono`) and `data-width` (`narrow`, `wide`, `full`) work
+ * the same way.
+ *
+ * `.md-button` is the raised button used by the reading controls. Author HTML
+ * may use it too, on <a> or <button>; plain <button>s in a page get it anyway.
  */
 
 :root {
   --md-scale: 1;
-  --md-font: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial,
-    sans-serif;
-  --md-font-heading: var(--md-font);
+  --md-font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
+    Arial, sans-serif;
+  --md-font-serif: Charter, "Bitstream Charter", "Iowan Old Style", "Palatino Linotype", Palatino,
+    Georgia, serif;
   --md-mono: ui-monospace, "SFMono-Regular", "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
-  --md-line-height: 1.65;
+  --md-font: var(--md-font-sans);
+  --md-font-heading: var(--md-font);
+  --md-font-ui: var(--md-font-sans);
+  --md-line-height: 1.7;
   --md-measure: 46rem;
   --md-radius: 6px;
 
-  --md-bg: #fdfdfc;
-  --md-fg: #1d1f23;
-  --md-muted: #5d6470;
-  --md-border: #d9dde3;
-  --md-surface: #f3f4f6;
-  --md-accent: #3b5bdb;
-  --md-mark: #fff3bf;
-  --md-shadow: 0 1px 3px rgb(0 0 0 / 12%);
+  /* Butter: the light theme. */
+  --md-bg: #f6efdc;
+  --md-fg: #2e2618;
+  --md-muted: #75664b;
+  --md-border: #e0d2ae;
+  --md-surface: #efe5c9;
+  --md-raised: #fbf7eb;
+  --md-edge: #dccb9f;
+  --md-accent: #9a5a06;
+  --md-mark: #f7dc84;
+  --md-shadow: 0 3px 2px rgb(70 50 10 / 10%), 0 5px 10px rgb(70 50 10 / 7%),
+    0 10px 20px rgb(70 50 10 / 7%);
 
-  --md-note: #1c7ed6;
-  --md-tip: #2b8a3e;
-  --md-important: #7048e8;
-  --md-warning: #e67700;
-  --md-caution: #e03131;
+  --md-primary: #f3cd6a;
+  --md-primary-edge: #c9992f;
+  --md-primary-fg: #3f2b05;
+  --md-primary-text-shadow: 0 1px 0 rgb(255 255 255 / 45%);
+  --md-button-halo: rgb(255 255 255 / 55%);
 
-  --md-code-keyword: #cf222e;
-  --md-code-string: #0a3069;
-  --md-code-number: #0550ae;
-  --md-code-comment: #6e7781;
-  --md-code-title: #8250df;
-  --md-code-type: #953800;
-  --md-code-attr: #116329;
+  --md-note: #2f6fb0;
+  --md-tip: #3d7a2a;
+  --md-important: #7446b8;
+  --md-warning: #b86a00;
+  --md-caution: #c0392b;
+
+  --md-code-keyword: #b1361e;
+  --md-code-string: #4f6b16;
+  --md-code-number: #9a4d00;
+  --md-code-comment: #8a7a5c;
+  --md-code-title: #6d3fa0;
+  --md-code-type: #8a4f00;
+  --md-code-attr: #2f6f5e;
 
   color-scheme: light;
 }
 
 :root[data-theme="dark"] {
-  --md-bg: #15171b;
-  --md-fg: #e3e6ea;
-  --md-muted: #9aa1ab;
-  --md-border: #343a42;
-  --md-surface: #1f2329;
-  --md-accent: #91a7ff;
-  --md-mark: #5c4813;
-  --md-shadow: 0 1px 3px rgb(0 0 0 / 50%);
-  --md-code-keyword: #ff7b72;
-  --md-code-string: #a5d6ff;
-  --md-code-number: #79c0ff;
-  --md-code-comment: #8b949e;
-  --md-code-title: #d2a8ff;
-  --md-code-type: #ffa657;
-  --md-code-attr: #7ee787;
+  --md-bg: #1c1914;
+  --md-fg: #ece3cf;
+  --md-muted: #a99b80;
+  --md-border: #3b3428;
+  --md-surface: #26221b;
+  --md-raised: #2c271f;
+  --md-edge: #100e0a;
+  --md-accent: #f0c35e;
+  --md-mark: #6b5314;
+  --md-shadow: 0 3px 2px rgb(0 0 0 / 30%), 0 5px 10px rgb(0 0 0 / 22%), 0 10px 20px rgb(0 0 0 / 18%);
+  --md-primary: #e0b045;
+  --md-primary-edge: #8f6a1c;
+  --md-primary-fg: #2a1c02;
+  --md-primary-text-shadow: 0 1px 0 rgb(255 255 255 / 25%);
+  --md-button-halo: rgb(255 255 255 / 12%);
+  --md-note: #7fb2ea;
+  --md-tip: #8fcb72;
+  --md-important: #c3a1f2;
+  --md-warning: #f0a848;
+  --md-caution: #f0806f;
+  --md-code-keyword: #ff8f70;
+  --md-code-string: #b8d98a;
+  --md-code-number: #f5b971;
+  --md-code-comment: #8f846f;
+  --md-code-title: #dcb8ff;
+  --md-code-type: #ffc66d;
+  --md-code-attr: #9fd4c4;
   color-scheme: dark;
 }
 
+@media (prefers-color-scheme: dark) {
+  :root[data-theme="auto"] {
+    --md-bg: #1c1914;
+    --md-fg: #ece3cf;
+    --md-muted: #a99b80;
+    --md-border: #3b3428;
+    --md-surface: #26221b;
+    --md-raised: #2c271f;
+    --md-edge: #100e0a;
+    --md-accent: #f0c35e;
+    --md-mark: #6b5314;
+    --md-shadow: 0 3px 2px rgb(0 0 0 / 30%), 0 5px 10px rgb(0 0 0 / 22%),
+      0 10px 20px rgb(0 0 0 / 18%);
+    --md-primary: #e0b045;
+    --md-primary-edge: #8f6a1c;
+    --md-primary-fg: #2a1c02;
+    --md-primary-text-shadow: 0 1px 0 rgb(255 255 255 / 25%);
+    --md-button-halo: rgb(255 255 255 / 12%);
+    --md-note: #7fb2ea;
+    --md-tip: #8fcb72;
+    --md-important: #c3a1f2;
+    --md-warning: #f0a848;
+    --md-caution: #f0806f;
+    --md-code-keyword: #ff8f70;
+    --md-code-string: #b8d98a;
+    --md-code-number: #f5b971;
+    --md-code-comment: #8f846f;
+    --md-code-title: #dcb8ff;
+    --md-code-type: #ffc66d;
+    --md-code-attr: #9fd4c4;
+    color-scheme: dark;
+  }
+}
+
 :root[data-theme="sepia"] {
-  --md-bg: #f5ecd9;
-  --md-fg: #3a2f22;
-  --md-muted: #75654f;
-  --md-border: #dccfb3;
-  --md-surface: #ece0c7;
-  --md-accent: #8a4b12;
-  --md-mark: #f2d58c;
-  --md-font: Charter, "Bitstream Charter", "Iowan Old Style", Georgia, "Times New Roman", serif;
+  --md-bg: #eadcc0;
+  --md-fg: #3b2c1c;
+  --md-muted: #6f5b42;
+  --md-border: #d3c19c;
+  --md-surface: #e0cfae;
+  --md-raised: #f2e7d0;
+  --md-edge: #c4ad82;
+  --md-accent: #8a3f12;
+  --md-mark: #e8c07a;
+  --md-primary: #c47e46;
+  --md-primary-edge: #8f5428;
+  --md-primary-fg: #fff8ee;
+  --md-primary-text-shadow: 0 1px 0 rgb(0 0 0 / 30%);
   --md-code-keyword: #9c2e1c;
   --md-code-string: #3d5a1e;
   --md-code-number: #7a3e00;
@@ -85,25 +156,17 @@
   color-scheme: light;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root[data-theme="auto"] {
-    --md-bg: #15171b;
-    --md-fg: #e3e6ea;
-    --md-muted: #9aa1ab;
-    --md-border: #343a42;
-    --md-surface: #1f2329;
-    --md-accent: #91a7ff;
-    --md-mark: #5c4813;
-    --md-shadow: 0 1px 3px rgb(0 0 0 / 50%);
-    --md-code-keyword: #ff7b72;
-    --md-code-string: #a5d6ff;
-    --md-code-number: #79c0ff;
-    --md-code-comment: #8b949e;
-    --md-code-title: #d2a8ff;
-    --md-code-type: #ffa657;
-    --md-code-attr: #7ee787;
-    color-scheme: dark;
-  }
+/*
+ * The default font is `sans` with no attribute rule, so a page's own
+ * `:root { --md-font: ... }` still wins. A reader's explicit choice below
+ * outranks it, as reader choices should.
+ */
+:root[data-font="serif"] {
+  --md-font: var(--md-font-serif);
+}
+
+:root[data-font="mono"] {
+  --md-font: var(--md-mono);
 }
 
 :root[data-width="wide"] {
@@ -135,10 +198,101 @@ body {
   overflow-wrap: break-word;
 }
 
+::selection {
+  background: var(--md-mark);
+  color: var(--md-fg);
+}
+
 .symbol-markdown {
   max-width: var(--md-measure);
   margin: 0 auto;
-  padding: 3.5rem 1.5rem 5rem;
+  padding: 4.5rem 1.5rem 5rem;
+}
+
+/* Buttons, after a raised "button 180": a solid edge underneath, an inset
+ * shine on top, and a 3px press that swallows the edge. */
+
+.md-button,
+.markdown-body button {
+  --md-button-depth: 3px;
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.45em;
+  min-height: 2.25em;
+  padding: 0.55em 1.25em;
+  border: 1px solid var(--md-button-edge, var(--md-primary-edge));
+  border-radius: 4px;
+  outline: none;
+  background: var(--md-button-bg, var(--md-primary));
+  box-shadow: inset 0 30px 30px -15px rgb(255 255 255 / 12%),
+    inset 0 0 0 1px rgb(255 255 255 / 28%), inset 0 1px 20px rgb(0 0 0 / 0%),
+    0 var(--md-button-depth) 0 var(--md-button-edge, var(--md-primary-edge)),
+    0 3px 2px rgb(0 0 0 / 18%), 0 5px 10px rgb(0 0 0 / 8%), 0 10px 20px rgb(0 0 0 / 8%);
+  color: var(--md-button-fg, var(--md-primary-fg));
+  font-family: var(--md-font-ui);
+  font-size: 0.85em;
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: 0.08em;
+  text-decoration: none;
+  text-shadow: var(--md-button-text-shadow, var(--md-primary-text-shadow));
+  text-transform: uppercase;
+  cursor: pointer;
+  transform: translateY(0);
+  transition: transform 150ms ease, box-shadow 150ms ease, filter 150ms ease;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.md-button:hover,
+.markdown-body button:hover {
+  filter: brightness(1.04) saturate(1.06);
+}
+
+.md-button:active,
+.md-button[aria-pressed="true"],
+.markdown-body button:active,
+details[open] > summary.md-button {
+  box-shadow: inset 0 16px 2px -15px rgb(0 0 0 / 0%), inset 0 0 0 1px rgb(255 255 255 / 15%),
+    inset 0 1px 20px rgb(0 0 0 / 10%), 0 0 0 var(--md-button-edge, var(--md-primary-edge)),
+    0 0 0 2px var(--md-button-halo), 0 0 0 rgb(0 0 0 / 0%), 0 0 0 rgb(0 0 0 / 0%);
+  transform: translateY(var(--md-button-depth));
+}
+
+.md-button:focus-visible,
+.markdown-body button:focus-visible {
+  outline: 2px solid var(--md-accent);
+  outline-offset: 3px;
+}
+
+.md-button:disabled,
+.md-button[aria-disabled="true"],
+.markdown-body button:disabled {
+  border-color: transparent;
+  background: var(--md-surface);
+  box-shadow: none;
+  color: var(--md-muted);
+  text-shadow: none;
+  opacity: 0.65;
+  pointer-events: none;
+}
+
+/* A neutral button that lights up in the primary colour once pressed. */
+.md-button-plain {
+  --md-button-bg: var(--md-raised);
+  --md-button-edge: var(--md-edge);
+  --md-button-fg: var(--md-fg);
+  --md-button-text-shadow: none;
+}
+
+.md-button-plain[aria-pressed="true"] {
+  --md-button-bg: var(--md-primary);
+  --md-button-edge: var(--md-primary-edge);
+  --md-button-fg: var(--md-primary-fg);
+  --md-button-text-shadow: var(--md-primary-text-shadow);
 }
 
 /* Typography */
@@ -156,19 +310,20 @@ body {
   position: relative;
   margin: 2em 0 0.6em;
   font-family: var(--md-font-heading);
-  font-weight: 650;
+  font-weight: 700;
   line-height: 1.25;
-  scroll-margin-top: 1.5rem;
+  scroll-margin-top: 4.5rem;
 }
 
 .markdown-body h1 {
-  font-size: 2.1em;
-  letter-spacing: -0.01em;
+  font-size: 2.2em;
+  font-weight: 800;
+  letter-spacing: -0.015em;
 }
 
 .markdown-body h2 {
   padding-bottom: 0.3em;
-  border-bottom: 1px solid var(--md-border);
+  border-bottom: 2px solid var(--md-border);
   font-size: 1.55em;
 }
 
@@ -183,7 +338,9 @@ body {
 .markdown-body h5,
 .markdown-body h6 {
   color: var(--md-muted);
-  font-size: 0.95em;
+  font-size: 0.8em;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
 }
 
 .markdown-body .anchor {
@@ -208,26 +365,29 @@ body {
 .markdown-body pre,
 .markdown-body blockquote,
 .markdown-body figure {
-  margin: 0 0 1.1em;
+  margin: 0 0 1.15em;
 }
 
-.markdown-body a {
+.markdown-body a:not(.md-button, .anchor) {
   color: var(--md-accent);
   text-decoration: underline;
-  text-decoration-thickness: 1px;
+  text-decoration-color: color-mix(in srgb, var(--md-accent) 45%, transparent);
+  text-decoration-thickness: 1.5px;
   text-underline-offset: 0.18em;
+  transition: text-decoration-color 120ms ease;
 }
 
-.markdown-body a:hover {
-  text-decoration-thickness: 2px;
+.markdown-body a:not(.md-button, .anchor):hover {
+  text-decoration-color: currentcolor;
 }
 
 .markdown-body strong {
-  font-weight: 650;
+  font-weight: 700;
 }
 
 .markdown-body mark {
-  padding: 0 0.15em;
+  padding: 0 0.2em;
+  border-radius: 3px;
   background: var(--md-mark);
   color: inherit;
 }
@@ -239,9 +399,13 @@ body {
   height: auto;
 }
 
+.markdown-body img {
+  border-radius: var(--md-radius);
+}
+
 .markdown-body hr {
-  height: 1px;
-  margin: 2.2em 0;
+  height: 2px;
+  margin: 2.5em 0;
   border: 0;
   background: var(--md-border);
 }
@@ -259,8 +423,12 @@ body {
   margin-bottom: 0.4em;
 }
 
+.markdown-body li::marker {
+  color: var(--md-muted);
+}
+
 .markdown-body dt {
-  font-weight: 650;
+  font-weight: 700;
 }
 
 .markdown-body dd {
@@ -276,14 +444,32 @@ body {
 .markdown-body li > input[type="checkbox"] {
   margin: 0 0.45em 0 -1.35em;
   vertical-align: -0.05em;
-  accent-color: var(--md-accent);
+  accent-color: var(--md-primary-edge);
+}
+
+/* Raised surfaces share one look: a light face over a solid bottom edge. */
+
+.markdown-body pre,
+.markdown-body :is(
+    .markdown-alert-note,
+    .markdown-alert-tip,
+    .markdown-alert-important,
+    .markdown-alert-warning,
+    .markdown-alert-caution
+  ),
+.symbol-toc,
+.symbol-front-matter-error {
+  border: 1px solid var(--md-border);
+  border-radius: var(--md-radius);
+  background: var(--md-raised);
+  box-shadow: 0 3px 0 var(--md-edge);
 }
 
 /* Quotes and GitHub-style alerts */
 
 .markdown-body blockquote {
-  padding: 0.1em 1em;
-  border-left: 0.25em solid var(--md-border);
+  padding: 0.1em 1.1em;
+  border-left: 0.3em solid var(--md-primary);
   color: var(--md-muted);
 }
 
@@ -299,10 +485,9 @@ body {
     .markdown-alert-caution
   ) {
   --md-alert: var(--md-note);
-  padding: 0.7em 1em;
-  border-left-color: var(--md-alert);
-  border-radius: 0 var(--md-radius) var(--md-radius) 0;
-  background: color-mix(in srgb, var(--md-alert) 8%, transparent);
+  padding: 0.8em 1.1em;
+  border-left: 0.3em solid var(--md-alert);
+  background: color-mix(in srgb, var(--md-alert) 7%, var(--md-raised));
   color: var(--md-fg);
 }
 
@@ -314,9 +499,13 @@ body {
     .markdown-alert-caution
   )::before {
   display: block;
-  margin-bottom: 0.3em;
+  margin-bottom: 0.35em;
   color: var(--md-alert);
-  font-weight: 650;
+  font-family: var(--md-font-ui);
+  font-size: 0.75em;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
 }
 
 .markdown-body .markdown-alert-note::before {
@@ -365,26 +554,29 @@ body {
 }
 
 .markdown-body :not(pre) > code {
-  padding: 0.15em 0.4em;
+  padding: 0.12em 0.4em;
+  border: 1px solid color-mix(in srgb, var(--md-border) 70%, transparent);
   border-radius: 4px;
   background: var(--md-surface);
 }
 
 .markdown-body kbd {
-  padding: 0.1em 0.4em;
-  border: 1px solid var(--md-border);
-  border-bottom-width: 2px;
+  display: inline-block;
+  padding: 0.1em 0.45em;
+  border: 1px solid var(--md-edge);
   border-radius: 4px;
-  background: var(--md-surface);
+  background: var(--md-raised);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 35%), 0 2px 0 var(--md-edge);
+  font-size: 0.8em;
+  font-weight: 600;
+  line-height: 1.3;
+  transform: translateY(-1px);
 }
 
 .markdown-body pre {
   overflow: auto;
-  padding: 1em 1.1em;
-  border: 1px solid var(--md-border);
-  border-radius: var(--md-radius);
-  background: var(--md-surface);
-  line-height: 1.5;
+  padding: 1em 1.15em;
+  line-height: 1.55;
   tab-size: 4;
 }
 
@@ -466,7 +658,7 @@ body {
 }
 
 .hljs-strong {
-  font-weight: 650;
+  font-weight: 700;
 }
 
 /* Tables */
@@ -474,24 +666,44 @@ body {
 .markdown-body table {
   display: block;
   overflow: auto;
+  width: max-content;
   max-width: 100%;
-  border-collapse: collapse;
+  border: 1px solid var(--md-border);
+  border-radius: var(--md-radius);
+  border-collapse: separate;
+  border-spacing: 0;
+  background: var(--md-raised);
+  box-shadow: 0 3px 0 var(--md-edge);
   font-variant-numeric: tabular-nums;
 }
 
 .markdown-body th,
 .markdown-body td {
-  padding: 0.45em 0.85em;
-  border: 1px solid var(--md-border);
+  padding: 0.5em 0.9em;
+  border-bottom: 1px solid var(--md-border);
+}
+
+.markdown-body :is(th, td) + :is(th, td) {
+  border-left: 1px solid color-mix(in srgb, var(--md-border) 60%, transparent);
+}
+
+.markdown-body tr:last-child td {
+  border-bottom: 0;
 }
 
 .markdown-body th {
   background: var(--md-surface);
-  font-weight: 650;
+  color: var(--md-muted);
+  font-family: var(--md-font-ui);
+  font-size: 0.78em;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-align: left;
+  text-transform: uppercase;
 }
 
-.markdown-body tr:nth-child(even) td {
-  background: color-mix(in srgb, var(--md-surface) 45%, transparent);
+.markdown-body tbody tr:nth-child(even) td {
+  background: color-mix(in srgb, var(--md-surface) 40%, transparent);
 }
 
 /* Math */
@@ -500,7 +712,7 @@ body {
   display: block;
   overflow-x: auto;
   overflow-y: hidden;
-  margin: 0 0 1.1em;
+  margin: 0 0 1.15em;
   padding: 0.2em 0;
   text-align: center;
 }
@@ -524,7 +736,7 @@ body {
 .symbol-footnotes {
   margin-top: 3em;
   padding-top: 1em;
-  border-top: 1px solid var(--md-border);
+  border-top: 2px solid var(--md-border);
   color: var(--md-muted);
   font-size: 0.9em;
 }
@@ -533,6 +745,7 @@ body {
   display: flex;
   gap: 0.6em;
   margin-bottom: 0.6em;
+  padding: 0.1em 0.3em;
 }
 
 .symbol-footnotes .footnote-definition > p {
@@ -543,7 +756,7 @@ body {
   flex: none;
   min-width: 1.4em;
   color: var(--md-accent);
-  font-weight: 650;
+  font-weight: 700;
 }
 
 .symbol-footnotes .footnote-definition:target {
@@ -555,18 +768,17 @@ body {
 
 .symbol-toc {
   margin: 0 0 2.5em;
-  padding: 1em 1.2em;
-  border: 1px solid var(--md-border);
-  border-radius: var(--md-radius);
+  padding: 1em 1.25em;
   font-size: 0.92em;
 }
 
 .symbol-toc > strong {
   display: block;
-  margin-bottom: 0.4em;
+  margin-bottom: 0.5em;
   color: var(--md-muted);
-  font-size: 0.8em;
-  letter-spacing: 0.06em;
+  font-family: var(--md-font-ui);
+  font-size: 0.75em;
+  letter-spacing: 0.1em;
   text-transform: uppercase;
 }
 
@@ -593,10 +805,8 @@ body {
 
 .symbol-front-matter-error {
   margin: 0 0 2em;
-  padding: 0.8em 1em;
-  border-left: 0.25em solid var(--md-caution);
-  border-radius: 0 var(--md-radius) var(--md-radius) 0;
-  background: color-mix(in srgb, var(--md-caution) 8%, transparent);
+  padding: 0.8em 1.1em;
+  border-left: 0.3em solid var(--md-caution);
   font-size: 0.9em;
 }
 
@@ -604,63 +814,128 @@ body {
   font-family: var(--md-mono);
 }
 
-/* Reader controls */
+/* Reading controls: RAW, and a settings panel tucked behind one button.
+ * Sized in px so the chrome stays put while the reader scales the text. */
 
 .symbol-controls {
   position: fixed;
-  z-index: 10;
-  top: 0.75rem;
-  right: 0.75rem;
+  z-index: 20;
+  top: 14px;
+  right: 14px;
   display: flex;
-  gap: 0.25rem;
-  padding: 0.25rem;
+  align-items: flex-start;
+  gap: 10px;
+  font-family: var(--md-font-ui);
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.symbol-controls .md-button {
+  min-height: 34px;
+  padding: 0 14px;
+  font-size: 12px;
+}
+
+.symbol-settings > summary {
+  list-style: none;
+  letter-spacing: 0.02em;
+  text-transform: none;
+}
+
+.symbol-settings > summary::-webkit-details-marker {
+  display: none;
+}
+
+.symbol-settings > summary .symbol-glyph {
+  font-family: var(--md-font-serif);
+  font-size: 16px;
+  font-weight: 700;
+}
+
+.symbol-panel {
+  position: absolute;
+  top: calc(100% + 12px);
+  right: 0;
+  display: grid;
+  gap: 16px;
+  width: min(300px, calc(100vw - 28px));
+  padding: 16px;
   border: 1px solid var(--md-border);
-  border-radius: 999px;
-  background: color-mix(in srgb, var(--md-bg) 85%, transparent);
-  box-shadow: var(--md-shadow);
-  font-family: var(--md-font);
-  font-size: 0.8rem;
-  backdrop-filter: blur(8px);
-  -webkit-backdrop-filter: blur(8px);
-}
-
-.symbol-controls :is(button, a) {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.3em;
-  min-height: 1.9rem;
-  padding: 0 0.7rem;
-  border: 0;
-  border-radius: 999px;
-  background: transparent;
-  color: var(--md-muted);
-  font: inherit;
-  line-height: 1;
-  text-decoration: none;
-  cursor: pointer;
-}
-
-.symbol-controls :is(button, a):hover,
-.symbol-controls :is(button, a):focus-visible {
-  background: var(--md-surface);
+  border-radius: 10px;
+  background: var(--md-raised);
+  box-shadow: 0 4px 0 var(--md-edge), var(--md-shadow);
   color: var(--md-fg);
+  animation: symbol-panel-in 140ms ease-out;
 }
 
-.symbol-controls :is(button, a):focus-visible {
-  outline: 2px solid var(--md-accent);
-  outline-offset: 1px;
+@keyframes symbol-panel-in {
+  from {
+    opacity: 0;
+    transform: translateY(-6px);
+  }
 }
 
-.symbol-controls .symbol-raw {
-  color: var(--md-accent);
+.symbol-choice-label {
+  display: block;
+  margin-bottom: 8px;
+  color: var(--md-muted);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.symbol-choice-options {
+  display: flex;
+  gap: 8px;
+}
+
+.symbol-choice-options .md-button {
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 32px;
+  padding: 0 6px;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+}
+
+/* Each font option previews itself. */
+.symbol-choice-options [data-symbol-set="font"][value="sans"] {
+  font-family: var(--md-font-sans);
+}
+
+.symbol-choice-options [data-symbol-set="font"][value="serif"] {
+  font-family: var(--md-font-serif);
+}
+
+.symbol-choice-options [data-symbol-set="font"][value="mono"] {
   font-family: var(--md-mono);
-  font-weight: 600;
-  letter-spacing: 0.04em;
+}
+
+.symbol-choice-options [data-symbol-action="smaller"],
+.symbol-choice-options [data-symbol-action="larger"] {
+  flex: 0 0 44px;
+  font-size: 13px;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.symbol-choice-options [data-symbol-action="reset-size"] {
+  font-variant-numeric: tabular-nums;
 }
 
 @media (max-width: 40rem) {
   .symbol-markdown {
-    padding-top: 4rem;
+    padding-top: 4.5rem;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .md-button,
+  .markdown-body button,
+  .symbol-panel {
+    transition: none;
+    animation: none;
   }
 }
 
@@ -673,5 +948,10 @@ body {
   .symbol-markdown {
     max-width: none;
     padding: 0;
+  }
+
+  .markdown-body pre,
+  .markdown-body table {
+    box-shadow: none;
   }
 }
