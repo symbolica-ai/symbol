@@ -14,7 +14,7 @@
   const CHOICES = {
     theme: ["auto", "light", "dark", "sepia"],
     font: ["sans", "serif", "mono"],
-    width: ["narrow", "wide", "full"],
+    width: ["narrow", "medium", "wide", "full"],
   };
   const SCALES = [0.85, 0.92, 1, 1.08, 1.17, 1.28];
   const DEFAULT_SCALE = SCALES.indexOf(1);
@@ -36,6 +36,73 @@
     },
   };
 
+  // The server lists front matter and Markdown problems in this notice; the
+  // browser adds what only it can see. Text between backticks becomes code,
+  // the same convention the server uses.
+  const reported = new Set();
+  function report(message) {
+    const notice = document.querySelector(".symbol-problems");
+    const list = notice?.querySelector("ul");
+    if (!list || reported.has(message)) {
+      return;
+    }
+    reported.add(message);
+    const item = document.createElement("li");
+    message.split("`").forEach((part, index) => {
+      if (index % 2 === 1) {
+        const code = document.createElement("code");
+        code.textContent = part;
+        item.append(code);
+      } else {
+        item.append(part);
+      }
+    });
+    list.append(item);
+    notice.hidden = false;
+  }
+
+  const LOAD_KINDS = {
+    link: "stylesheet",
+    script: "script",
+    img: "image",
+    video: "video",
+    audio: "audio",
+    source: "media file",
+  };
+
+  function reportRecordedErrors() {
+    const recorded = document.symbolErrors ?? [];
+    for (const failure of recorded.splice(0)) {
+      if (failure.kind === "error") {
+        const where = failure.where ? ` (${failure.where})` : "";
+        report(`A script on this page failed: \`${failure.message}\`${where}.`);
+      } else {
+        const kind = LOAD_KINDS[failure.kind] ?? failure.kind;
+        report(`Could not load the ${kind} \`${failure.url}\`.`);
+      }
+    }
+  }
+
+  // Runs after every deferred script, including the page's own, so targets
+  // those scripts create are not reported.
+  function reportBrokenFragmentLinks() {
+    for (const link of document.querySelectorAll('.symbol-markdown a[href^="#"]')) {
+      const fragment = link.getAttribute("href").slice(1);
+      if (fragment === "") {
+        continue;
+      }
+      let id = fragment;
+      try {
+        id = decodeURIComponent(fragment);
+      } catch {
+        // Keep the raw fragment.
+      }
+      if (document.getElementById(id) === null && document.getElementsByName(id).length === 0) {
+        report(`The link to \`#${fragment}\` goes nowhere: nothing on this page has that id.`);
+      }
+    }
+  }
+
   function wireControls() {
     const settings = document.querySelector(".symbol-settings");
     if (settings === null) {
@@ -53,6 +120,9 @@
     if (!Number.isInteger(scale) || scale < 0 || scale >= SCALES.length) {
       scale = DEFAULT_SCALE;
     }
+    // Re-apply even the default: it also undoes anything a stale or corrupt
+    // stored value made the early inline script choose.
+    root.style.setProperty("--md-scale", String(SCALES[scale]));
 
     const refresh = () => {
       for (const button of choices) {
@@ -130,16 +200,28 @@
       if (node.classList.contains("katex-rendered")) {
         continue;
       }
+      const tex = node.textContent ?? "";
+      const options = {
+        displayMode: node.classList.contains("math-display"),
+        throwOnError: true,
+        output: "htmlAndMathml",
+      };
       try {
-        window.katex.render(node.textContent ?? "", node, {
-          displayMode: node.classList.contains("math-display"),
-          throwOnError: false,
-          output: "htmlAndMathml",
-        });
-        node.classList.add("katex-rendered");
+        window.katex.render(tex, node, options);
       } catch (error) {
-        node.title = String(error);
+        const shown = tex.length > 60 ? `${tex.slice(0, 57)}...` : tex;
+        // rawMessage omits the combining underlines KaTeX adds to `message`.
+        const reason = error.rawMessage ?? error.message;
+        const at = Number.isInteger(error.position) ? ` (at character ${error.position + 1})` : "";
+        report(`Math \`${shown.replace(/`/g, "'")}\` could not be typeset: ${reason}${at}.`);
+        try {
+          // Show KaTeX's inline error rendering in place of the formula.
+          window.katex.render(tex, node, { ...options, throwOnError: false });
+        } catch {
+          node.title = String(error);
+        }
       }
+      node.classList.add("katex-rendered");
     }
   }
 
@@ -158,9 +240,16 @@
   }
 
   function ready() {
+    reportRecordedErrors();
+    document.addEventListener("symbol:error", reportRecordedErrors);
     wireControls();
     renderMath();
     highlightCode();
+    if (document.readyState === "complete") {
+      reportBrokenFragmentLinks();
+    } else {
+      window.addEventListener("load", reportBrokenFragmentLinks, { once: true });
+    }
   }
 
   if (document.readyState === "loading") {

@@ -105,8 +105,11 @@ curl ${host}/hello/notes.md/RAW
 symbol raw hello/notes.md
 ```
 
-front matter sets the title, theme, and custom CSS; the protocol manual lists
-every option.
+front matter sets the title, theme, and custom CSS. mistakes, like an unknown
+option or a broken footnote, are listed at the top of the page.
+
+the [markdown guide](${host}/API/MARKDOWN) covers syntax, every option, and
+styling; it is itself a markdown page.
 
 ## API manuals
 
@@ -116,4 +119,5 @@ See [${host}/API/](${host}/API/)
 * [Python](${host}/API/PY)
 * [shell client](${host}/API/SH)
 * [curl and HTTP protocol](${host}/API/CURL)
+* [markdown pages](${host}/API/MARKDOWN)
 

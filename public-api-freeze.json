@@ -103,7 +103,7 @@
         "name": "api documentation",
         "method": "GET",
         "head": true,
-        "path": "/API[/]|/API/{JS|TS|PY|PYTHON|SH|CURL|HTTP|REST|PROTOCOL}",
+        "path": "/API[/]|/API/{JS|TS|PY|PYTHON|SH|CURL|HTTP|REST|PROTOCOL|MARKDOWN|MD}|/API/MARKDOWN/RAW",
         "success_statuses": [200, 304, 307],
         "error_statuses": [304, 404],
         "request_headers": ["Accept", "If-None-Match"],

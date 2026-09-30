@@ -737,7 +737,7 @@ mod tests {
             section
                 .blocks
                 .iter()
-                .any(|block| matches!(block, Block::List(items) if items.len() == 4))
+                .any(|block| matches!(block, Block::List(items) if items.len() == 5))
         }));
         assert!(page.sections.iter().any(|s| {
             s.blocks.iter().any(|b| {

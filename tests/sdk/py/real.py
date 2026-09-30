@@ -78,6 +78,7 @@ with tempfile.TemporaryDirectory() as root:
         assert symbol.api_client(api.ApiClientAsset.PYTHON).status == 200
         assert len(symbol.api_client_hash(api.ApiClientAsset.PYTHON)) == 64
         assert symbol.api_manual(api.ApiManual.PYTHON).status == 200
+        assert symbol.api_manual(api.ApiManual.MARKDOWN).text().startswith("---\n")
         document = symbol.api_version()
         assert document.api_version == api.API_VERSION_PARTS
         assert isinstance(document.commit, api.GitCommit)

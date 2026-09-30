@@ -10,8 +10,8 @@
  *
  * Themes select a palette through `data-theme` on <html>: `auto` follows the
  * reader's system, and `light`, `dark` and `sepia` are fixed. `data-font`
- * (`sans`, `serif`, `mono`) and `data-width` (`narrow`, `wide`, `full`) work
- * the same way.
+ * (`sans`, `serif`, `mono`) and `data-width` (`narrow`, `medium`, `wide`,
+ * `full`) work the same way.
  *
  * `.md-button` is the raised button used by the reading controls. Author HTML
  * may use it too, on <a> or <button>; plain <button>s in a page get it anyway.
@@ -19,16 +19,23 @@
 
 :root {
   --md-scale: 1;
-  --md-font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
-    Arial, sans-serif;
-  --md-font-serif: Charter, "Bitstream Charter", "Iowan Old Style", "Palatino Linotype", Palatino,
-    Georgia, serif;
+  /*
+   * Apple's faces first. Browsers only expose the system faces through
+   * keywords: SF Pro is -apple-system (Safari, Firefox), BlinkMacSystemFont
+   * (Chromium) and ui-sans-serif (Safari); New York is ui-serif (Safari
+   * only). The quoted names catch the faces when installed as ordinary fonts.
+   * `system-ui` comes late: off Apple platforms it is not Helvetica.
+   */
+  --md-font-sans: -apple-system, BlinkMacSystemFont, ui-sans-serif, "SF Pro Text", "SF Pro",
+    "Helvetica Neue", Helvetica, "Segoe UI", Roboto, system-ui, Arial, sans-serif;
+  --md-font-serif: ui-serif, "New York", "New York Small", Charter, "Bitstream Charter",
+    "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
   --md-mono: ui-monospace, "SFMono-Regular", "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
   --md-font: var(--md-font-sans);
   --md-font-heading: var(--md-font);
   --md-font-ui: var(--md-font-sans);
   --md-line-height: 1.7;
-  --md-measure: 46rem;
+  --md-measure: 58rem;
   --md-radius: 6px;
 
   /* Butter: the light theme. */
@@ -55,6 +62,8 @@
   --md-important: #7446b8;
   --md-warning: #b86a00;
   --md-caution: #c0392b;
+  /* Recomputed per theme, since the themes override the colours on :root. */
+  --md-toc-marker: color-mix(in srgb, var(--md-accent) 55%, var(--md-raised));
 
   --md-code-keyword: #b1361e;
   --md-code-string: #4f6b16;
@@ -157,8 +166,8 @@
 }
 
 /*
- * The default font is `sans` with no attribute rule, so a page's own
- * `:root { --md-font: ... }` still wins. A reader's explicit choice below
+ * The default font (`sans`) and width (`medium`) have no attribute rule, so a
+ * page's own `:root { --md-font: ...; --md-measure: ... }` still wins. A reader's explicit choice below
  * outranks it, as reader choices should.
  */
 :root[data-font="serif"] {
@@ -167,6 +176,10 @@
 
 :root[data-font="mono"] {
   --md-font: var(--md-mono);
+}
+
+:root[data-width="narrow"] {
+  --md-measure: 46rem;
 }
 
 :root[data-width="wide"] {
@@ -458,7 +471,7 @@ details[open] > summary.md-button {
     .markdown-alert-caution
   ),
 .symbol-toc,
-.symbol-front-matter-error {
+.symbol-problems {
   border: 1px solid var(--md-border);
   border-radius: var(--md-radius);
   background: var(--md-raised);
@@ -782,14 +795,38 @@ details[open] > summary.md-button {
   text-transform: uppercase;
 }
 
-.symbol-toc ul {
-  margin: 0;
-  padding-left: 1.1em;
+/* A literal monospaced `*` bullet, hung in the gutter so wrapped entries
+ * align with their text. Only the item's gutter indents, so each level steps
+ * in by exactly one, putting a child's bullet under its parent's first letter. */
+.symbol-toc {
+  --md-toc-gutter: 1.4em;
 }
 
-.symbol-toc > ul {
+.symbol-toc ul {
+  margin: 0;
   padding-left: 0;
   list-style: none;
+}
+
+.symbol-toc li {
+  position: relative;
+  padding-left: var(--md-toc-gutter);
+}
+
+.symbol-toc li + li,
+.symbol-toc li > ul {
+  margin-top: 0.15em;
+}
+
+.symbol-toc li::before {
+  position: absolute;
+  left: 0;
+  color: var(--md-toc-marker);
+  font-family: var(--md-mono);
+  font-weight: 700;
+  content: "*";
+  /* Decorative: keep screen readers from announcing "star" per entry. */
+  content: "*" / "";
 }
 
 .symbol-toc a {
@@ -801,17 +838,58 @@ details[open] > summary.md-button {
   color: var(--md-accent);
 }
 
-/* Front matter problems stay visible rather than silently ignored. */
+/* Problems stay visible rather than silently ignored: bad front matter,
+ * broken footnotes, failed loads, math errors and dead in-page links. */
 
-.symbol-front-matter-error {
+.symbol-problems {
   margin: 0 0 2em;
   padding: 0.8em 1.1em;
   border-left: 0.3em solid var(--md-caution);
-  font-size: 0.9em;
+  background: color-mix(in srgb, var(--md-caution) 6%, var(--md-raised));
+  font-family: var(--md-font-ui);
+  font-size: 0.88em;
+  line-height: 1.55;
 }
 
-.symbol-front-matter-error code {
+.symbol-problems[hidden] {
+  display: none;
+}
+
+.symbol-problems > strong {
+  display: block;
+  margin-bottom: 0.4em;
+  color: var(--md-caution);
+  font-size: 0.8em;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.symbol-problems ul {
+  margin: 0;
+  padding-left: 1.2em;
+}
+
+.symbol-problems-help {
+  margin: 0.6em 0 0;
+  color: var(--md-muted);
+  font-size: 0.92em;
+}
+
+.symbol-problems-help a {
+  color: var(--md-accent);
+}
+
+.symbol-problems li + li {
+  margin-top: 0.3em;
+}
+
+.symbol-problems code {
+  padding: 0.05em 0.35em;
+  border-radius: 3px;
+  background: var(--md-surface);
   font-family: var(--md-mono);
+  font-size: 0.92em;
+  overflow-wrap: anywhere;
 }
 
 /* Reading controls: RAW, and a settings panel tucked behind one button.
@@ -918,6 +996,21 @@ details[open] > summary.md-button {
   font-size: 13px;
   letter-spacing: 0;
   text-transform: none;
+}
+
+.symbol-guide-link {
+  padding-top: 12px;
+  border-top: 1px solid var(--md-border);
+  color: var(--md-muted);
+  font-size: 12px;
+  text-align: center;
+  text-decoration: none;
+}
+
+.symbol-guide-link:hover,
+.symbol-guide-link:focus-visible {
+  color: var(--md-accent);
+  text-decoration: underline;
 }
 
 .symbol-choice-options [data-symbol-action="reset-size"] {

@@ -34,6 +34,7 @@ sea-query = { version = "1.0.2", features = ["backend-sqlite", "derive"], defaul
 pulldown-cmark = { version = "0.13.4", default-features = false, features = ["html"] }
 toml = "1.1.4"
 saphyr = { version = "0.1.0", default-features = false }
+saphyr-parser = { version = "0.1.0", default-features = false }
 
 [dev-dependencies]
 proptest = "1.11.0"

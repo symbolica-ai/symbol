@@ -9,6 +9,9 @@ JavaScript, Python 3.14, POSIX shell, and raw HTTP.
 - [Shell client](/API/SH)
 - [HTTP, curl, and protocol reference](/API/CURL)
 
+Publishing documents? [Markdown pages](/API/MARKDOWN) covers how `.md` files
+render in a browser: syntax, front matter, theming, and scripts.
+
 Downloadable clients:
 
 - [`/symbol.ts`](/symbol.ts), [`/symbol.js`](/symbol.js),
@@ -78,7 +81,7 @@ Typed value/resource APIs additionally expose `apiIdentity`, `origin`,
 
 `apiClient` accepts only `symbol.ts`, `symbol.js`, `symbol.global.js`,
 `symbol.d.ts`, and `symbol.py`. `apiManual` accepts only `index`, `javascript`, `typescript`,
-`python`, `shell`, and `protocol`.
+`python`, `shell`, `protocol`, and `markdown`.
 Metadata parses semantic versions into readonly `[major, minor, patch]`
 `ApiVersion` tuples and validates branded `Blake3` and `GitCommit` values;
 `API_VERSION` remains the canonical wire-format string.
@@ -1070,9 +1073,14 @@ rejected with `405` and `Allow: GET, HEAD`.
 ### `GET /API/{manual}`
 
 `/API/`, `/API/JS`, `/API/PY`, `/API/SH`, and `/API/CURL` are compiled from
-the marked sections in this file. JS/TS, PY/PYTHON, SH, and
-CURL/HTTP/REST/PROTOCOL aliases return identical bytes, ETags, cache policy,
-and canonical `Link`. HTML is negotiated for browsers; explicit Markdown or
+the marked sections in this file. JS/TS, PY/PYTHON, SH,
+CURL/HTTP/REST/PROTOCOL, and MARKDOWN/MD aliases return identical bytes,
+ETags, cache policy, and canonical `Link`.
+
+`/API/MARKDOWN` is the guide to Markdown pages. Its source is
+`static/markdown-guide.md`, and its HTML comes from the same renderer as a
+published `.md` file, once at startup. `/API/MARKDOWN/RAW` returns its Markdown
+whatever `Accept` asks for, as `RAW` does for a file. HTML is negotiated for browsers; explicit Markdown or
 plain requests receive the canonical section. Responses use `no-cache`,
 `Vary: Accept, User-Agent`, and support `If-None-Match`.
 
@@ -1520,74 +1528,21 @@ else receives the source: `curl` and the SDKs send `*/*`, and so does a page's
 own `fetch()`, which therefore keeps working for sites that render Markdown
 client-side. User-Agent is deliberately not consulted. Both representations
 carry `Vary: Accept`. The rendering is `200` with
-`Content-Type: text/html; charset=utf-8`, an `ETag` of the rendered bytes,
-`Accept-Ranges: none` because byte ranges into a generated document mean
-nothing, and `Link: </{name}/{path}/RAW>; rel="alternate"; type="text/markdown"`.
+`Content-Type: text/html; charset=utf-8`, `Accept-Ranges: none` because byte
+ranges into a generated document mean nothing, and
+`Link: </{name}/{path}/RAW>; rel="alternate"; type="text/markdown"`.
 Files above 4 MiB, and files that are not UTF-8, are always served as source.
 `RAW` never renders.
 
-Rendering supports CommonMark plus tables, footnotes (collected at the end),
-strikethrough, task lists, definition lists, `^superscript^`, GitHub alerts
-(`> [!NOTE]`, `TIP`, `IMPORTANT`, `WARNING`, `CAUTION`), heading attributes
-(`## Title {#id .class}`), and heading ids with hover anchors. Math in `$...$`,
-`$$...$$`, or a ```` ```math ```` fence is typeset by KaTeX; fenced code with a
-language is highlighted by highlight.js. Raw HTML, including `<script>` and
-`<style>`, passes through untouched.
+The rendering's `ETag` is `"md-"` and a digest of its inputs: the file's
+content hash, the name and path it is served under, and the renderer build. A
+matching `If-None-Match` is answered `304` without reading or rendering the
+file, and rendered pages are kept in a bounded in-memory cache under the same
+key, so a changed file is re-rendered on its next request and nothing else is.
 
-Optional front matter opens the file, as YAML between `---` lines or TOML
-between `+++` lines. It must be closed; a lone leading `---` is an ordinary
-thematic break. Recognised keys:
-
-| Key | Value | Default |
-| --- | --- | --- |
-| `title` | page `<title>` | first `#` heading, then file name |
-| `description` | `<meta name="description">` | none |
-| `lang` | `<html lang>` | `en` |
-| `theme` | `auto`, `light`, `dark`, `sepia` | `auto` |
-| `font` | `sans`, `serif`, `mono` | `sans` |
-| `width` | `narrow`, `wide`, `full` | `narrow` |
-| `css` | inline CSS, appended last | none |
-| `stylesheet`, `stylesheets` | a URL or list of URLs | none |
-| `script`, `scripts` | a URL or list, loaded after the page's own | none |
-| `head` | raw HTML inserted into `<head>` | none |
-| `class` | classes on `<body>` | none |
-| `controls` | `true`, `false`, or any of `theme`, `font`, `width`, `size`, `raw` | `true` |
-| `toc` | table of contents from `##` headings down | `false` |
-| `math` | KaTeX | `true` |
-| `highlight` | highlight.js | `true` |
-| `smart_punctuation` | curly quotes and dashes | `false` |
-
-Relative URLs resolve against the page, as they would in any HTML file.
-Unrecognised keys are ignored, and the whole front matter is published as JSON
-in `<script type="application/json" id="symbol-front-matter">` for a page's own
-scripts to read. A value the renderer cannot use is not silently dropped: the
-page renders with the default and names the problem in a visible note.
-
-The reading controls are a `RAW` button and a settings button that opens a
-panel for theme, font, width, and text size. Choices persist per origin in
-`localStorage`, so a reader's choice follows them to every Markdown page on this
-host and overrides the page's front-matter default. Without JavaScript only the
-`RAW` link, which needs none, is shown. Every colour, font, and measure is a CSS
-custom property on `:root` — among them `--md-bg`, `--md-fg`, `--md-accent`
-(links), `--md-primary` and `--md-primary-edge` (buttons), `--md-font`,
-`--md-mono`, `--md-measure`, and `--md-line-height` — so front-matter `css`
-can retheme a page without replacing its stylesheet. The controls' raised
-button style is available to page HTML as `class="md-button"`, and plain
-`<button>` elements in a page get it by default.
-
-```markdown
----
-title: Field notes
-theme: sepia
-toc: true
-css: ":root { --md-accent: #b5451b }"
----
-# Field notes
-
-Euler's identity is $e^{i\pi} + 1 = 0$.[^proof]
-
-[^proof]: See any complex analysis text.
-```
+What renders and how to style it, from syntax and front matter to theming,
+scripts, and the problems notice, is covered by the
+[Markdown guide](${host}/API/MARKDOWN), itself a rendered Markdown page.
 
 These control suffixes are reserved:
 
