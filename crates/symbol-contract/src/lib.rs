@@ -167,6 +167,9 @@ pub const API_CURL_MANUAL: &str = "/API/CURL";
 pub const API_HTTP_MANUAL: &str = "/API/HTTP";
 pub const API_REST_MANUAL: &str = "/API/REST";
 pub const API_PROTOCOL_MANUAL: &str = "/API/PROTOCOL";
+pub const API_MARKDOWN_MANUAL: &str = "/API/MARKDOWN";
+pub const API_MD_MANUAL: &str = "/API/MD";
+pub const API_MARKDOWN_RAW: &str = "/API/MARKDOWN/RAW";
 pub const API_VERSION: &str = "/API/VERSION";
 pub const API_PATH: &str = "/API/{*path}";
 pub const SITE_FILES: &str = "/{name}/FILES";
@@ -824,7 +827,7 @@ pub static ENDPOINTS: &[EndpointContract] = &[
         name: "api documentation",
         method: "GET",
         head: true,
-        path: "/API[/]|/API/{JS|TS|PY|PYTHON|SH|CURL|HTTP|REST|PROTOCOL}",
+        path: "/API[/]|/API/{JS|TS|PY|PYTHON|SH|CURL|HTTP|REST|PROTOCOL|MARKDOWN|MD}|/API/MARKDOWN/RAW",
         request_headers: &["Accept", "If-None-Match"],
         outcomes: &[
             EndpointOutcome {

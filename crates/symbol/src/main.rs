@@ -20,6 +20,7 @@ mod expiry;
 mod hash;
 mod http_cache;
 mod markdown;
+mod markdown_cache;
 mod mutation_http;
 mod name;
 mod page;
@@ -628,6 +629,18 @@ fn api_router() -> Router<App> {
             contract::API_PROTOCOL_MANUAL,
             api_manual_methods(get(api_protocol)),
         )
+        .route(
+            contract::API_MARKDOWN_MANUAL,
+            api_manual_methods(get(api_markdown)),
+        )
+        .route(
+            contract::API_MD_MANUAL,
+            api_manual_methods(get(api_markdown)),
+        )
+        .route(
+            contract::API_MARKDOWN_RAW,
+            api_manual_methods(get(api_markdown_raw)),
+        )
         .route(contract::API_VERSION, api_manual_methods(get(api_version)))
         .route(
             contract::API_PATH,
@@ -933,6 +946,15 @@ async fn api_shell(State(app): State<App>, headers: HeaderMap) -> Response {
 
 async fn api_protocol(State(app): State<App>, headers: HeaderMap) -> Response {
     page::respond(&headers, &app.pages, page::Special::ApiProtocol)
+}
+
+async fn api_markdown(State(app): State<App>, headers: HeaderMap) -> Response {
+    page::respond(&headers, &app.pages, page::Special::MarkdownGuide)
+}
+
+/// The guide's Markdown whatever the client asks for, as `RAW` is for a file.
+async fn api_markdown_raw(State(app): State<App>, headers: HeaderMap) -> Response {
+    page::respond_raw(&headers, &app.pages, page::Special::MarkdownGuide)
 }
 
 async fn api_version(headers: HeaderMap) -> Response {
@@ -2488,18 +2510,14 @@ async fn send_site_file(
     response
 }
 
-/// Renders a Markdown file, or `None` to fall back to its source.
-///
-/// Falls back rather than failing for anything that cannot sensibly be read
-/// as a document: a file over [`markdown::RENDER_LIMIT_BYTES`], or one that is
-/// not UTF-8.
-async fn send_rendered_markdown(
-    headers: &HeaderMap,
-    name: &str,
-    logical: &str,
-    hash: ContentHash,
+/// Reads and renders a file the cache did not have, and caches the result.
+async fn render_markdown_file(
     app: &App,
-) -> Option<Response> {
+    hash: ContentHash,
+    logical: &str,
+    raw_href: &str,
+    key: markdown_cache::Key,
+) -> Option<axum::body::Bytes> {
     let size = tokio::fs::metadata(app.store.blob_path(hash))
         .await
         .ok()?
@@ -2511,25 +2529,63 @@ async fn send_rendered_markdown(
         .run_store(move |store| store.read_blob(hash))
         .await
         .ok()?;
-    let source = std::str::from_utf8(&bytes).ok()?;
+    let path = logical.to_string();
+    let href = raw_href.to_string();
+    // Rendering a large document takes real CPU time; keep it off the threads
+    // that serve every other request.
+    let body = tokio::task::spawn_blocking(move || {
+        let source = std::str::from_utf8(&bytes).ok()?;
+        let assets = assets::base();
+        Some(axum::body::Bytes::from(markdown::render(&markdown::Page {
+            source,
+            path: &path,
+            raw_href: &href,
+            assets: &assets,
+        })))
+    })
+    .await
+    .ok()??;
+    markdown_cache::CACHE.insert(key, body.clone());
+    Some(body)
+}
 
-    let mut raw_href = format!("/{name}");
-    for segment in logical.split('/') {
-        raw_href.push('/');
-        mutation_http::encode_path_segment(&mut raw_href, segment);
+/// Renders a Markdown file, or `None` to fall back to its source.
+///
+/// Falls back rather than failing for anything that cannot sensibly be read
+/// as a document: a file over [`markdown::RENDER_LIMIT_BYTES`], or one that is
+/// not UTF-8.
+///
+/// The `ETag` names the rendering's inputs rather than its bytes, so a
+/// matching `If-None-Match` is answered before reading or rendering anything.
+/// Only a file that rendered can have produced that tag, and the tag covers
+/// its content hash, so the answer cannot be stale.
+async fn send_rendered_markdown(
+    headers: &HeaderMap,
+    name: &str,
+    logical: &str,
+    hash: ContentHash,
+    app: &App,
+) -> Option<Response> {
+    let key = markdown_cache::key(hash, name, logical);
+    let etag = markdown_cache::etag(&key);
+    let raw_href = markdown::raw_href(name, logical);
+    let vary = HeaderValue::from_static("Accept");
+    if let Some(mut response) =
+        http_cache::not_modified(headers, &etag, http_cache::Policy::Revalidate, Some(&vary))
+    {
+        add_target_expiry_headers(app, name, logical, response.headers_mut()).await;
+        return Some(response);
     }
-    raw_href.push_str("/RAW");
-    let assets = assets::base();
-    let body = markdown::render(&markdown::Page {
-        source,
-        path: logical,
-        raw_href: &raw_href,
-        assets: &assets,
-    });
+
+    let body = match markdown_cache::CACHE.get(&key) {
+        Some(body) => body,
+        None => render_markdown_file(app, hash, logical, &raw_href, key).await?,
+    };
 
     let length = body.len();
     let mut representation = http_cache::Representation::new(body, "text/html; charset=utf-8");
-    representation.vary = Some(HeaderValue::from_static("Accept"));
+    representation.etag = Some(etag);
+    representation.vary = Some(vary);
     representation.link = HeaderValue::from_str(&format!(
         "<{raw_href}>; rel=\"alternate\"; type=\"text/markdown\""
     ))
@@ -3463,6 +3519,137 @@ mod tests {
         assert!(body.contains("<title>Notes</title>"));
         assert!(body.contains(r#"<span class="math math-inline">x^2</span>"#));
         assert!(body.contains(r#"href="/hello/docs/notes.md/RAW""#));
+    }
+
+    #[tokio::test]
+    async fn rendered_markdown_is_cached_and_keyed_by_content_hash() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::new(root.path().to_path_buf()).unwrap();
+        store.put_file("cache", "page.md", b"# First\n").unwrap();
+        let app = router(test_app(store.clone()));
+        let hash = |store: &Store| match store.lookup("cache", "page.md").unwrap() {
+            store::Node::File { hash, .. } => hash,
+            store::Node::Dir => unreachable!(),
+        };
+
+        let first_hash = hash(&store);
+        let key = markdown_cache::key(first_hash, "cache", "page.md");
+        let first = get_with(&app, "/cache/page.md", &BROWSER).await;
+        let etag = first.headers()[header::ETAG].to_str().unwrap().to_string();
+        assert_eq!(
+            etag,
+            markdown_cache::etag(&key),
+            "the ETag names the inputs"
+        );
+        assert!(markdown_cache::is_cached(&key), "the rendering was kept");
+        let again = get_with(&app, "/cache/page.md", &BROWSER).await;
+        assert_eq!(again.headers()[header::ETAG], etag.as_str());
+        assert!(
+            String::from_utf8(body_bytes(again).await)
+                .unwrap()
+                .contains("First")
+        );
+
+        let revalidated = get_with(
+            &app,
+            "/cache/page.md",
+            &[BROWSER[0], ("if-none-match", &etag)],
+        )
+        .await;
+        assert_eq!(revalidated.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(revalidated.headers()[header::VARY], "Accept");
+
+        // Changing the file changes its hash, so the old tag stops matching.
+        store.put_file("cache", "page.md", b"# Second\n").unwrap();
+        assert_ne!(hash(&store), first_hash);
+        let changed = get_with(
+            &app,
+            "/cache/page.md",
+            &[BROWSER[0], ("if-none-match", &etag)],
+        )
+        .await;
+        assert_eq!(changed.status(), StatusCode::OK);
+        assert_ne!(changed.headers()[header::ETAG], etag.as_str());
+        assert!(
+            String::from_utf8(body_bytes(changed).await)
+                .unwrap()
+                .contains("Second")
+        );
+    }
+
+    #[tokio::test]
+    async fn revalidating_a_rendering_reads_and_renders_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::new(root.path().to_path_buf()).unwrap();
+        store
+            .put_file("cold", "never-rendered.md", b"# Cold\n")
+            .unwrap();
+        let store::Node::File { hash, .. } = store.lookup("cold", "never-rendered.md").unwrap()
+        else {
+            unreachable!()
+        };
+        // With the stored bytes gone, anything that tried to read or render
+        // would fail; the conditional request must not need them.
+        std::fs::remove_file(store.blob_path(hash)).unwrap();
+        let app = router(test_app(store));
+        let etag = markdown_cache::etag(&markdown_cache::key(hash, "cold", "never-rendered.md"));
+        let response = get_with(
+            &app,
+            "/cold/never-rendered.md",
+            &[BROWSER[0], ("if-none-match", &etag)],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(response.headers()[header::ETAG], etag.as_str());
+    }
+
+    #[tokio::test]
+    async fn the_markdown_guide_is_served_under_api() {
+        let app = markdown_app();
+        let page = get_with(&app, "/API/MARKDOWN", &BROWSER).await;
+        assert_eq!(page.status(), StatusCode::OK);
+        assert_eq!(
+            page.headers()[header::CONTENT_TYPE],
+            "text/html; charset=utf-8"
+        );
+        assert_eq!(
+            page.headers()[header::LINK],
+            "</API/MARKDOWN>; rel=\"canonical\""
+        );
+        assert_contract_status("api documentation", page.status());
+        let etag = page.headers()[header::ETAG].clone();
+        let html = String::from_utf8(body_bytes(page).await).unwrap();
+        assert!(html.contains(r#"<article class="markdown-body">"#));
+
+        let alias = get_with(&app, "/API/MD", &BROWSER).await;
+        assert_eq!(alias.headers()[header::ETAG], etag, "MD is an alias");
+
+        let markdown = get_with(&app, "/API/MARKDOWN", &[("accept", "text/markdown")]).await;
+        assert_eq!(
+            markdown.headers()[header::CONTENT_TYPE],
+            "text/markdown; charset=utf-8"
+        );
+
+        let raw = get_with(&app, "/API/MARKDOWN/RAW", &BROWSER).await;
+        assert_eq!(raw.status(), StatusCode::OK);
+        assert_eq!(
+            raw.headers()[header::CONTENT_TYPE],
+            "text/markdown; charset=utf-8"
+        );
+        assert!(body_bytes(raw).await.starts_with(b"---\n"));
+
+        let rejected = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/API/MARKDOWN/RAW")
+                    .body(Body::from("x"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::METHOD_NOT_ALLOWED);
     }
 
     #[tokio::test]

@@ -343,6 +343,7 @@ class ApiManual(StrEnum):
     PYTHON = "python"
     SHELL = "shell"
     PROTOCOL = "protocol"
+    MARKDOWN = "markdown"
 
 
 class ManagementAction(StrEnum):
@@ -400,6 +401,8 @@ def _api_manual_path(manual: ApiManual) -> str:
             return "/API/SH"
         case ApiManual.PROTOCOL:
             return "/API/CURL"
+        case ApiManual.MARKDOWN:
+            return "/API/MARKDOWN"
 
 
 @dataclass(frozen=True, slots=True)

@@ -2496,6 +2496,7 @@ dependencies = [
  "proptest",
  "pulldown-cmark",
  "saphyr",
+ "saphyr-parser",
  "sea-query",
  "serde",
  "serde_json",

@@ -1667,7 +1667,14 @@ export type ApiClientAsset =
   | "symbol.global.js"
   | "symbol.d.ts"
   | "symbol.py";
-export type ApiManual = "index" | "javascript" | "typescript" | "python" | "shell" | "protocol";
+export type ApiManual =
+  | "index"
+  | "javascript"
+  | "typescript"
+  | "python"
+  | "shell"
+  | "protocol"
+  | "markdown";
 
 export class SymbolClient {
   constructor(options: SymbolClientOptions = {}) {
@@ -3596,6 +3603,8 @@ function apiManualPath(manual: ApiManual): string {
       return "/API/SH";
     case "protocol":
       return "/API/CURL";
+    case "markdown":
+      return "/API/MARKDOWN";
   }
 }
 

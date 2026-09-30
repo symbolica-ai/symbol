@@ -5,6 +5,10 @@
 //! flavour, fills in `${host}`, and builds the response. One table, one code
 //! path: before this the guide parsed markdown in-process while the manuals
 //! were served verbatim with no substitution at all.
+//!
+//! The Markdown guide is the one exception: its HTML comes from the renderer
+//! that serves users' `.md` files, once at startup, so the guide demonstrates
+//! every feature it describes exactly as a published page would show it.
 
 use axum::http::{HeaderMap, HeaderValue, header};
 use axum::response::Response;
@@ -56,7 +60,11 @@ pub enum Special {
     ApiPython,
     ApiShell,
     ApiProtocol,
+    MarkdownGuide,
 }
+
+/// The Markdown guide's source, also what non-browsers and `RAW` receive.
+const MARKDOWN_GUIDE: &str = include_str!("../../../static/markdown-guide.md");
 
 struct Template {
     html: &'static str,
@@ -69,13 +77,14 @@ struct Template {
 }
 
 impl Special {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Guide,
         Self::ApiIndex,
         Self::ApiJavaScript,
         Self::ApiPython,
         Self::ApiShell,
         Self::ApiProtocol,
+        Self::MarkdownGuide,
     ];
 
     const fn index(self) -> usize {
@@ -86,6 +95,7 @@ impl Special {
             Self::ApiPython => 3,
             Self::ApiShell => 4,
             Self::ApiProtocol => 5,
+            Self::MarkdownGuide => 6,
         }
     }
 
@@ -124,6 +134,8 @@ impl Special {
                 generated_page!("api-doc-protocol.md"),
                 "</API/CURL>; rel=\"canonical\"",
             ),
+            // The HTML is rendered in `Rendered::new`, not at build time.
+            Self::MarkdownGuide => manual("", MARKDOWN_GUIDE, "</API/MARKDOWN>; rel=\"canonical\""),
         }
     }
 }
@@ -167,9 +179,15 @@ impl Rendered {
                 .iter()
                 .map(|page| {
                     let template = page.template();
+                    let plain = fill(template.plain, host, name);
+                    let html = if *page == Special::MarkdownGuide {
+                        render_markdown_guide(&plain)
+                    } else {
+                        fill(template.html, &escaped_host, &escaped_name)
+                    };
                     Bodies {
-                        html: fill(template.html, &escaped_host, &escaped_name),
-                        plain: fill(template.plain, host, name),
+                        html,
+                        plain,
                         man: fill(template.man, host, name),
                     }
                 })
@@ -191,6 +209,25 @@ impl Rendered {
     pub fn guide_plain(&self) -> &str {
         self.body(Special::Guide, Flavor::Plain)
     }
+}
+
+fn render_markdown_guide(source: &str) -> String {
+    let assets = crate::assets::base();
+    crate::markdown::render(&crate::markdown::Page {
+        source,
+        path: "MARKDOWN",
+        raw_href: "/API/MARKDOWN/RAW",
+        assets: &assets,
+    })
+}
+
+/// A page's Markdown regardless of `Accept`, for `/API/MARKDOWN/RAW`.
+pub fn respond_raw(headers: &HeaderMap, rendered: &Rendered, page: Special) -> Response {
+    let template = page.template();
+    let mut representation =
+        Representation::new(rendered.body(page, Flavor::Plain).to_owned(), MARKDOWN_TYPE);
+    representation.link = Some(HeaderValue::from_static(template.link_plain));
+    http_cache::respond(headers, representation)
 }
 
 /// Negotiates a flavour and returns the prerendered page.
@@ -430,6 +467,37 @@ mod tests {
                 "{page:?} did not revalidate"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn the_markdown_guide_is_a_rendered_page_with_no_problems() {
+        let rendered = Rendered::new("https://symbol.test");
+        let html = rendered.body(Special::MarkdownGuide, Flavor::Html);
+        assert!(
+            html.contains(r#"<article class="markdown-body">"#),
+            "rendered by the Markdown renderer"
+        );
+        assert!(
+            html.contains(r#"href="/API/MARKDOWN/RAW""#),
+            "its RAW button shows its source"
+        );
+        assert!(
+            html.contains(r#"aria-label="Problems with this page" hidden>"#),
+            "the guide must pass its own checks"
+        );
+        assert!(html.contains("https://symbol.test"));
+
+        let markdown = respond(&accept("text/markdown"), &rendered, Special::MarkdownGuide);
+        assert_eq!(markdown.headers()[header::CONTENT_TYPE], MARKDOWN_TYPE);
+        assert!(body_of(markdown).await.starts_with("---\n"));
+
+        let raw = respond_raw(&accept("text/html"), &rendered, Special::MarkdownGuide);
+        assert_eq!(raw.headers()[header::CONTENT_TYPE], MARKDOWN_TYPE);
+        assert!(
+            raw.headers().get(header::VARY).is_none(),
+            "RAW is never negotiated"
+        );
+        assert!(body_of(raw).await.contains("https://symbol.test"));
     }
 
     #[test]

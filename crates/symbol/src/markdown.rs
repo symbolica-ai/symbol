@@ -25,7 +25,7 @@ pub const RENDER_LIMIT_BYTES: u64 = 4 * 1024 * 1024;
 
 const THEMES: [&str; 4] = ["auto", "light", "dark", "sepia"];
 const FONTS: [&str; 3] = ["sans", "serif", "mono"];
-const WIDTHS: [&str; 3] = ["narrow", "wide", "full"];
+const WIDTHS: [&str; 4] = ["narrow", "medium", "wide", "full"];
 const CONTROLS: [&str; 5] = ["theme", "font", "width", "size", "raw"];
 
 /// Whether `path` names a Markdown file.
@@ -87,22 +87,45 @@ pub struct Page<'a> {
     pub assets: &'a str,
 }
 
+/// Where the Markdown guide is served; pages link to it for help.
+pub const GUIDE: &str = "/API/MARKDOWN";
+
+/// The URL of a file's exact bytes: its path with `/RAW` appended.
+pub fn raw_href(name: &str, path: &str) -> String {
+    let mut href = format!("/{name}");
+    for segment in path.split('/') {
+        href.push('/');
+        crate::mutation_http::encode_path_segment(&mut href, segment);
+    }
+    href.push_str("/RAW");
+    href
+}
+
 /// Renders a Markdown file as a complete HTML document.
 pub fn render(page: &Page<'_>) -> String {
     let (front_matter, body) = split_front_matter(page.source);
     let mut problems = Vec::new();
     let data = match front_matter {
-        None => Value::Object(Map::new()),
-        Some((syntax, text)) => match parse_front_matter(syntax, text) {
-            Ok(value) => value,
-            Err(problem) => {
-                problems.push(problem);
-                Value::Object(Map::new())
+        None => {
+            problems.extend(unclosed_front_matter(page.source));
+            Value::Object(Map::new())
+        }
+        Some((syntax, text)) => {
+            if syntax == Syntax::Yaml {
+                problems.extend(duplicate_yaml_keys(text));
             }
-        },
+            match parse_front_matter(syntax, text) {
+                Ok(value) => value,
+                Err(problem) => {
+                    problems.push(problem);
+                    Value::Object(Map::new())
+                }
+            }
+        }
     };
     let settings = Settings::from_front_matter(&data, &mut problems);
     let rendered = render_body(body, &settings);
+    problems.extend(rendered.problems.iter().cloned());
     let title = settings
         .title
         .clone()
@@ -153,17 +176,112 @@ fn split_front_matter(source: &str) -> (Option<(Syntax, &str)>, &str) {
     (None, source)
 }
 
+/// Explains front matter that was opened but never closed.
+///
+/// An unclosed `+++` means nothing in Markdown, so it is always a mistake. A
+/// lone `---` is a legitimate thematic break, so it is only reported when the
+/// next line reads like a front matter key.
+fn unclosed_front_matter(source: &str) -> Option<String> {
+    let text = source.strip_prefix('\u{feff}').unwrap_or(source);
+    let mut lines = text.lines();
+    match lines.next()?.trim_end() {
+        "+++" => Some(
+            "Front matter opened with `+++` on line 1 is never closed with `+++`, \
+             so it was not applied."
+                .to_string(),
+        ),
+        "---"
+            if lines
+                .find(|line| !line.trim().is_empty())
+                .is_some_and(looks_like_key) =>
+        {
+            Some(
+                "Front matter opened with `---` on line 1 is never closed with `---`, \
+                 so it was not applied and shows as text."
+                    .to_string(),
+            )
+        }
+        _ => None,
+    }
+}
+
+fn looks_like_key(line: &str) -> bool {
+    let Some((key, _)) = line.split_once(':') else {
+        return false;
+    };
+    let key = key.trim_end();
+    !key.is_empty()
+        && !line.starts_with(char::is_whitespace)
+        && key
+            .chars()
+            .all(|character| character.is_alphanumeric() || matches!(character, '_' | '-'))
+}
+
+/// Finds top-level YAML keys given more than once.
+///
+/// YAML loaders keep the last value without a word, which would silently
+/// discard the first; TOML already rejects duplicates as a parse error.
+fn duplicate_yaml_keys(text: &str) -> Vec<String> {
+    use saphyr_parser::{Event, Parser};
+    let mut problems = Vec::new();
+    let mut seen = HashMap::new();
+    let mut depth = 0usize;
+    let mut expect_key = true;
+    for item in Parser::new_from_str(text) {
+        let Ok((event, span)) = item else {
+            break;
+        };
+        match event {
+            Event::MappingStart(..) | Event::SequenceStart(..) => depth += 1,
+            Event::MappingEnd | Event::SequenceEnd => {
+                depth = depth.saturating_sub(1);
+                if depth == 1 {
+                    expect_key = !expect_key;
+                }
+            }
+            Event::Scalar(value, ..) if depth == 1 => {
+                if expect_key {
+                    let line = span.start.line() + 1;
+                    if let Some(first) = seen.insert(value.to_string(), line) {
+                        problems.push(format!(
+                            "Front matter: `{value}` is set on line {first} and again on \
+                             line {line}; only the last value was applied."
+                        ));
+                    }
+                }
+                expect_key = !expect_key;
+            }
+            Event::Alias(..) if depth == 1 => expect_key = !expect_key,
+            _ => {}
+        }
+    }
+    problems
+}
+
 fn parse_front_matter(syntax: Syntax, text: &str) -> Result<Value, String> {
     let value = match syntax {
         Syntax::Yaml => {
             use saphyr::LoadableYamlNode as _;
-            let documents = saphyr::Yaml::load_from_str(text)
-                .map_err(|error| format!("YAML front matter: {error}"))?;
+            let documents = saphyr::Yaml::load_from_str(text).map_err(|error| {
+                // saphyr counts lines from 1 within the block; the opening
+                // `---` is line 1 of the file.
+                format!(
+                    "Front matter: YAML error on line {}: {}. None of it was applied.",
+                    error.marker().line() + 1,
+                    error.info()
+                )
+            })?;
             documents.first().map_or(Value::Null, yaml_to_json)
         }
         Syntax::Toml => {
             let table: toml::Table = text.parse().map_err(|error: toml::de::Error| {
-                format!("TOML front matter: {}", error.message())
+                let line = error.span().map_or(2, |span| {
+                    text[..span.start.min(text.len())].matches('\n').count() + 2
+                });
+                format!(
+                    "Front matter: TOML error on line {line}: {}. None of it was applied.",
+                    error.message()
+                )
             })?;
             toml_to_json(toml::Value::Table(table))
         }
@@ -171,7 +289,11 @@ fn parse_front_matter(syntax: Syntax, text: &str) -> Result<Value, String> {
     match value {
         Value::Object(_) => Ok(value),
         Value::Null => Ok(Value::Object(Map::new())),
-        _ => Err("front matter must be a mapping of keys to values".to_string()),
+        _ => Err(
+            "Front matter must be a mapping of keys to values, such as `title: Notes`. \
+             None of it was applied."
+                .to_string(),
+        ),
     }
 }
 
@@ -222,10 +344,34 @@ fn toml_to_json(value: toml::Value) -> Value {
     }
 }
 
-/// The front matter keys the renderer understands.
+/// Every top-level front matter key the renderer accepts.
 ///
-/// Unknown keys are not an error: the whole front matter is also published to
-/// scripts on the page, so a site is free to invent its own.
+/// Anything else is reported, since a misspelt option would otherwise do
+/// nothing without a word. A page's own values belong under `data`, which is
+/// never interpreted; the whole front matter is still published to scripts.
+const KNOWN_KEYS: [&str; 19] = [
+    "title",
+    "description",
+    "lang",
+    "theme",
+    "font",
+    "width",
+    "css",
+    "stylesheet",
+    "stylesheets",
+    "script",
+    "scripts",
+    "head",
+    "class",
+    "controls",
+    "toc",
+    "math",
+    "highlight",
+    "smart_punctuation",
+    "data",
+];
+
+/// The front matter keys the renderer understands.
 #[allow(clippy::struct_excessive_bools)]
 struct Settings {
     title: Option<String>,
@@ -250,6 +396,11 @@ impl Settings {
     fn from_front_matter(data: &Value, problems: &mut Vec<String>) -> Self {
         let empty = Map::new();
         let map = data.as_object().unwrap_or(&empty);
+        for key in map.keys() {
+            if !KNOWN_KEYS.contains(&key.as_str()) {
+                problems.push(unknown_key(key));
+            }
+        }
         let mut reader = Reader { map, problems };
         Self {
             title: reader.string("title"),
@@ -257,7 +408,7 @@ impl Settings {
             lang: reader.string("lang"),
             theme: reader.choice("theme", &THEMES, "auto"),
             font: reader.choice("font", &FONTS, "sans"),
-            width: reader.choice("width", &WIDTHS, "narrow"),
+            width: reader.choice("width", &WIDTHS, "medium"),
             css: reader.string("css"),
             stylesheets: reader.strings(&["stylesheets", "stylesheet"]),
             scripts: reader.strings(&["scripts", "script"]),
@@ -279,6 +430,10 @@ struct Reader<'a> {
 }
 
 impl Reader<'_> {
+    fn report(&mut self, problem: &str) {
+        self.problems.push(format!("Front matter: {problem}"));
+    }
+
     fn string(&mut self, key: &str) -> Option<String> {
         match self.map.get(key)? {
             Value::String(text) => Some(text.clone()),
@@ -286,7 +441,7 @@ impl Reader<'_> {
             Value::Number(number) => Some(number.to_string()),
             Value::Bool(flag) => Some(flag.to_string()),
             _ => {
-                self.problems.push(format!("`{key}` must be a string"));
+                self.report(&format!("`{key}` must be text, not a list or mapping."));
                 None
             }
         }
@@ -297,7 +452,9 @@ impl Reader<'_> {
             None | Some(Value::Null) => default,
             Some(Value::Bool(flag)) => *flag,
             Some(_) => {
-                self.problems.push(format!("`{key}` must be true or false"));
+                self.report(&format!(
+                    "`{key}` must be `true` or `false`; using `{default}`."
+                ));
                 default
             }
         }
@@ -316,9 +473,9 @@ impl Reader<'_> {
         if let Some(found) = allowed.iter().find(|option| **option == wanted) {
             return found;
         }
-        self.problems.push(format!(
-            "`{key}: {wanted}` is not one of {}",
-            allowed.join(", ")
+        self.report(&format!(
+            "`{key}: {wanted}` is not one of {}; using `{default}`.",
+            code_list(allowed)
         ));
         default
     }
@@ -333,13 +490,13 @@ impl Reader<'_> {
                     for item in items {
                         match item {
                             Value::String(text) => out.push(text.clone()),
-                            _ => self.problems.push(format!("`{key}` entries must be URLs")),
+                            _ => {
+                                self.report(&format!("`{key}` entries must be URLs; skipped one."));
+                            }
                         }
                     }
                 }
-                Some(_) => self
-                    .problems
-                    .push(format!("`{key}` must be a URL or a list of URLs")),
+                Some(_) => self.report(&format!("`{key}` must be a URL or a list of URLs.")),
             }
         }
         out
@@ -351,17 +508,22 @@ impl Reader<'_> {
             Some(Value::Bool(false)) => Vec::new(),
             Some(Value::String(one)) => self.named_controls(std::slice::from_ref(one)),
             Some(Value::Array(items)) => {
-                let names: Vec<String> = items
-                    .iter()
-                    .filter_map(|item| item.as_str().map(str::to_string))
-                    .collect();
+                let mut names = Vec::new();
+                for item in items {
+                    match item.as_str() {
+                        Some(name) => names.push(name.to_string()),
+                        None => self.report(&format!(
+                            "`controls` entries must be names, not `{item}`; skipped it."
+                        )),
+                    }
+                }
                 self.named_controls(&names)
             }
             Some(_) => {
-                self.problems.push(
-                    "`controls` must be true, false, or a list of theme, font, width, size, raw"
-                        .to_string(),
-                );
+                self.report(&format!(
+                    "`controls` must be `true`, `false`, or a list of {}; showing them all.",
+                    code_list(&CONTROLS)
+                ));
                 CONTROLS.to_vec()
             }
         }
@@ -374,14 +536,63 @@ impl Reader<'_> {
             match CONTROLS.iter().find(|control| **control == name) {
                 Some(control) if !chosen.contains(control) => chosen.push(*control),
                 Some(_) => {}
-                None => self.problems.push(format!(
-                    "`controls` has unknown `{name}`; expected {}",
-                    CONTROLS.join(", ")
+                None => self.report(&format!(
+                    "`controls` has unknown `{name}`; expected {}.",
+                    code_list(&CONTROLS)
                 )),
             }
         }
         chosen
     }
+}
+
+/// Formats values as a readable list of code spans: `a`, `b` or `c`.
+fn code_list(values: &[&str]) -> String {
+    let quoted: Vec<String> = values.iter().map(|value| format!("`{value}`")).collect();
+    match quoted.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} or {last}", rest.join(", ")),
+        _ => quoted.concat(),
+    }
+}
+
+fn unknown_key(key: &str) -> String {
+    let normal = key.trim().to_ascii_lowercase().replace('-', "_");
+    let suggestion = KNOWN_KEYS
+        .iter()
+        .map(|known| (edit_distance(&normal, known), *known))
+        .filter(|(distance, known)| *distance <= 2 && *distance < known.len())
+        .min_by_key(|(distance, _)| *distance)
+        .map(|(_, known)| known);
+    suggestion.map_or_else(
+        || {
+            format!(
+                "Front matter: unknown option `{key}`, ignored. Your own values go under `data`."
+            )
+        },
+        |known| {
+            format!(
+                "Front matter: unknown option `{key}`; did you mean `{known}`? \
+                 Your own values go under `data`."
+            )
+        },
+    )
+}
+
+/// Levenshtein distance, for suggesting the option a typo meant.
+fn edit_distance(left: &str, right: &str) -> usize {
+    let right: Vec<char> = right.chars().collect();
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    for (row, left_char) in left.chars().enumerate() {
+        let mut current = vec![row + 1; right.len() + 1];
+        for (column, right_char) in right.iter().enumerate() {
+            let substitution = previous[column] + usize::from(left_char != *right_char);
+            current[column + 1] = substitution
+                .min(previous[column + 1] + 1)
+                .min(current[column] + 1);
+        }
+        previous = current;
+    }
+    previous[right.len()]
 }
 
 // ---------------------------------------------------------------------------
@@ -397,6 +608,7 @@ struct RenderedBody {
     html: String,
     headings: Vec<Heading>,
     first_h1: Option<String>,
+    problems: Vec<String>,
 }
 
 /// Renders the Markdown body, adding what plain CommonMark leaves out.
@@ -414,7 +626,8 @@ fn render_body(markdown: &str, settings: &Settings) -> RenderedBody {
         | Options::ENABLE_HEADING_ATTRIBUTES
         | Options::ENABLE_GFM
         | Options::ENABLE_DEFINITION_LIST
-        | Options::ENABLE_SUPERSCRIPT;
+        | Options::ENABLE_SUPERSCRIPT
+        | Options::ENABLE_SUBSCRIPT;
     if settings.math {
         options |= Options::ENABLE_MATH;
     }
@@ -423,9 +636,12 @@ fn render_body(markdown: &str, settings: &Settings) -> RenderedBody {
     }
 
     let mut rewriter = Rewriter::new(settings.math);
-    for event in Parser::new_ext(markdown, options) {
+    let parser = Parser::new_ext(markdown, options).into_offset_iter();
+    for event in intraword_scripts(markdown, parser) {
         rewriter.push(event);
     }
+    rewriter.flush_text();
+    let problems = rewriter.problems();
     let Rewriter {
         mut events,
         mut footnotes,
@@ -447,6 +663,127 @@ fn render_body(markdown: &str, settings: &Settings) -> RenderedBody {
         html,
         headings,
         first_h1,
+        problems,
+    }
+}
+
+/// Adds Pandoc-style `^sup^` and `~sub~` inside words: `H~2~O`, `2^10^`.
+///
+/// pulldown-cmark only honours these delimiters at word boundaries, so the
+/// intraword forms reach this point as literal text. Adjacent text events
+/// are joined and scanned; a pair of delimiters around a run with no spaces
+/// becomes the element. Only delimiters written literally count: not ones from
+/// character references, nor ones escaped as `\^` or `\~`.
+fn intraword_scripts<'a>(
+    source: &str,
+    parser: impl Iterator<Item = (Event<'a>, std::ops::Range<usize>)>,
+) -> Vec<Event<'a>> {
+    let mut out = Vec::new();
+    // Each text event, with where it starts in the source when it is a
+    // verbatim copy of it (so offsets inside it map straight back).
+    let mut run: Vec<(CowStr<'a>, Option<usize>)> = Vec::new();
+    let mut in_code_block = false;
+    // Open images and links, and whether each keeps its text literal: image
+    // alt text is plain text, and an autolink's text is its URL.
+    let mut literal: Vec<bool> = Vec::new();
+    for (event, range) in parser {
+        match event {
+            Event::Text(text) if !in_code_block && !literal.contains(&true) => {
+                let start = (source.get(range.clone()) == Some(&*text)).then_some(range.start);
+                run.push((text, start));
+            }
+            other => {
+                flush_scripts(source, &mut run, &mut out);
+                match &other {
+                    Event::Start(Tag::CodeBlock(_)) => in_code_block = true,
+                    Event::End(TagEnd::CodeBlock) => in_code_block = false,
+                    Event::Start(Tag::Image { .. }) => literal.push(true),
+                    Event::Start(Tag::Link { link_type, .. }) => literal.push(matches!(
+                        link_type,
+                        pulldown_cmark::LinkType::Autolink | pulldown_cmark::LinkType::Email
+                    )),
+                    Event::End(TagEnd::Image | TagEnd::Link) => {
+                        literal.pop();
+                    }
+                    _ => {}
+                }
+                out.push(other);
+            }
+        }
+    }
+    flush_scripts(source, &mut run, &mut out);
+    out
+}
+
+fn flush_scripts<'a>(
+    source: &str,
+    run: &mut Vec<(CowStr<'a>, Option<usize>)>,
+    out: &mut Vec<Event<'a>>,
+) {
+    let has_delimiter = run
+        .iter()
+        .any(|(text, start)| start.is_some() && text.contains(['^', '~']));
+    if !has_delimiter {
+        out.extend(run.drain(..).map(|(text, _)| Event::Text(text)));
+        return;
+    }
+    let mut text = String::new();
+    // Byte offsets of delimiters that were written literally in the source.
+    let mut live = std::collections::HashSet::new();
+    for (part, start) in run.drain(..) {
+        if let Some(start) = start {
+            for (index, _) in part.match_indices(['^', '~']) {
+                let escapes = source.as_bytes()[..start + index]
+                    .iter()
+                    .rev()
+                    .take_while(|byte| **byte == b'\\')
+                    .count();
+                if escapes % 2 == 0 {
+                    live.insert(text.len() + index);
+                }
+            }
+        }
+        text.push_str(&part);
+    }
+    let bytes = text.as_bytes();
+    let mut plain_from = 0;
+    let mut index = 0;
+    while index < bytes.len() {
+        let delimiter = bytes[index];
+        let opens = live.contains(&index)
+            // `~~` is strikethrough, never a subscript delimiter.
+            && !(delimiter == b'~' && (bytes.get(index + 1) == Some(&b'~')
+                || index > 0 && bytes[index - 1] == b'~'));
+        let close = opens.then(|| {
+            text[index + 1..]
+                .find(|character: char| {
+                    character.is_whitespace() || matches!(character, '^' | '~' | '[' | ']')
+                })
+                .map(|offset| index + 1 + offset)
+        });
+        if let Some(Some(end)) = close
+            && end > index + 1
+            && bytes[end] == delimiter
+            && live.contains(&end)
+            && !(delimiter == b'~' && bytes.get(end + 1) == Some(&b'~'))
+        {
+            if plain_from < index {
+                out.push(Event::Text(CowStr::from(
+                    text[plain_from..index].to_string(),
+                )));
+            }
+            let tag = if delimiter == b'^' { "sup" } else { "sub" };
+            out.push(Event::InlineHtml(CowStr::from(format!("<{tag}>"))));
+            out.push(Event::Text(CowStr::from(text[index + 1..end].to_string())));
+            out.push(Event::InlineHtml(CowStr::from(format!("</{tag}>"))));
+            index = end + 1;
+            plain_from = index;
+            continue;
+        }
+        index += 1;
+    }
+    if plain_from < text.len() {
+        out.push(Event::Text(CowStr::from(text[plain_from..].to_string())));
     }
 }
 
@@ -464,6 +801,16 @@ struct Rewriter<'a> {
     headings: Vec<Heading>,
     first_h1: Option<String>,
     used_ids: HashMap<String, usize>,
+    /// Every heading id emitted, to catch two headings given the same `{#id}`.
+    heading_ids: std::collections::HashSet<String>,
+    duplicate_ids: Vec<String>,
+    in_code_block: bool,
+    /// Consecutive prose text, scanned for footnote references that did not
+    /// resolve: pulldown-cmark leaves those as literal `[^label]` text.
+    pending_text: String,
+    unresolved_footnotes: Vec<String>,
+    footnote_references: std::collections::HashSet<String>,
+    footnote_definitions: Vec<String>,
 }
 
 impl<'a> Rewriter<'a> {
@@ -478,7 +825,72 @@ impl<'a> Rewriter<'a> {
             headings: Vec::new(),
             first_h1: None,
             used_ids: HashMap::new(),
+            heading_ids: std::collections::HashSet::new(),
+            duplicate_ids: Vec::new(),
+            in_code_block: false,
+            pending_text: String::new(),
+            unresolved_footnotes: Vec::new(),
+            footnote_references: std::collections::HashSet::new(),
+            footnote_definitions: Vec::new(),
         }
+    }
+
+    fn flush_text(&mut self) {
+        let text = std::mem::take(&mut self.pending_text);
+        let mut rest = text.as_str();
+        while let Some(start) = rest.find("[^") {
+            rest = &rest[start + 2..];
+            let Some(end) = rest.find(']') else {
+                break;
+            };
+            let label = &rest[..end];
+            if !label.is_empty()
+                && !label.contains(char::is_whitespace)
+                && !self.unresolved_footnotes.iter().any(|seen| seen == label)
+            {
+                self.unresolved_footnotes.push(label.to_string());
+            }
+            rest = &rest[end + 1..];
+        }
+    }
+
+    /// Problems found in the body, in reading order.
+    fn problems(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+        let defined: Vec<String> = self
+            .footnote_definitions
+            .iter()
+            .map(|label| label.to_lowercase())
+            .collect();
+        for label in &self.unresolved_footnotes {
+            if !defined.contains(&label.to_lowercase()) {
+                problems.push(format!(
+                    "Footnote `[^{label}]` is referenced but never defined, so it shows as text."
+                ));
+            }
+        }
+        let mut seen = Vec::new();
+        for label in &self.footnote_definitions {
+            let normal = label.to_lowercase();
+            if seen.contains(&normal) {
+                problems.push(format!(
+                    "Footnote `[^{label}]` is defined more than once; only the first is used."
+                ));
+                continue;
+            }
+            if !self.footnote_references.contains(&normal) {
+                problems.push(format!(
+                    "Footnote `[^{label}]` is defined but never referenced."
+                ));
+            }
+            seen.push(normal);
+        }
+        for id in &self.duplicate_ids {
+            problems.push(format!(
+                "Several headings have the id `{id}`; links to `#{id}` reach only the first."
+            ));
+        }
+        problems
     }
 
     /// Where finished events go: the footnote section or the main flow.
@@ -509,14 +921,33 @@ impl<'a> Rewriter<'a> {
             }
             return;
         }
+        match &event {
+            Event::Text(text) if !self.in_code_block => {
+                self.pending_text.push_str(text);
+            }
+            _ => self.flush_text(),
+        }
         match event {
             Event::Start(tag @ Tag::Heading { .. }) => self.heading = Some((tag, Vec::new())),
+            Event::End(TagEnd::CodeBlock) => {
+                self.in_code_block = false;
+                self.output().push(event);
+            }
+            Event::FootnoteReference(ref label) => {
+                self.footnote_references.insert(label.to_lowercase());
+                self.output().push(event);
+            }
             Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(ref info)))
                 if self.math && info.split_whitespace().next() == Some("math") =>
             {
                 self.math_fence = Some(String::new());
             }
-            Event::Start(Tag::FootnoteDefinition(_)) => {
+            Event::Start(Tag::CodeBlock(_)) => {
+                self.in_code_block = true;
+                self.output().push(event);
+            }
+            Event::Start(Tag::FootnoteDefinition(ref label)) => {
+                self.footnote_definitions.push(label.to_string());
                 self.in_footnote = true;
                 self.footnotes.push(event);
             }
@@ -544,9 +975,21 @@ impl<'a> Rewriter<'a> {
         };
         let text = plain_text(&inline);
         let id = id.map_or_else(
-            || unique_id(&slug(&text), &mut self.used_ids),
+            || {
+                // Skip past ids an explicit `{#id}` already took.
+                let base = slug(&text);
+                loop {
+                    let candidate = unique_id(&base, &mut self.used_ids);
+                    if !self.heading_ids.contains(&candidate) {
+                        break candidate;
+                    }
+                }
+            },
             |id| id.to_string(),
         );
+        if !self.heading_ids.insert(id.clone()) && !self.duplicate_ids.contains(&id) {
+            self.duplicate_ids.push(id.clone());
+        }
         let rank = heading_rank(level);
         if rank == 1 && self.first_h1.is_none() && !text.is_empty() {
             self.first_h1 = Some(text.clone());
@@ -656,7 +1099,7 @@ fn document(
                 link rel="alternate" type="text/markdown" href=(page.raw_href);
                 // Applies the reader's saved choices before first paint, so a
                 // dark-mode reader never sees a white flash.
-                script { (PreEscaped(EARLY_PREFERENCES)) }
+                script { (PreEscaped(EARLY_ERRORS)) ";" (PreEscaped(EARLY_PREFERENCES)) }
                 link rel="stylesheet" href={ (assets) "/markdown.css" };
                 @if settings.math {
                     link rel="stylesheet" href={ (assets) "/katex/katex.min.css" };
@@ -676,14 +1119,20 @@ fn document(
                     (controls(page.raw_href, &show))
                 }
                 main class="symbol-markdown" {
-                    @if !problems.is_empty() {
-                        aside class="symbol-front-matter-error" role="note" {
-                            strong { "Front matter was not fully applied." }
-                            ul {
-                                @for problem in problems {
-                                    li { (problem) }
-                                }
+                    // Always present so markdown.js can add what only a browser can
+                    // see: failed loads, math errors, broken in-page links.
+                    aside class="symbol-problems" role="note" aria-label="Problems with this page"
+                        hidden[problems.is_empty()]
+                    {
+                        strong { "Problems with this page" }
+                        ul {
+                            @for problem in problems {
+                                li { (problem_markup(problem)) }
                             }
+                        }
+                        p class="symbol-problems-help" {
+                            "The " a href={ (GUIDE) "#when-something-is-wrong" } { "Markdown guide" }
+                            " explains each check."
                         }
                     }
                     @if settings.toc && body.headings.iter().any(|heading| heading.level > 1) {
@@ -710,10 +1159,25 @@ fn document(
     }
 }
 
+/// Records resource load failures and uncaught script errors from the start.
+///
+/// Runs before any stylesheet or script is requested, so nothing is missed;
+/// `static/markdown.js` lists what it recorded in the page's problem notice.
+const EARLY_ERRORS: &str = r#"(()=>{const f=document.symbolErrors=[];addEventListener("error",e=>{const t=e.target;if(t instanceof Element){const u=t.currentSrc||t.src||t.href;if(u)f.push({kind:t.localName,url:String(u)})}else if(e instanceof ErrorEvent)f.push({kind:"error",message:e.message,where:e.filename?e.filename+":"+e.lineno:""});else return;document.dispatchEvent(new Event("symbol:error"))},true)})()"#;
+
+/// Renders a problem, with text between backticks as code.
+fn problem_markup(problem: &str) -> Markup {
+    html! {
+        @for (index, part) in problem.split('`').enumerate() {
+            @if index % 2 == 1 { code { (part) } } @else { (part) }
+        }
+    }
+}
+
 /// Reads the reader's saved theme, width and scale before first paint.
 ///
 /// Kept in step with `static/markdown.js`, which owns the same keys.
-const EARLY_PREFERENCES: &str = r#"(()=>{try{const s=localStorage,r=document.documentElement,o={theme:["auto","light","dark","sepia"],font:["sans","serif","mono"],width:["narrow","wide","full"]};for(const k in o){const v=s.getItem("symbol-md-"+k);if(o[k].includes(v))r.dataset[k]=v}const z=[.85,.92,1,1.08,1.17,1.28][Number(s.getItem("symbol-md-scale"))];if(z)r.style.setProperty("--md-scale",String(z))}catch{}})()"#;
+const EARLY_PREFERENCES: &str = r#"(()=>{try{const s=localStorage,r=document.documentElement,o={theme:["auto","light","dark","sepia"],font:["sans","serif","mono"],width:["narrow","medium","wide","full"]};for(const k in o){const v=s.getItem("symbol-md-"+k);if(o[k].includes(v))r.dataset[k]=v}const z=[.85,.92,1,1.08,1.17,1.28][s.getItem("symbol-md-scale")];if(z)r.style.setProperty("--md-scale",String(z))}catch{}})()"#;
 
 fn controls(raw_href: &str, show: &dyn Fn(&str) -> bool) -> Markup {
     let settings = ["theme", "font", "width", "size"].into_iter().any(show);
@@ -748,6 +1212,7 @@ fn controls(raw_href: &str, show: &dyn Fn(&str) -> bool) -> Markup {
                                 }
                             }
                         }
+                        a class="symbol-guide-link" href=(GUIDE) { "How to write and style Markdown pages" }
                     }
                 }
             }
@@ -982,15 +1447,216 @@ mod tests {
         assert!(page("just text").contains("<title>notes.md</title>"));
     }
 
+    fn problems(html: &str) -> Vec<String> {
+        let Some(start) = html.find(r#"<aside class="symbol-problems""#) else {
+            return Vec::new();
+        };
+        let notice = &html[start..html[start..].find("</aside>").unwrap() + start];
+        notice
+            .split("<li>")
+            .skip(1)
+            .map(|item| {
+                item.split("</li>")
+                    .next()
+                    .unwrap()
+                    .replace("<code>", "`")
+                    .replace("</code>", "`")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_clean_page_has_an_empty_hidden_notice() {
+        let html =
+            page("---\ntitle: Fine\ndata: {tags: [a, b], anything: {goes: here}}\n---\n# Hi\n");
+        assert!(
+            html.contains(r#"aria-label="Problems with this page" hidden>"#),
+            "{html}"
+        );
+        assert!(problems(&html).is_empty(), "{:?}", problems(&html));
+    }
+
+    #[test]
+    fn unknown_front_matter_options_are_reported_with_suggestions() {
+        let found = problems(&page(
+            "---\ntittle: Hi\nTheme: dark\nsmart-punctuation: true\nauthor: Sam\n---\nx",
+        ));
+        assert!(
+            found
+                .iter()
+                .any(|p| p.contains("unknown option `tittle`; did you mean `title`?")),
+            "{found:?}"
+        );
+        assert!(
+            found
+                .iter()
+                .any(|p| p.contains("`Theme`; did you mean `theme`?")),
+            "{found:?}"
+        );
+        assert!(
+            found
+                .iter()
+                .any(|p| p.contains("`smart-punctuation`; did you mean `smart_punctuation`?")),
+            "{found:?}"
+        );
+        assert!(
+            found.iter().any(|p| p
+                .contains("unknown option `author`, ignored. Your own values go under `data`.")),
+            "{found:?}"
+        );
+        assert_eq!(found.len(), 4, "{found:?}");
+    }
+
+    #[test]
+    fn duplicate_yaml_keys_are_reported_with_lines() {
+        let found = problems(&page(
+            "---\ntitle: One\nnested: {title: fine}\ntitle: Two\n---\nx",
+        ));
+        assert!(
+            found
+                .iter()
+                .any(|p| p.contains("`title` is set on line 2 and again on line 4")),
+            "{found:?}"
+        );
+        assert!(
+            !found.iter().any(|p| p.contains("line 3")),
+            "nested keys are separate: {found:?}"
+        );
+    }
+
+    #[test]
+    fn parse_errors_point_at_file_lines() {
+        let found = problems(&page("+++\ntitle = \"a\"\ntheme =\n+++\nx"));
+        assert!(
+            found
+                .iter()
+                .any(|p| p.starts_with("Front matter: TOML error on line 3")),
+            "{found:?}"
+        );
+        let found = problems(&page("+++\ntitle = \"a\"\ntitle = \"b\"\n+++\nx"));
+        assert!(
+            found.iter().any(|p| p.contains("duplicate key")),
+            "{found:?}"
+        );
+        let found = problems(&page("---\n- a\n- b\n---\nx"));
+        assert!(
+            found.iter().any(|p| p.contains("must be a mapping")),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn unclosed_front_matter_is_reported_but_a_thematic_break_is_not() {
+        let found = problems(&page("+++\ntitle = \"a\"\n\n# Body\n"));
+        assert!(
+            found
+                .iter()
+                .any(|p| p.contains("`+++` on line 1 is never closed")),
+            "{found:?}"
+        );
+        let found = problems(&page("---\ntitle: a\n\n# Body\n"));
+        assert!(
+            found
+                .iter()
+                .any(|p| p.contains("`---` on line 1 is never closed")),
+            "{found:?}"
+        );
+        assert!(problems(&page("---\n\nJust a rule, then prose: with a colon.\n")).is_empty());
+    }
+
+    #[test]
+    fn footnote_mistakes_are_reported() {
+        let found = problems(&page(concat!(
+            "Used[^a], missing[^nope], again[^nope].\n\n",
+            "```\ncode [^in-code] is fine\n```\n\n",
+            "[^a]: One.\n\n[^unused]: Two.\n\n[^a]: Again.\n"
+        )));
+        assert_eq!(
+            found,
+            [
+                "Footnote `[^nope]` is referenced but never defined, so it shows as text.",
+                "Footnote `[^unused]` is defined but never referenced.",
+                "Footnote `[^a]` is defined more than once; only the first is used.",
+            ],
+        );
+    }
+
+    #[test]
+    fn duplicate_heading_ids_are_reported_and_generated_ids_avoid_them() {
+        let html = page("## Intro {#same}\n\n## Other {#same}\n\n# setup {#setup}\n\n## Setup\n");
+        let found = problems(&html);
+        assert_eq!(
+            found,
+            ["Several headings have the id `same`; links to `#same` reach only the first."]
+        );
+        assert!(
+            html.contains(r#"id="setup-1""#),
+            "generated id steps past the explicit one: {html}"
+        );
+    }
+
+    #[test]
+    fn superscript_and_subscript_work_inside_words() {
+        let body = |source: &str| {
+            let html = page(source);
+            let start = html.find(r#"<article class="markdown-body">"#).unwrap();
+            html[start..html.find("</article>").unwrap()].to_string()
+        };
+        assert!(
+            body("H~2~O and ^super^script").contains("H<sub>2</sub>O and <sup>super</sup>script")
+        );
+        assert!(
+            body("x^2^ and 2^10^, E = mc^2^.")
+                .contains("x<sup>2</sup> and 2<sup>10</sup>, E = mc<sup>2</sup>.")
+        );
+        assert!(body("a ^up^ b ~down~ c").contains("a <sup>up</sup> b <sub>down</sub> c"));
+        assert!(body("~~strike~~ and ~sub~").contains("<del>strike</del> and <sub>sub</sub>"));
+        // Spaces, escapes, code and footnote syntax stay literal.
+        for literal in [
+            "~/path/file and ~user",
+            "cost ~5 and ~10",
+            r"2\^10\^ and H\~2\~O",
+            "`x^2^` in code",
+            "[^a][^b] undefined",
+            "a~~b~~c",
+            "<https://example.com/~alice/~bob>",
+        ] {
+            let html = body(literal);
+            assert!(
+                !html.contains("<sup>") && !html.contains("<sub>"),
+                "{literal}: {html}"
+            );
+        }
+        assert!(
+            !body("```\nH~2~O\n```\n").contains("<sub>"),
+            "code blocks are verbatim"
+        );
+        assert!(body("![H~2~O](water.png)").contains(r#"alt="H~2~O""#));
+        assert!(
+            body("[H~2~O](water.html)").contains("H<sub>2</sub>O</a>"),
+            "ordinary link text works"
+        );
+        // Headings keep the digits in their text, so ids and the TOC read right.
+        let html = page("---\ntoc: true\n---\n## Using H~2~O\n");
+        assert!(html.contains(r#"id="using-h2o""#), "{html}");
+    }
+
     #[test]
     fn bad_front_matter_is_reported_not_swallowed() {
         let html = page("---\ntitle: [unclosed\n---\nBody text\n");
-        assert!(html.contains("symbol-front-matter-error"), "{html}");
+        assert!(html.contains("YAML error on line 3"), "{html}");
         assert!(html.contains("Body text"), "the page still renders");
 
-        let html = page("---\ntheme: purple\ncontrols: [theme, sparkles]\n---\nx");
-        assert!(html.contains("`theme: purple` is not one of auto, light, dark, sepia"));
-        assert!(html.contains("unknown `sparkles`"));
+        let html = page("---\ntheme: purple\ncontrols: [theme, sparkles, 7]\n---\nx");
+        assert!(
+            html.contains(
+                "<code>theme: purple</code> is not one of <code>auto</code>, <code>light</code>, \
+             <code>dark</code> or <code>sepia</code>; using <code>auto</code>."
+            ),
+            "{html}"
+        );
+        assert!(html.contains("unknown <code>sparkles</code>"));
+        assert!(html.contains("entries must be names, not <code>7</code>"));
         assert!(
             html.contains(r#"data-theme="auto""#),
             "falls back to the default"
@@ -1036,6 +1702,10 @@ mod tests {
             );
         }
         assert!(html.contains(r#"<details class="symbol-settings" hidden>"#));
+        assert!(
+            html.contains(r#"data-width="medium""#),
+            "medium is the default"
+        );
         assert!(html.contains(r#"<a class="md-button symbol-raw" href="notes.md/RAW""#));
 
         let none = page("---\ncontrols: false\n---\nx");
