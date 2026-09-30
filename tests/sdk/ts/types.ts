@@ -8,6 +8,8 @@ import {
   type CachedFileInventory,
   type CachedTextAsset,
   ContentFormats,
+  type DisposableResponse,
+  type EndpointError,
   type ExpiryReport,
   type FileInventory,
   type FileReplaceReceipt,
@@ -61,6 +63,12 @@ type _ReplacementExact = Expect<NoOptional<FileReplaceReceipt>>;
 type _SpliceExact = Expect<NoOptional<SpliceReceipt>>;
 type _ExpiryExact = Expect<NoOptional<ExpiryReport>>;
 type _ApiVersionExact = Expect<NoOptional<SymbolApiVersion>>;
+type _RawErrors = Expect<Equal<EndpointError<"file raw">, EndpointError<"site file">>>;
+
+const raw: Operation<DisposableResponse> = site
+  .file("notes.md")
+  .raw({ range: "bytes=0-9", ifRange: `"${"a".repeat(64)}"` });
+const rawUrl: URL = site.file("notes.md").rawUrl;
 
 async function narrowing(): Promise<void> {
   const cached = await inventory;
@@ -115,6 +123,11 @@ async function narrowing(): Promise<void> {
   await using response = await site.file("data.bin").get();
   await response.arrayBuffer();
 
+  await using rawResponse = await raw;
+  if (rawResponse.status !== 304) {
+    await rawResponse.arrayBuffer();
+  }
+
   const hosted = await site.file("config.json").json<{ enabled: boolean }>();
   hosted.enabled.valueOf();
 }
@@ -146,6 +159,10 @@ new Operation<SymbolStats>({} as never);
 site.put("body", { idempotencyKey: "unsupported" });
 // @ts-expect-error unsupported file PUTs cannot accept idempotency keys.
 site.file("data.bin").put("body", { idempotencyKey: "unsupported" });
+// @ts-expect-error raw reads accept read validators, not mutation preconditions.
+site.file("notes.md").raw({ ifMatch: `"${"a".repeat(64)}"` });
+// @ts-expect-error the raw URL is fixed by the file path.
+site.file("notes.md").rawUrl = new URL("http://127.0.0.1:4340/other/RAW");
 // @ts-expect-error generated assets are a closed set.
 client.apiClient("api.rb");
 // @ts-expect-error manuals are a closed set.
@@ -160,4 +177,5 @@ void apiAsset;
 void apiManual;
 void alias;
 void splice;
+void rawUrl;
 void narrowing;

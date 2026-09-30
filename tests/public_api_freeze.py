@@ -9,7 +9,7 @@ import pathlib
 import subprocess
 
 EXPECTED_APPROVED_ADDITIONS_SHA256 = (
-    "f3202df99dc29ae0859733813f1af865de2eb34a365d525cd3a2377517e26242"
+    "0cbf6273d084aea3951067b52e0c6b7d8c36e23c8ef659acceed5841b3bf65bd"
 )
 
 

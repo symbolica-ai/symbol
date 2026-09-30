@@ -3154,10 +3154,23 @@ class FileClient:
     def url(self) -> str:
         return _url(self.site.symbol.origin, self.site.name, *self.path.split("/"))
 
+    @property
+    def raw_url(self) -> str:
+        return _url(
+            self.site.symbol.origin, self.site.name, *self.path.split("/"), "RAW"
+        )
+
     def get(self, options: RequestOptions = RequestOptions()) -> ApiResponse:
         return self.site.symbol._send(
             HttpMethod.GET,
             self.url,
+            headers=_options(replace(options, token=options.token or self.site.token)),
+        )
+
+    def raw(self, options: RequestOptions = RequestOptions()) -> ApiResponse:
+        return self.site.symbol._send(
+            HttpMethod.GET,
+            self.raw_url,
             headers=_options(replace(options, token=options.token or self.site.token)),
         )
 
@@ -3904,10 +3917,22 @@ class AsyncFileClient:
     def url(self) -> str:
         return _url(self.site.symbol.origin, self.site.name, *self.path.split("/"))
 
+    @property
+    def raw_url(self) -> str:
+        return _url(
+            self.site.symbol.origin, self.site.name, *self.path.split("/"), "RAW"
+        )
+
     async def get(self, options: RequestOptions = RequestOptions()) -> ApiResponse:
         options = replace(options, token=options.token or self.site.token)
         return await self.site.symbol._send(
             HttpMethod.GET, self.url, headers=_options(options)
+        )
+
+    async def raw(self, options: RequestOptions = RequestOptions()) -> ApiResponse:
+        options = replace(options, token=options.token or self.site.token)
+        return await self.site.symbol._send(
+            HttpMethod.GET, self.raw_url, headers=_options(options)
         )
 
     async def text(self) -> str:

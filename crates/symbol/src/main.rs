@@ -10,6 +10,7 @@ macro_rules! generated_asset {
     };
 }
 
+mod assets;
 mod blob_store;
 mod browse;
 #[cfg(test)]
@@ -18,6 +19,7 @@ mod database;
 mod expiry;
 mod hash;
 mod http_cache;
+mod markdown;
 mod mutation_http;
 mod name;
 mod page;
@@ -540,6 +542,7 @@ fn router(app: App) -> Router {
                 .fallback(site_root_method),
         )
         .route(contract::IMMUTABLE_BLOB, get(serve_immutable_blob))
+        .route(contract::RENDER_ASSET, get(render_asset))
         .route(
             contract::SITE_PATH,
             get(serve_path)
@@ -2375,7 +2378,47 @@ async fn serve_path(
     if let Some(rel) = strip_hash_path(&path) {
         return send_hash(&app, &name, rel).await;
     }
+    if let Some(rel) = strip_raw_path(&path) {
+        return send_raw(&app, &name, rel, &headers).await;
+    }
     serve_from(&app, &name, &path, &headers).await
+}
+
+fn strip_raw_path(path: &str) -> Option<&str> {
+    let path = path.trim_end_matches('/');
+    if path == "RAW" {
+        return Some("");
+    }
+    path.strip_suffix("/RAW")
+}
+
+/// Serves exactly the stored bytes at `rel`, with nothing layered on top.
+///
+/// The ordinary read path is allowed to be clever: it tries `.html` fallbacks,
+/// redirects to pretty URLs, resolves directory indexes, and renders markdown
+/// for browsers. `RAW` does none of that. It resolves `rel` the same way `HASH`
+/// does, so for any file the bytes it returns hash to what `HASH` reports.
+///
+/// A directory, including the site root, has no raw bytes and is `404`: mapping
+/// it to an index file would be exactly the augmentation `RAW` exists to avoid.
+async fn send_raw(app: &App, name: &str, rel: &str, headers: &HeaderMap) -> Response {
+    if rel.is_empty() {
+        return StoreError::NotFound.into_response();
+    }
+    let node = app
+        .run_store({
+            let name = name.to_string();
+            let rel = rel.to_string();
+            move |store| store.lookup(&name, &rel)
+        })
+        .await;
+    match node {
+        Ok(store::Node::File { logical, hash }) => {
+            send_expiring_blob(headers, name, &logical, hash, app).await
+        }
+        Ok(store::Node::Dir) | Err(StoreError::NotFound) => StoreError::NotFound.into_response(),
+        Err(err) => err.into_response(),
+    }
 }
 
 async fn serve_from(app: &App, name: &str, rel: &str, headers: &HeaderMap) -> Response {
@@ -2413,10 +2456,113 @@ async fn serve_from(app: &App, name: &str, rel: &str, headers: &HeaderMap) -> Re
             response
         }
         Ok(SiteGet::Node(store::Node::File { logical, hash })) => {
-            send_expiring_blob(headers, name, &logical, hash, app).await
+            send_site_file(headers, name, &logical, hash, app).await
         }
         Err(err) => err.into_response(),
     }
+}
+
+/// The ordinary file read, which may render Markdown for a browser.
+async fn send_site_file(
+    headers: &HeaderMap,
+    name: &str,
+    logical: &str,
+    hash: ContentHash,
+    app: &App,
+) -> Response {
+    if !markdown::is_markdown(logical) {
+        return send_expiring_blob(headers, name, logical, hash, app).await;
+    }
+    if markdown::wants_rendering(headers)
+        && let Some(response) = send_rendered_markdown(headers, name, logical, hash, app).await
+    {
+        return response;
+    }
+    let mut response = send_expiring_blob(headers, name, logical, hash, app).await;
+    // One URL, two representations chosen by `Accept`: caches must key on it
+    // for the source as well as for the rendering, or a shared cache could
+    // hand a browser's HTML to curl.
+    response
+        .headers_mut()
+        .insert(header::VARY, HeaderValue::from_static("Accept"));
+    response
+}
+
+/// Renders a Markdown file, or `None` to fall back to its source.
+///
+/// Falls back rather than failing for anything that cannot sensibly be read
+/// as a document: a file over [`markdown::RENDER_LIMIT_BYTES`], or one that is
+/// not UTF-8.
+async fn send_rendered_markdown(
+    headers: &HeaderMap,
+    name: &str,
+    logical: &str,
+    hash: ContentHash,
+    app: &App,
+) -> Option<Response> {
+    let size = tokio::fs::metadata(app.store.blob_path(hash))
+        .await
+        .ok()?
+        .len();
+    if size > markdown::RENDER_LIMIT_BYTES {
+        return None;
+    }
+    let bytes = app
+        .run_store(move |store| store.read_blob(hash))
+        .await
+        .ok()?;
+    let source = std::str::from_utf8(&bytes).ok()?;
+
+    let mut raw_href = format!("/{name}");
+    for segment in logical.split('/') {
+        raw_href.push('/');
+        mutation_http::encode_path_segment(&mut raw_href, segment);
+    }
+    raw_href.push_str("/RAW");
+    let assets = assets::base();
+    let body = markdown::render(&markdown::Page {
+        source,
+        path: logical,
+        raw_href: &raw_href,
+        assets: &assets,
+    });
+
+    let length = body.len();
+    let mut representation = http_cache::Representation::new(body, "text/html; charset=utf-8");
+    representation.vary = Some(HeaderValue::from_static("Accept"));
+    representation.link = HeaderValue::from_str(&format!(
+        "<{raw_href}>; rel=\"alternate\"; type=\"text/markdown\""
+    ))
+    .ok();
+    let mut response = http_cache::respond(headers, representation);
+    if response.status() == StatusCode::OK {
+        let response_headers = response.headers_mut();
+        response_headers.insert(
+            header::CONTENT_LENGTH,
+            HeaderValue::from_str(&length.to_string()).expect("valid content length"),
+        );
+        // A rendering is generated, so byte ranges into it mean nothing.
+        response_headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("none"));
+    }
+    add_target_expiry_headers(app, name, logical, response.headers_mut()).await;
+    Some(response)
+}
+
+/// Serves a built-in asset that rendered pages reference.
+async fn render_asset(
+    Path((bundle, path)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(asset) = assets::find(&bundle, &path) else {
+        return StoreError::NotFound.into_response();
+    };
+    let mut representation = http_cache::Representation::new(
+        axum::body::Bytes::from_static(asset.bytes),
+        asset.content_type,
+    );
+    representation.policy = http_cache::Policy::Immutable;
+    representation.nosniff = true;
+    http_cache::respond(&headers, representation)
 }
 
 enum SiteGet {
@@ -2594,15 +2740,12 @@ async fn send_expiring_blob(
         Ok(media_type) => media_type,
         Err(err) => return err.into_response(),
     };
-    let mut response = send_blob(
-        headers,
+    let media_type = with_default_charset(
         stored_media_type
             .as_deref()
             .unwrap_or_else(|| inferred.essence_str()),
-        hash,
-        app,
-    )
-    .await;
+    );
+    let mut response = send_blob(headers, &media_type, hash, app).await;
     let updated = app
         .run_store({
             let name = name.to_string();
@@ -2616,6 +2759,35 @@ async fn send_expiring_blob(
     }
     insert_expiry_headers(response.headers_mut(), &report);
     response
+}
+
+/// Labels text as UTF-8 unless it already names a charset.
+///
+/// `mime_guess` returns a bare essence such as `text/markdown`, and an unlabeled
+/// text response leaves the browser to guess the encoding -- usually
+/// windows-1252, which turns UTF-8 accents and emoji into mojibake. HTML and XML
+/// are left alone: both declare their own encoding in-band (`<meta charset>`,
+/// `<?xml encoding?>`), and an HTTP charset would silently override an author's
+/// explicit declaration.
+fn with_default_charset(media_type: &str) -> std::borrow::Cow<'_, str> {
+    let mut parameters = media_type.split(';');
+    let essence = parameters.next().unwrap_or_default().trim();
+    let is_text = essence
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("text/"));
+    let self_declaring =
+        essence.eq_ignore_ascii_case("text/html") || essence.eq_ignore_ascii_case("text/xml");
+    let declares_charset = parameters.any(|parameter| {
+        parameter
+            .trim()
+            .get(..8)
+            .is_some_and(|name| name.eq_ignore_ascii_case("charset="))
+    });
+    if is_text && !self_declaring && !declares_charset {
+        std::borrow::Cow::Owned(format!("{media_type}; charset=utf-8"))
+    } else {
+        std::borrow::Cow::Borrowed(media_type)
+    }
 }
 
 async fn add_target_expiry_headers(app: &App, name: &str, rel: &str, headers: &mut HeaderMap) {
@@ -3077,6 +3249,351 @@ mod tests {
             endpoint.has_status(code),
             "{name} does not declare observed status {code}"
         );
+    }
+
+    #[test]
+    fn text_media_types_are_labelled_utf8_unless_they_self_declare() {
+        for (given, expected) in [
+            ("text/markdown", "text/markdown; charset=utf-8"),
+            ("text/plain", "text/plain; charset=utf-8"),
+            ("text/css", "text/css; charset=utf-8"),
+            ("text/javascript", "text/javascript; charset=utf-8"),
+            ("text/csv", "text/csv; charset=utf-8"),
+            ("TEXT/Plain", "TEXT/Plain; charset=utf-8"),
+            // An explicit charset, in any case, is the author's and wins.
+            (
+                "text/plain; charset=iso-8859-1",
+                "text/plain; charset=iso-8859-1",
+            ),
+            ("text/plain;CHARSET=utf-16", "text/plain;CHARSET=utf-16"),
+            // Self-declaring formats: an HTTP charset would override `<meta>`.
+            ("text/html", "text/html"),
+            ("text/xml", "text/xml"),
+            // Not text at all.
+            ("application/json", "application/json"),
+            ("image/png", "image/png"),
+            ("application/octet-stream", "application/octet-stream"),
+            ("image/svg+xml", "image/svg+xml"),
+        ] {
+            assert_eq!(with_default_charset(given), expected, "{given}");
+        }
+    }
+
+    #[tokio::test]
+    async fn served_text_files_carry_a_charset() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::new(root.path().to_path_buf()).unwrap();
+        store
+            .put_file("hello", "notes.md", "# café ✓\n".as_bytes())
+            .unwrap();
+        store
+            .put_file("hello", "page.html", b"<meta charset=utf-8>")
+            .unwrap();
+        let app = router(test_app(store));
+
+        let response = app
+            .clone()
+            .oneshot(Request::get("/hello/notes.md").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/markdown; charset=utf-8"
+        );
+
+        let response = app
+            .oneshot(Request::get("/hello/page").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "text/html");
+    }
+
+    async fn get_with(app: &Router, path: &str, headers: &[(&str, &str)]) -> Response {
+        let mut request = Request::get(path);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        app.clone()
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    async fn body_bytes(response: Response) -> Vec<u8> {
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec()
+    }
+
+    #[tokio::test]
+    async fn raw_returns_exactly_the_bytes_hash_describes() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::new(root.path().to_path_buf()).unwrap();
+        let source = "# Title\n\nSome *markdown* with café.\n";
+        store
+            .put_file("hello", "notes.md", source.as_bytes())
+            .unwrap();
+        let app = router(test_app(store));
+
+        let raw = get_with(&app, "/hello/notes.md/RAW", &[]).await;
+        assert_eq!(raw.status(), StatusCode::OK);
+        assert_eq!(
+            raw.headers()[header::CONTENT_TYPE],
+            "text/markdown; charset=utf-8"
+        );
+        let raw_bytes = body_bytes(raw).await;
+        assert_eq!(raw_bytes, source.as_bytes());
+
+        let hash = body_bytes(get_with(&app, "/hello/notes.md/HASH", &[]).await).await;
+        assert_eq!(
+            String::from_utf8(hash).unwrap().trim(),
+            blake3::hash(&raw_bytes).to_hex().as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_is_never_augmented() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::new(root.path().to_path_buf()).unwrap();
+        store
+            .put_file("hello", "about.html", b"<p>about</p>")
+            .unwrap();
+        store
+            .put_file("hello", "index.html", b"<p>home</p>")
+            .unwrap();
+        let app = router(test_app(store));
+        let browser = [
+            ("accept", "text/html,application/xhtml+xml,*/*;q=0.8"),
+            ("user-agent", "Mozilla/5.0 (X11; Linux x86_64) Chrome/120"),
+        ];
+
+        // The ordinary read path redirects this to the pretty URL.
+        let pretty = get_with(&app, "/hello/about.html", &browser).await;
+        assert_eq!(pretty.status(), StatusCode::TEMPORARY_REDIRECT);
+        // RAW serves the exact path instead.
+        let exact = get_with(&app, "/hello/about.html/RAW", &browser).await;
+        assert_eq!(exact.status(), StatusCode::OK);
+        assert_eq!(body_bytes(exact).await, b"<p>about</p>");
+
+        // The ordinary read path falls back from `about` to `about.html`.
+        let fallback = get_with(&app, "/hello/about", &browser).await;
+        assert_eq!(fallback.status(), StatusCode::OK);
+        // RAW does not.
+        let missing = get_with(&app, "/hello/about/RAW", &browser).await;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        // Nor does it resolve a directory to its index.
+        let root_raw = get_with(&app, "/hello/RAW", &browser).await;
+        assert_eq!(root_raw.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            get_with(&app, "/hello/RAW/", &browser).await.status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_supports_ranges_and_revalidation() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::new(root.path().to_path_buf()).unwrap();
+        store.put_file("hello", "data.txt", b"abcdefgh").unwrap();
+        let app = router(test_app(store));
+
+        let partial = get_with(&app, "/hello/data.txt/RAW", &[("range", "bytes=2-4")]).await;
+        assert_eq!(partial.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(body_bytes(partial).await, b"cde");
+
+        let full = get_with(&app, "/hello/data.txt/RAW", &[]).await;
+        let etag = full.headers()[header::ETAG].to_str().unwrap().to_string();
+        let cached = get_with(&app, "/hello/data.txt/RAW", &[("if-none-match", &etag)]).await;
+        assert_eq!(cached.status(), StatusCode::NOT_MODIFIED);
+    }
+
+    const BROWSER: [(&str, &str); 2] = [
+        (
+            "accept",
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        ),
+        (
+            "user-agent",
+            "Mozilla/5.0 (Macintosh) AppleWebKit/537.36 Chrome/120",
+        ),
+    ];
+
+    fn markdown_app() -> Router {
+        let root = tempfile::tempdir().unwrap().keep();
+        let store = Store::new(root).unwrap();
+        store
+            .put_file(
+                "hello",
+                "docs/notes.md",
+                "---\ntitle: Notes\n---\n# Heading\n\nSome $x^2$ math.\n".as_bytes(),
+            )
+            .unwrap();
+        router(test_app(store))
+    }
+
+    #[tokio::test]
+    async fn browsers_get_rendered_markdown() {
+        let app = markdown_app();
+        let response = get_with(&app, "/hello/docs/notes.md", &BROWSER).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let headers = response.headers().clone();
+        assert_eq!(headers[header::CONTENT_TYPE], "text/html; charset=utf-8");
+        assert_eq!(headers[header::VARY], "Accept");
+        assert_eq!(headers[header::ACCEPT_RANGES], "none");
+        assert_eq!(
+            headers[header::LINK],
+            "</hello/docs/notes.md/RAW>; rel=\"alternate\"; type=\"text/markdown\""
+        );
+        // Still an ordinary `site file` 200 as far as the contract is concerned.
+        assert_contract_status("site file", response.status());
+        for required in [
+            "content-type",
+            "content-length",
+            "etag",
+            "cache-control",
+            "accept-ranges",
+        ] {
+            assert!(headers.contains_key(required), "missing {required}");
+        }
+        let body = String::from_utf8(body_bytes(response).await).unwrap();
+        assert_eq!(headers[header::CONTENT_LENGTH], body.len().to_string());
+        assert!(body.contains("<title>Notes</title>"));
+        assert!(body.contains(r#"<span class="math math-inline">x^2</span>"#));
+        assert!(body.contains(r#"href="/hello/docs/notes.md/RAW""#));
+    }
+
+    #[tokio::test]
+    async fn every_other_client_gets_the_source() {
+        let app = markdown_app();
+        let source = "---\ntitle: Notes\n---\n# Heading\n\nSome $x^2$ math.\n";
+        for headers in [
+            // curl
+            &[("accept", "*/*"), ("user-agent", "curl/8.5.0")][..],
+            // a browser `fetch()` sends `*/*` with a browser user agent
+            &[("accept", "*/*"), BROWSER[1]][..],
+            // asking for Markdown outright
+            &[("accept", "text/markdown"), BROWSER[1]][..],
+            &[][..],
+        ] {
+            let response = get_with(&app, "/hello/docs/notes.md", headers).await;
+            assert_eq!(response.status(), StatusCode::OK, "{headers:?}");
+            assert_eq!(
+                response.headers()[header::CONTENT_TYPE],
+                "text/markdown; charset=utf-8",
+                "{headers:?}"
+            );
+            assert_eq!(response.headers()[header::VARY], "Accept");
+            assert_eq!(body_bytes(response).await, source.as_bytes(), "{headers:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_never_renders_even_for_a_browser() {
+        let app = markdown_app();
+        let response = get_with(&app, "/hello/docs/notes.md/RAW", &BROWSER).await;
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/markdown; charset=utf-8"
+        );
+        assert!(body_bytes(response).await.starts_with(b"---\ntitle: Notes"));
+    }
+
+    #[tokio::test]
+    async fn oversized_or_non_utf8_markdown_is_served_raw() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::new(root.path().to_path_buf()).unwrap();
+        let limit = usize::try_from(markdown::RENDER_LIMIT_BYTES).unwrap();
+        store
+            .put_file("hello", "big.md", &vec![b'x'; limit + 1])
+            .unwrap();
+        store.put_file("hello", "latin1.md", b"caf\xe9\n").unwrap();
+        let app = router(test_app(store));
+        for path in ["/hello/big.md", "/hello/latin1.md"] {
+            let response = get_with(&app, path, &BROWSER).await;
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert_eq!(
+                response.headers()[header::CONTENT_TYPE],
+                "text/markdown; charset=utf-8",
+                "{path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rendered_pages_reference_assets_that_resolve() {
+        let app = markdown_app();
+        let page = get_with(&app, "/hello/docs/notes.md", &BROWSER).await;
+        let page = String::from_utf8(body_bytes(page).await).unwrap();
+        let mut checked = 0;
+        for attribute in ["href=\"/ASSETS/", "src=\"/ASSETS/"] {
+            for piece in page.split(attribute).skip(1) {
+                let path = format!("/ASSETS/{}", piece.split('"').next().unwrap());
+                let response = get_with(&app, &path, &[]).await;
+                assert_eq!(response.status(), StatusCode::OK, "{path}");
+                assert_eq!(
+                    response.headers()[header::CACHE_CONTROL],
+                    "public, max-age=31536000, immutable"
+                );
+                assert_eq!(
+                    response.headers()[header::X_CONTENT_TYPE_OPTIONS],
+                    "nosniff"
+                );
+                checked += 1;
+            }
+        }
+        assert!(
+            checked >= 5,
+            "expected css, katex css+js, highlight and page js; saw {checked}"
+        );
+    }
+
+    #[tokio::test]
+    async fn assets_revalidate_and_reject_other_bundles() {
+        let app = markdown_app();
+        let path = format!("{}/markdown.css", assets::base());
+        let first = get_with(&app, &path, &[]).await;
+        assert_eq!(
+            first.headers()[header::CONTENT_TYPE],
+            "text/css; charset=utf-8"
+        );
+        let etag = first.headers()[header::ETAG].to_str().unwrap().to_string();
+        let cached = get_with(&app, &path, &[("if-none-match", &etag)]).await;
+        assert_eq!(cached.status(), StatusCode::NOT_MODIFIED);
+
+        let stale = get_with(&app, "/ASSETS/0000000000000000/markdown.css", &[]).await;
+        assert_eq!(stale.status(), StatusCode::NOT_FOUND);
+        let missing = get_with(&app, &format!("{}/nope.css", assets::base()), &[]).await;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        let font = get_with(
+            &app,
+            &format!("{}/katex/fonts/KaTeX_Main-Regular.woff2", assets::base()),
+            &[],
+        )
+        .await;
+        assert_eq!(font.headers()[header::CONTENT_TYPE], "font/woff2");
+    }
+
+    #[tokio::test]
+    async fn raw_is_a_reserved_path_component() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::new(root.path().to_path_buf()).unwrap();
+        store.put_file("hello", "index.html", b"home").unwrap();
+        let app = router(test_app(store));
+        for path in ["/hello/RAW", "/hello/docs/RAW"] {
+            let response = app
+                .clone()
+                .oneshot(Request::put(path).body(Body::from("shadow")).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+            assert_eq!(
+                body_bytes(response).await,
+                format!("{}\n", contract::RESERVED_MUTATION_ERROR).as_bytes()
+            );
+        }
     }
 
     #[derive(Clone)]

@@ -43,8 +43,10 @@
       "api client hash",
       "api documentation",
       "api version",
+      "file raw",
       "file replace",
-      "file splice"
+      "file splice",
+      "render asset"
     ],
     "endpoint_contracts": [
       {
@@ -118,6 +120,16 @@
         "response_headers": ["Cache-Control", "Content-Type", "ETag"]
       },
       {
+        "name": "file raw",
+        "method": "GET",
+        "head": true,
+        "path": "/{name}/{path...}/RAW",
+        "success_statuses": [200, 206, 304],
+        "error_statuses": [304, 400, 404, 416],
+        "request_headers": ["Range", "If-Range", "If-None-Match"],
+        "response_headers": ["Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "ETag", "Cache-Control", "Expires"]
+      },
+      {
         "name": "file replace",
         "method": "REPLACE",
         "head": false,
@@ -136,6 +148,16 @@
         "error_statuses": [400, 401, 403, 404, 409, 412, 413, 416, 500],
         "request_headers": ["Authorization", "Content-Type", "Idempotency-Key", "If-Content-Match", "If-Match", "Splice"],
         "response_headers": ["Content-Revision", "Content-Type", "ETag", "Idempotency-Replayed", "Location", "Undo-Expires", "Undo-Token"]
+      },
+      {
+        "name": "render asset",
+        "method": "GET",
+        "head": true,
+        "path": "/ASSETS/{bundle}/{path...}",
+        "success_statuses": [200, 304],
+        "error_statuses": [304, 404],
+        "request_headers": ["If-None-Match"],
+        "response_headers": ["Cache-Control", "Content-Type", "ETag"]
       }
     ],
     "global_response_headers": [
@@ -222,7 +244,8 @@
       500
     ],
     "shell_commands": [
-      "alias"
+      "alias",
+      "raw"
     ],
     "sdk_assets": [
       "api.d.ts",

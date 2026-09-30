@@ -78,7 +78,7 @@ test("media types and content formats are immutable and exact", async () => {
     }
 });
 
-test("all 40 installed endpoint mappings execute exact decoders", async () => {
+test("all 41 installed endpoint mappings execute exact decoders", async () => {
     const server = await startMockServer(artifacts.fixture);
     const hash = "a".repeat(64);
     server.expect(
@@ -144,6 +144,7 @@ test("all 40 installed endpoint mappings execute exact decoders", async () => {
             headers: { accept: "application/json" },
         },
         { operation: "file hash", path: "/hello/data.bin/HASH" },
+        { operation: "file raw", path: "/hello/data.bin/RAW" },
         { operation: "undo stack", path: "/hello/UNDO" },
         { operation: "expiry inventory", path: "/hello/EXPIRES" },
         { operation: "expiry target", path: "/hello/data.bin/EXPIRES" },
@@ -252,6 +253,11 @@ test("all 40 installed endpoint mappings execute exact decoders", async () => {
     assert.equal(subtree.status, 200);
     assert.equal(subtree.entries[0].kind, "site");
     assert.equal((await site.file("data.bin").hash()).length, 64);
+    assert.equal(site.file("data.bin").rawUrl.href, `${server.origin}/hello/data.bin/RAW`);
+    const raw = await site.file("data.bin").raw();
+    assert.equal(raw.status, 200);
+    assert.equal(await raw.text(), "abcdefgh");
+    await raw[Symbol.asyncDispose]();
     assert.equal((await site.undoStack()).entries[0].kind, "put");
     assert.equal((await site.expiry()).entries.length, 1);
     assert.equal((await site.expiry("data.bin")).target.kind, "file");
@@ -283,7 +289,7 @@ test("all 40 installed endpoint mappings execute exact decoders", async () => {
         sourceHash: esm.SOURCE_HASH,
     });
     await server.stop();
-    assert.equal(server.requests.length, 40);
+    assert.equal(server.requests.length, 41);
 });
 
 test("segment encoding, credentials, naming, and custom allocation are exact", async () => {
@@ -1040,6 +1046,77 @@ test("typed HTTP errors preserve response details and malformed DTOs fail closed
         Promise.resolve(malformedVersion.stats()),
         esm.MissingApiIdentityError,
     );
+});
+
+test("raw forwards range and validators, maps read errors, and never follows redirects", async () => {
+    const server = await startMockServer(artifacts.fixture);
+    const etag = `"${"b".repeat(64)}"`;
+    server.expect(
+        {
+            operation: "file raw",
+            path: "/hello/notes%20dir/read%20me.md/RAW",
+            status: 206,
+            headers: { range: "bytes=0-1", "if-range": etag },
+        },
+        {
+            operation: "file raw",
+            path: "/hello/notes%20dir/read%20me.md/RAW",
+            status: 304,
+            headers: { "if-none-match": etag },
+        },
+        { operation: "file raw", path: "/hello/missing.md/RAW", status: 404 },
+        {
+            operation: "file raw",
+            path: "/hello/data.bin/RAW",
+            status: 416,
+            headers: { range: "bytes=99-" },
+        },
+    );
+    const client = new esm.SymbolClient({ origin: server.origin });
+    const file = client.site("hello").file("notes dir/read me.md");
+    assert.equal(file.rawUrl.href, `${server.origin}/hello/notes%20dir/read%20me.md/RAW`);
+    const partial = await file.raw({ range: "bytes=0-1", ifRange: etag });
+    assert.equal(partial.status, 206);
+    assert.equal(partial.headers.get("content-range"), "bytes 0-1/8");
+    assert.equal(await partial.text(), "ab");
+    await partial[Symbol.asyncDispose]();
+    const unchanged = await file.raw({ ifNoneMatch: etag });
+    assert.equal(unchanged.status, 304);
+    await unchanged[Symbol.asyncDispose]();
+    await assert.rejects(
+        Promise.resolve(client.site("hello").file("missing.md").raw()),
+        esm.NotFoundError,
+    );
+    await assert.rejects(
+        Promise.resolve(client.site("hello").file("data.bin").raw({ range: "bytes=99-" })),
+        esm.RangeNotSatisfiableError,
+    );
+    await server.stop();
+    assert.equal(server.requests.length, 4);
+
+    const requested = [];
+    const redirecting = new esm.SymbolClient({
+        origin: "https://redirect.invalid",
+        fetch: async (url, init) => {
+            requested.push({ url: String(url), redirect: init.redirect });
+            return new Response(null, {
+                status: 307,
+                headers: {
+                    Location: "/hello/folder/",
+                    "Symbol-API-Version": esm.API_VERSION,
+                    "Symbol-API-Revision": String(esm.API_REVISION),
+                    "Symbol-API-Source-Hash": esm.SOURCE_HASH,
+                },
+            });
+        },
+    });
+    await assert.rejects(
+        Promise.resolve(redirecting.site("hello").file("folder").raw()),
+        esm.UnexpectedResponseError,
+    );
+    assert.deepEqual(requested, [
+        { url: "https://redirect.invalid/hello/folder/RAW", redirect: "manual" },
+    ]);
 });
 
 test("version compatibility accepts newer peers and rejects impossible identities", async () => {

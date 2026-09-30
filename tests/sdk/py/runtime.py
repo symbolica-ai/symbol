@@ -300,6 +300,44 @@ def test_allocation_naming() -> None:
     assert headers["File-Extension"] == "anno"
 
 
+def test_raw_file_mapping_sync_and_async() -> None:
+    raw_url = "http://symbol/demo/notes%20dir/read%20me.md/RAW"
+    stored = b"# raw *markdown*\n"
+    headers = (
+        ("Content-Type", "text/markdown; charset=utf-8"),
+        ("ETag", '"' + "b" * 64 + '"'),
+    )
+    backend = Backend()
+    symbol = api.Symbol(api.HttpClient.wrap(backend), origin="http://symbol")
+    file = symbol.site("demo").file("notes dir/read me.md")
+    assert file.raw_url == raw_url
+    backend.queue(200, stored, headers)
+    response = file.raw(api.RequestOptions(headers=(("Range", "bytes=0-5"),)))
+    assert response.status == 200
+    assert response.body == stored
+    request = backend.requests[-1]
+    assert (request.method, request.url) == ("GET", raw_url)
+    assert ("Range", "bytes=0-5") in request.headers
+
+    async def check_async() -> None:
+        async_backend = AsyncBackend(api.ApiResponse(200, IDENTITY + headers, stored))
+        async_symbol = api.Symbol(
+            api.AsyncHttpClient.wrap(async_backend), origin="http://symbol"
+        )
+        async_file = async_symbol.site("demo").file("notes dir/read me.md")
+        assert async_file.raw_url == raw_url
+        async_response = await async_file.raw(
+            api.RequestOptions(headers=(("If-None-Match", '"' + "b" * 64 + '"'),))
+        )
+        assert async_response.status == 200
+        assert await async_response.aread() == stored
+        async_request = async_backend.requests[-1]
+        assert (str(async_request.method), async_request.url) == ("GET", raw_url)
+        assert ("If-None-Match", '"' + "b" * 64 + '"') in async_request.headers
+
+    asyncio.run(check_async())
+
+
 def test_sync_async_public_method_parity() -> None:
     def methods(client_type: type[object]) -> set[str]:
         return {
@@ -811,13 +849,14 @@ def main() -> None:
     test_metadata_and_media_types()
     test_sync_client_mapping()
     test_allocation_naming()
+    test_raw_file_mapping_sync_and_async()
     test_sync_async_public_method_parity()
     test_malformed_responses_and_typed_errors()
     test_retry_policy_applies_to_sync_and_async_transports()
     test_streaming_bodies_are_lazy_and_closeable()
     test_async_splice_insertions_never_read_synchronous_sources()
     asyncio.run(test_async_factory())
-    print("SDK Python runtime: 9 tests")
+    print("SDK Python runtime: 10 tests")
 
 
 if __name__ == "__main__":

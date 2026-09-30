@@ -1,0 +1,53 @@
+# Third-party files served to rendered Markdown pages from /ASSETS/{bundle}/.
+#
+# They are not committed. Only this manifest is: each package's published npm
+# tarball, pinned by the sha512 integrity the registry publishes, and the files
+# to take from it. The files land in static/vendor/, which git ignores.
+#
+#   Nix builds         fetch and verify the tarballs themselves (flake.nix).
+#   Everything else    python3 tooling/fetch_vendor.py
+#
+# The build refuses to start if static/vendor/ is missing or was fetched for a
+# different version of this manifest.
+#
+# Why bundle them at all rather than load them from a CDN: symbol runs on
+# tailnets that may have no internet access, and a CDN would learn every page
+# a reader opens.
+#
+# Only KaTeX's .woff2 fonts are taken: katex.min.css lists woff2 first in every
+# src, and every browser that runs KaTeX supports it, so the woff and ttf
+# fallbacks are never requested. No highlight.js theme is taken either:
+# static/markdown.css styles its token classes with the page's own custom
+# properties, so code follows the reader's theme.
+#
+# To update a package: change its version, url and integrity (the registry's
+# dist.integrity), refetch, and run the Rust tests. assets::tests fail if a
+# KaTeX font the stylesheet prefers is missing or a fetched file is not served.
+
+[[package]]
+name = "katex"
+version = "0.18.9"
+licence = "MIT"
+homepage = "https://katex.org"
+url = "https://registry.npmjs.org/katex/-/katex-0.18.9.tgz"
+integrity = "sha512-8ad9RyoKsb/g8/yLFE+KAlP+DhbCTRUNi/V9XGsxn0R+trJJltNwzcDNo0q/DEkOy5fQUQTAQyCXCYSE+OakTQ=="
+files = [
+  { from = "package/LICENSE", to = "katex/LICENSE" },
+  { from = "package/dist/katex.min.js", to = "katex/katex.min.js" },
+  { from = "package/dist/katex.min.css", to = "katex/katex.min.css" },
+  { from = "package/dist/contrib/copy-tex.min.js", to = "katex/copy-tex.min.js" },
+  { from = "package/dist/fonts", to = "katex/fonts", suffix = ".woff2" },
+]
+
+[[package]]
+name = "@highlightjs/cdn-assets"
+version = "11.12.0"
+licence = "BSD-3-Clause"
+homepage = "https://highlightjs.org"
+url = "https://registry.npmjs.org/@highlightjs/cdn-assets/-/cdn-assets-11.12.0.tgz"
+integrity = "sha512-KvOKXODaiFmId9xaq3xc5xCL66wVLUuOngDbO9B/kewbFTqdGbn2nJxNhN3H5R1cgDTVj6R8vH0zgiNDEGjpDw=="
+files = [
+  { from = "package/LICENSE", to = "highlight/LICENSE" },
+  # The common-languages bundle.
+  { from = "package/highlight.min.js", to = "highlight/highlight.min.js" },
+]

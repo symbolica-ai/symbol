@@ -31,6 +31,9 @@ symbol-contract = { path = "../symbol-contract" }
 diesel = { version = "2.3.12", features = ["sqlite", "returning_clauses_for_sqlite_3_35"] }
 libsqlite3-sys = { version = "0.38.2", features = ["bundled"] }
 sea-query = { version = "1.0.2", features = ["backend-sqlite", "derive"], default-features = false }
+pulldown-cmark = { version = "0.13.4", default-features = false, features = ["html"] }
+toml = "1.1.4"
+saphyr = { version = "0.1.0", default-features = false }
 
 [dev-dependencies]
 proptest = "1.11.0"

@@ -19,7 +19,7 @@ mod database_schema;
 #[path = "generation/mod.rs"]
 mod generation;
 
-const STYLESHEETS: &[&str] = &["base.css", "browse.css", "docs.css"];
+const STYLESHEETS: &[&str] = &["base.css", "browse.css", "docs.css", "markdown.css"];
 
 fn main() {
     run().unwrap_or_else(|error| panic!("deterministic generation failed: {error}"));
@@ -35,6 +35,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .expect("workspace root");
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("build output directory"));
     emit_rerun_inputs(&root)?;
+    require_fetched_vendor(&root);
 
     let mode = generation_mode_from_environment()?;
     let bump_intent = bump_intent_from_environment()?;
@@ -63,6 +64,32 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|error| panic!("invalid CSS in {}: {error:?}", path.display()));
     }
     Ok(())
+}
+
+/// Fails early, and helpfully, when the Markdown page assets are missing.
+///
+/// They are fetched rather than committed (see `static/vendor.toml`), so a
+/// fresh checkout built with plain `cargo` has none. The fetch leaves a copy of
+/// the manifest beside the files; a mismatch means they are for another
+/// version.
+fn require_fetched_vendor(root: &Path) {
+    let manifest = root.join("static/vendor.toml");
+    let stamp = root.join("static/vendor/vendor.toml");
+    println!("cargo::rerun-if-changed={}", manifest.display());
+    println!("cargo::rerun-if-changed={}", stamp.display());
+    let wanted = fs::read(&manifest)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", manifest.display()));
+    let problem = match fs::read(&stamp) {
+        Ok(fetched) if fetched == wanted => return,
+        Ok(_) => "static/vendor/ was fetched for a different static/vendor.toml",
+        Err(_) => "static/vendor/ is missing",
+    };
+    panic!(
+        "{problem}.\n\
+         The KaTeX and highlight.js files served to Markdown pages are fetched, \
+         not committed. Run:\n\n    python3 tooling/fetch_vendor.py\n\n\
+         Nix builds fetch them automatically."
+    );
 }
 
 fn generate_writable(

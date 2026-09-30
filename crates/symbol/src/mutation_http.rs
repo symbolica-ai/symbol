@@ -1395,7 +1395,7 @@ fn resource_location(app: &App, name: &str, path: &str) -> String {
     location
 }
 
-fn encode_path_segment(output: &mut String, segment: &str) {
+pub fn encode_path_segment(output: &mut String, segment: &str) {
     for byte in segment.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
             output.push(char::from(byte));

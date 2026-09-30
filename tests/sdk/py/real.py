@@ -96,6 +96,12 @@ with tempfile.TemporaryDirectory() as root:
         inventory = symbol.site("python-sdk").files()
         assert inventory.site == "python-sdk"
         assert inventory.files[0].path == "index.html"
+        index_file = symbol.site("python-sdk").file("index.html")
+        raw = index_file.raw()
+        assert raw.status == 200
+        assert raw.body == b"<h1>python</h1>"
+        assert raw.header("ETag") == f'"{index_file.hash()}"'
+        assert symbol.site("python-sdk").file("index").raw().status == 404
 
         allocated = (
             symbol.site("python-sdk")
@@ -109,6 +115,7 @@ with tempfile.TemporaryDirectory() as root:
             )
         )
         assert "/python-sdk/notes/" in allocated.mutation.location
+        assert symbol.site("python-sdk").file("notes").raw().status == 404
 
         alias = symbol.site("python-sdk").alias("latest", "index.html")
         assert alias.mutation.status == 201
@@ -176,6 +183,7 @@ with tempfile.TemporaryDirectory() as root:
                     base_hash=base_hash,
                 )
                 assert await scratch.bytes() == b"u12xyz"
+                assert await (await scratch.raw()).aread() == b"u12xyz"
                 await scratch.remove()
                 await site.folder("generated").json({"async": True})
 

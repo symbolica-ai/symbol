@@ -15,6 +15,9 @@ enum Fixture {
 enum Target {
     Literal(&'static str),
     Blob,
+    /// A path under the current render-asset bundle, whose digest is only
+    /// known at runtime.
+    RenderAsset(&'static str),
 }
 
 #[derive(Clone, Copy)]
@@ -465,6 +468,36 @@ const SUCCESS_PROBES: &[Probe] = &[
         response_headers: PLAIN_HEADER,
     },
     Probe {
+        endpoint: "render asset",
+        fixture: Fixture::Empty,
+        method: "GET",
+        target: Target::RenderAsset("markdown.css"),
+        request_headers: NO_REQUEST_HEADERS,
+        body: b"",
+        status: 200,
+        response_headers: &[
+            header_value("content-type", "text/css; charset=utf-8"),
+            header("etag"),
+            header_value("cache-control", "public, max-age=31536000, immutable"),
+        ],
+    },
+    Probe {
+        endpoint: "file raw",
+        fixture: Fixture::Site,
+        method: "GET",
+        target: Target::Literal("/hello/assets/app.js/RAW"),
+        request_headers: NO_REQUEST_HEADERS,
+        body: b"",
+        status: 200,
+        response_headers: &[
+            header_value("content-type", "text/javascript; charset=utf-8"),
+            header("content-length"),
+            header("etag"),
+            header("cache-control"),
+            header("accept-ranges"),
+        ],
+    },
+    Probe {
         endpoint: "undo stack",
         fixture: Fixture::Undo,
         method: "GET",
@@ -783,6 +816,74 @@ const ERROR_PROBES: &[Probe] = &[
         status: 404,
         response_headers: PLAIN_HEADER,
     },
+    // A bundle this binary does not serve is a 404, never a substitution:
+    // anything else would break the `immutable` promise.
+    Probe {
+        endpoint: "render asset",
+        fixture: Fixture::Empty,
+        method: "GET",
+        target: Target::Literal("/ASSETS/0000000000000000/markdown.css"),
+        request_headers: NO_REQUEST_HEADERS,
+        body: b"",
+        status: 404,
+        response_headers: PLAIN_HEADER,
+    },
+    Probe {
+        endpoint: "render asset",
+        fixture: Fixture::Empty,
+        method: "GET",
+        target: Target::RenderAsset("missing.css"),
+        request_headers: NO_REQUEST_HEADERS,
+        body: b"",
+        status: 404,
+        response_headers: PLAIN_HEADER,
+    },
+    Probe {
+        endpoint: "file raw",
+        fixture: Fixture::Site,
+        method: "GET",
+        target: Target::Literal("/hello/missing.txt/RAW"),
+        request_headers: NO_REQUEST_HEADERS,
+        body: b"",
+        status: 404,
+        response_headers: PLAIN_HEADER,
+    },
+    // A directory has no raw bytes, even one with an index file.
+    Probe {
+        endpoint: "file raw",
+        fixture: Fixture::Site,
+        method: "GET",
+        target: Target::Literal("/hello/assets/RAW"),
+        request_headers: NO_REQUEST_HEADERS,
+        body: b"",
+        status: 404,
+        response_headers: PLAIN_HEADER,
+    },
+    Probe {
+        endpoint: "file raw",
+        fixture: Fixture::Site,
+        method: "GET",
+        target: Target::Literal("/hello/RAW"),
+        request_headers: NO_REQUEST_HEADERS,
+        body: b"",
+        status: 404,
+        response_headers: PLAIN_HEADER,
+    },
+    Probe {
+        endpoint: "file raw",
+        fixture: Fixture::Site,
+        method: "GET",
+        target: Target::Literal("/hello/assets/app.js/RAW"),
+        request_headers: &[("range", "bytes=99-100")],
+        body: b"",
+        status: 416,
+        response_headers: &[
+            header("content-range"),
+            header("accept-ranges"),
+            header("etag"),
+            header("cache-control"),
+        ],
+    },
     Probe {
         endpoint: "expiry inventory",
         fixture: Fixture::Empty,
@@ -1067,6 +1168,7 @@ fn target_uri(target: Target, store: &Store) -> String {
             };
             format!("/.blob/hello/{}", hash.to_hex())
         }
+        Target::RenderAsset(path) => format!("{}/{path}", crate::assets::base()),
     }
 }
 
@@ -2033,7 +2135,10 @@ async fn phase_five_mutations_cover_replay_conflict_limits_and_two_phase_outcome
     assert_eq!(finalized.status(), StatusCode::CREATED);
     let custom_content = send(&app, "GET", "/hello/custom/chosen", &[], Body::empty()).await;
     assert_eq!(custom_content.status(), StatusCode::OK);
-    assert_eq!(custom_content.headers()[header::CONTENT_TYPE], "text/plain");
+    assert_eq!(
+        custom_content.headers()[header::CONTENT_TYPE],
+        "text/plain; charset=utf-8"
+    );
     let custom_alias = send(
         &app,
         "ALIAS",
@@ -2046,7 +2151,7 @@ async fn phase_five_mutations_cover_replay_conflict_limits_and_two_phase_outcome
     let custom_alias_content = send(&app, "GET", "/hello/custom-link", &[], Body::empty()).await;
     assert_eq!(
         custom_alias_content.headers()[header::CONTENT_TYPE],
-        "text/plain"
+        "text/plain; charset=utf-8"
     );
     let finalized_replay = send(
         &app,

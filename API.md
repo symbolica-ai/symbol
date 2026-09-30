@@ -236,6 +236,19 @@ const receipt = await site.folder("reports").create(pdf, {
 `ifNoneMatch`. Convenience decoders require a successful response and validate
 the expected representation.
 
+### `raw(options)` and `rawUrl`
+
+`raw` reads `/{name}/{path}/RAW`: exactly the stored bytes, never rendered,
+redirected, or resolved to an index, whatever the request's `Accept`. It
+returns the owned response like `get`, honours `range`, `ifRange`, and
+`ifNoneMatch`, and succeeds with `200`, `206`, or `304`. A `307` is never
+followed; it can only mean something other than `RAW` answered. `rawUrl` is
+the same address as a `URL`, for linking or embedding.
+
+```ts
+const source = await (await site.file("notes.md").raw()).text();
+```
+
 ### `put(body, options)` and `putJson(value, options)`
 
 PUT adds or replaces this ordinary path. It intentionally does not advertise
@@ -468,10 +481,13 @@ print(receipt.path, receipt.hash, receipt.blob_url)
 ### File operations
 
 `get` returns a closeable streaming `ApiResponse`. `bytes`, `text`, and `json`
-consume and decode it. `put` writes ordinary content. `remove` returns
-`DeleteReceipt`. `hash` returns validated `Blake3`. `replace` requires the
-current content hash. `splice` applies one edit and `patch` applies multiple
-original-offset edits atomically.
+consume and decode it. `raw` returns the same kind of response for
+`/{name}/{path}/RAW` — exactly the stored bytes, never rendered, redirected,
+or resolved to an index — and `raw_url` is that address as a string. `put`
+writes ordinary content. `remove` returns `DeleteReceipt`. `hash` returns
+validated `Blake3`. `replace` requires the current content hash. `splice`
+applies one edit and `patch` applies multiple original-offset edits
+atomically.
 
 ```python
 from symbol_api import ByteSplice
@@ -775,6 +791,19 @@ symbol pop NAME [ARCHIVE|-]
 Both support tar.gz, tar, and zip. `get` leaves the site untouched. `pop`
 removes it only as part of the same successful server operation and prints its
 undo command.
+
+### `raw`
+
+```sh
+symbol raw NAME/PATH [-o FILE|-]
+symbol raw NAME PATH [-o FILE|-]
+```
+
+Writes exactly the stored bytes of one file, from `/{name}/{path}/RAW`: never
+rendered, redirected, or resolved to an index. Output goes to stdout, or with
+`-o FILE` (also `--output`) downloads to a temporary file that is moved into
+place only on success, so a failed read leaves nothing behind. A directory,
+including the site root, has no raw bytes and fails.
 
 ### `copy`, `move`, and `remix`
 
@@ -1102,8 +1131,8 @@ Canonical client: `symbol api`, or `symbol api --json`.
 - `FILES`, `UNDO`, and `EXPIRES` reserve their whole top-level virtual
   namespace: a mutation path whose first component is one of those names is
   rejected, including the name itself and every descendant.
-- `FILES`, `HASH`, `UNDO`, `EXPIRES`, `symbol.toml`, `.symbol-token`, and
-  `.symbol-claim` are also reserved as the final component of any mutation
+- `FILES`, `HASH`, `RAW`, `UNDO`, `EXPIRES`, `symbol.toml`, `.symbol-token`,
+  and `.symbol-claim` are also reserved as the final component of any mutation
   path.
 - After managed-site authentication, `POST`, `ALIAS`, `REPLACE`, `PATCH`,
   `PUT`, `DELETE`, and `EXPIRE` apply both rules uniformly and return
@@ -1478,10 +1507,89 @@ extension included. An `index.html` entry, or an `index.htm` entry with no
 path that would only redirect. `PUT`, `DELETE`, `EXPIRE`, and `HASH` stay on
 the real path.
 
+Text types are served with `charset=utf-8` unless they already name a charset.
+`text/html` and `text/xml` are left unlabeled, because both declare their own
+encoding in-band and an HTTP charset would override an author's explicit
+`<meta charset>` or `<?xml encoding?>`.
+
+#### Markdown in browsers
+
+A `.md` or `.markdown` file is rendered to HTML when the request explicitly
+prefers HTML in `Accept`, as a browser's top-level navigation does. Anything
+else receives the source: `curl` and the SDKs send `*/*`, and so does a page's
+own `fetch()`, which therefore keeps working for sites that render Markdown
+client-side. User-Agent is deliberately not consulted. Both representations
+carry `Vary: Accept`. The rendering is `200` with
+`Content-Type: text/html; charset=utf-8`, an `ETag` of the rendered bytes,
+`Accept-Ranges: none` because byte ranges into a generated document mean
+nothing, and `Link: </{name}/{path}/RAW>; rel="alternate"; type="text/markdown"`.
+Files above 4 MiB, and files that are not UTF-8, are always served as source.
+`RAW` never renders.
+
+Rendering supports CommonMark plus tables, footnotes (collected at the end),
+strikethrough, task lists, definition lists, `^superscript^`, GitHub alerts
+(`> [!NOTE]`, `TIP`, `IMPORTANT`, `WARNING`, `CAUTION`), heading attributes
+(`## Title {#id .class}`), and heading ids with hover anchors. Math in `$...$`,
+`$$...$$`, or a ```` ```math ```` fence is typeset by KaTeX; fenced code with a
+language is highlighted by highlight.js. Raw HTML, including `<script>` and
+`<style>`, passes through untouched.
+
+Optional front matter opens the file, as YAML between `---` lines or TOML
+between `+++` lines. It must be closed; a lone leading `---` is an ordinary
+thematic break. Recognised keys:
+
+| Key | Value | Default |
+| --- | --- | --- |
+| `title` | page `<title>` | first `#` heading, then file name |
+| `description` | `<meta name="description">` | none |
+| `lang` | `<html lang>` | `en` |
+| `theme` | `auto`, `light`, `dark`, `sepia` | `auto` |
+| `width` | `narrow`, `wide`, `full` | `narrow` |
+| `css` | inline CSS, appended last | none |
+| `stylesheet`, `stylesheets` | a URL or list of URLs | none |
+| `script`, `scripts` | a URL or list, loaded after the page's own | none |
+| `head` | raw HTML inserted into `<head>` | none |
+| `class` | classes on `<body>` | none |
+| `controls` | `true`, `false`, or any of `theme`, `width`, `size`, `raw` | `true` |
+| `toc` | table of contents from `##` headings down | `false` |
+| `math` | KaTeX | `true` |
+| `highlight` | highlight.js | `true` |
+| `smart_punctuation` | curly quotes and dashes | `false` |
+
+Relative URLs resolve against the page, as they would in any HTML file.
+Unrecognised keys are ignored, and the whole front matter is published as JSON
+in `<script type="application/json" id="symbol-front-matter">` for a page's own
+scripts to read. A value the renderer cannot use is not silently dropped: the
+page renders with the default and names the problem in a visible note.
+
+The reading controls let a reader cycle the theme and width, change the text
+size, and open the `RAW` source. They persist per origin in `localStorage`, so a
+reader's choice follows them to every Markdown page on this host and overrides
+the page's front-matter default. Without JavaScript only the `RAW` link, which
+needs none, is shown. Every colour, font, and measure is a CSS custom property
+on `:root` — among them `--md-bg`, `--md-fg`, `--md-accent`, `--md-font`,
+`--md-mono`, `--md-measure`, and `--md-line-height` — so front-matter `css`
+can retheme a page without replacing its stylesheet.
+
+```markdown
+---
+title: Field notes
+theme: sepia
+toc: true
+css: ":root { --md-accent: #b5451b }"
+---
+# Field notes
+
+Euler's identity is $e^{i\pi} + 1 = 0$.[^proof]
+
+[^proof]: See any complex analysis text.
+```
+
 These control suffixes are reserved:
 
 - `/{name}/{path...}/HASH` returns the raw stored file hash with `200`, or `404`
   for a directory/missing path.
+- `/{name}/{path...}/RAW` returns the stored bytes exactly; see below.
 - `/{name}/{path}/EXPIRES` returns the expiry report JSON.
 
 `/{name}/HASH` returns the hash of root `index.html` or `index.htm`, preferring
@@ -1489,6 +1597,61 @@ These control suffixes are reserved:
 
 Canonical client: no direct content command; `symbol url NAME` prints the site
 root.
+
+<!-- contract:file raw -->
+### `GET /{name}/{path...}/RAW`
+
+Returns exactly the stored bytes at `{path}`, never augmented. The ordinary
+read path above is allowed to be helpful: it falls back from `about` to
+`about.html`, redirects `about.html` to `about`, resolves a directory to its
+index, and renders Markdown for browsers. `RAW` does none of that, for any
+client, whatever it sends in `Accept`.
+
+`{path}` resolves the same way `HASH` resolves it, aliases included, so for
+every file the returned bytes hash to what `/{name}/{path...}/HASH` reports. A
+directory, the site root included, has no raw bytes and returns `404`; mapping
+it to an index file would be exactly the augmentation `RAW` exists to avoid.
+
+```http
+GET /hello/notes.md/RAW HTTP/1.1
+```
+
+```http
+HTTP/1.1 200 OK
+Content-Type: text/markdown; charset=utf-8
+Content-Length: 42
+ETag: "<raw hash>"
+Cache-Control: no-cache
+Accept-Ranges: bytes
+```
+
+The response headers otherwise match the ordinary file read: `Content-Type`
+follows the same charset rule, the `ETag` is the raw file hash, and `Expires`
+is present when an expiry policy applies. `Range` and `If-Range` select one
+byte range with `206` and `Content-Range`, `If-None-Match` revalidates with
+`304`, and an unsatisfiable range returns `416`. A malformed site name or path
+returns `400`.
+
+Canonical client: `symbol raw NAME/PATH`.
+
+<!-- contract:render asset -->
+### `GET /ASSETS/{bundle}/{path...}`
+
+Serves the stylesheets, scripts, and fonts that rendered Markdown pages load:
+the page stylesheet and script, and the vendored KaTeX and highlight.js. Like
+`API`, the uppercase `ASSETS` namespace is built into the binary and cannot
+collide with a site, whose names are lower case.
+
+`{bundle}` is a digest of every asset together, so changing any of them moves
+every URL. That is what lets them be served `200` with
+`Cache-Control: public, max-age=31536000, immutable`, a strong `ETag`, an exact
+`Content-Type`, and `X-Content-Type-Options: nosniff`: a browser holding a stale
+copy is never asked for it again, because the page that referenced it now names
+a different bundle. `If-None-Match` revalidates with `304`. A bundle this binary
+does not serve, or an unknown path, is `404` rather than a silent substitution,
+which would break that promise.
+
+Rendered pages construct these URLs themselves; nothing else needs to.
 
 ### byte ranges
 

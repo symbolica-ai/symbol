@@ -6,6 +6,8 @@
 /.venv
 /tooling/.venv
 /.api-version.lock
+# Fetched from static/vendor.toml; see tooling/fetch_vendor.py.
+/static/vendor/
 
 *.swp
 *.swo

@@ -40,6 +40,14 @@ try {
     assert.equal(inventory.files.some((file) => file.path === "index.html"), true);
     assert.equal(await site.file("index.html").text(), "<h1>SDK</h1>");
 
+    const raw = await site.file("index.html").raw();
+    assert.equal(raw.status, 200);
+    assert.match(raw.headers.get("content-type"), /^text\/html(?:;|$)/);
+    assert.equal(raw.headers.get("etag"), `"${await site.file("index.html").hash()}"`);
+    assert.equal(await raw.text(), "<h1>SDK</h1>");
+    await raw[Symbol.asyncDispose]();
+    await assert.rejects(Promise.resolve(site.file("index").raw()), sdk.NotFoundError);
+
     const allocated = await site.folder("generated").text("allocated text", {
         name: { prefix: "note-", suffix: "-final", extension: ".TXT" },
     });
@@ -47,6 +55,7 @@ try {
     assert.match(allocated.path, /^generated\/note-[0-9a-f]{64}-final\.txt$/);
     assert.equal(allocated.naming.mode, "generated");
     assert.equal(allocated.blobUrl.pathname.startsWith("/.blob/sdk-real/"), true);
+    await assert.rejects(Promise.resolve(site.file("generated").raw()), sdk.NotFoundError);
 
     const alias = await site.alias("latest", allocated.path);
     assert.equal(alias.target, allocated.path);
