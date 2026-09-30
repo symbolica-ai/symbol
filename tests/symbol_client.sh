@@ -17,7 +17,7 @@ mkdir "${MOCK_CURL_STATE}"
 cat > "${ROOT}/bin/curl" <<'MOCK'
 #!/bin/sh
 set -eu
-method=GET headers= output= dump= write= upload= url=
+method=GET headers= output= dump= write= upload= url= fail=0 fail_status=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     -X) method=$2; shift 2 ;;
@@ -29,7 +29,8 @@ while [ "$#" -gt 0 ]; do
     -T) upload=$2; shift 2 ;;
     --data-binary) upload=${2#@}; shift 2 ;;
     --max-time) shift 2 ;;
-    -s|-S|-f|-L|-fsS|-fsSL|-sS) shift ;;
+    -f) fail=1; shift ;;
+    -s|-S|-L|-fsS|-fsSL|-sS) shift ;;
     -*) shift ;;
     *) url=$1; shift ;;
   esac
@@ -74,6 +75,8 @@ case "$method:$url" in
   PUT:http://mock|PUT:*/) status=201; location=http://mock/abcd/; body='created http://mock/abcd/' ;;
   PUT:*) body=updated ;;
   GET:*/drop-file.txt) body=${MOCK_FILE_BODY:-verified-file-body} ;;
+  GET:*/missing.md/RAW) status=404; fail_status=1; body='error: not found' ;;
+  GET:*/RAW) body='# stored *markdown* bytes' ;;
   GET:*video.mp4/EXPIRES|EXPIRE:*video.mp4)
     body='{"target":{"site":"hello","path":"video.mp4","kind":"file"},"size":5,"refreshed_at":"2026-01-01T00:00:00Z","own_policy":{"mode":"relative","retention_seconds":100,"expires_at":"2027-01-01T00:00:00Z"},"inherited_caps":[{"kind":"site","path":null,"expires_at":"2026-12-01T00:00:00Z"}],"effective_expires_at":"2026-12-01T00:00:00Z","remaining_seconds":50,"limited_by":{"kind":"site","path":null}}'
     ;;
@@ -167,6 +170,11 @@ if [ "${MOCK_DROP_ONCE_METHOD:-}" = "$method" ] &&
   fi
   : > "$MOCK_CURL_STATE/dropped-$method"
   exit 52
+fi
+
+if [ "$fail" = 1 ] && [ "$fail_status" = 1 ]; then
+  printf 'curl: (22) The requested URL returned error: %s\n' "$status" >&2
+  exit 22
 fi
 
 if [ -n "$dump" ]; then
@@ -474,6 +482,47 @@ out=$("${CLIENT}" get hello -)
 [ "${out}" = ARCHIVE-BYTES ] &&
   contains "$(cat "${LOG}")" 'METHOD=GET URL=http://mock/hello.tar.gz' &&
   ok 'get dash keeps stdout binary-only' || not_ok 'get dash keeps stdout binary-only'
+
+: > "${LOG}"
+out=$("${CLIENT}" -t explicit raw 'hello/docs/read me.md')
+log=$(cat "${LOG}")
+[ "${out}" = '# stored *markdown* bytes' ] &&
+  contains "${log}" 'METHOD=GET URL=http://mock/hello/docs/read%20me.md/RAW' &&
+  ! contains "${log}" 'Authorization:' &&
+  ok 'raw NAME/PATH streams stored bytes from the RAW endpoint' ||
+  not_ok 'raw NAME/PATH streams stored bytes from the RAW endpoint'
+
+: > "${LOG}"
+out=$("${CLIENT}" raw hello notes.md -o "${ROOT}/raw-out.md")
+[ "${out}" = "downloaded ${ROOT}/raw-out.md" ] &&
+  [ "$(cat "${ROOT}/raw-out.md")" = '# stored *markdown* bytes' ] &&
+  contains "$(cat "${LOG}")" 'METHOD=GET URL=http://mock/hello/notes.md/RAW' &&
+  ok 'raw NAME PATH -o FILE writes the stored bytes to FILE' ||
+  not_ok 'raw NAME PATH -o FILE writes the stored bytes to FILE'
+
+if "${CLIENT}" raw hello/missing.md -o "${ROOT}/raw-missing.md" \
+  >"${ROOT}/raw.out" 2>"${ROOT}/raw.err"; then
+  not_ok 'raw failure exits nonzero without writing FILE'
+elif [ ! -e "${ROOT}/raw-missing.md" ] && [ ! -s "${ROOT}/raw.out" ] &&
+  contains "$(cat "${ROOT}/raw.err")" 'raw download failed: hello/missing.md'; then
+  ok 'raw failure exits nonzero without writing FILE'
+else
+  not_ok 'raw failure exits nonzero without writing FILE'
+fi
+
+raw_usage_ok=1
+: > "${LOG}"
+for raw_args in 'hello' 'hello/' 'hello/../x' 'hello/HASH' 'bad.name/x' 'hello/x --bogus'; do
+  # shellcheck disable=SC2086 # word-split the fixture into arguments
+  if "${CLIENT}" raw ${raw_args} >/dev/null 2>&1; then
+    raw_usage_ok=0
+  fi
+done
+"${CLIENT}" raw hello/x -o >/dev/null 2>&1 && raw_usage_ok=0
+[ ! -s "${LOG}" ] || raw_usage_ok=0
+[ "${raw_usage_ok}" -eq 1 ] &&
+  ok 'raw rejects missing, unsafe, and reserved paths before any request' ||
+  not_ok 'raw rejects missing, unsafe, and reserved paths before any request'
 
 : > "${LOG}"
 printf '<h1>x</h1>' | "${CLIENT}" -t explicit put - >/dev/null

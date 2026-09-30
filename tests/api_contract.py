@@ -35,7 +35,7 @@ names = set()
 normalized_api = re.sub(r"\s+", " ", api)
 for required_reserved_rule in (
     "`FILES`, `UNDO`, and `EXPIRES` reserve their whole top-level virtual namespace",
-    "`FILES`, `HASH`, `UNDO`, `EXPIRES`, `symbol.toml`, `.symbol-token`, and `.symbol-claim` are also reserved as the final component of any mutation path",
+    "`FILES`, `HASH`, `RAW`, `UNDO`, `EXPIRES`, `symbol.toml`, `.symbol-token`, and `.symbol-claim` are also reserved as the final component of any mutation path",
     "`POST`, `ALIAS`, `REPLACE`, `PATCH`, `PUT`, `DELETE`, and `EXPIRE` apply both rules uniformly",
     "`error: path is reserved by symbol\\n`",
     "Authentication failure takes precedence and returns `401`",

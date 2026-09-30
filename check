@@ -33,6 +33,8 @@ if [ -z "${CHROMIUM_BIN:-}" ]; then
   fi
 fi
 
+# The Markdown page assets are fetched, not committed; a no-op when current.
+python3 tooling/fetch_vendor.py
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-targets --all-features --locked

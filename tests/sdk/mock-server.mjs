@@ -19,9 +19,12 @@ const AMBIENT_REQUEST_HEADERS = new Set([
     "accept",
     "accept-encoding",
     "accept-language",
+    // The Fetch standard adds these to requests carrying If-None-Match/If-Range.
+    "cache-control",
     "connection",
     "content-length",
     "host",
+    "pragma",
     "sec-fetch-mode",
     "transfer-encoding",
     "user-agent",
@@ -506,6 +509,11 @@ class RawResponse {
             return;
         }
         this.#ended = true;
+        if (this.#bodiless()) {
+            this.#flush();
+            this.#socket.end();
+            return;
+        }
         if (value !== null && !this.#flushed) {
             const bytes = normalizeBody(value);
             if (!hasHeader(this.#headers, "content-length")) {
@@ -533,7 +541,7 @@ class RawResponse {
         }
         this.#flushed = true;
         this.#headers.Connection = "close";
-        if (!hasHeader(this.#headers, "content-length")) {
+        if (!this.#bodiless() && !hasHeader(this.#headers, "content-length")) {
             this.#headers["Transfer-Encoding"] = "chunked";
             this.#chunked = true;
         }
@@ -544,6 +552,11 @@ class RawResponse {
         }
         encoded += "\r\n";
         this.#socket.write(encoded);
+    }
+
+    // 204 and 304 responses never carry a body, so they get no framing headers.
+    #bodiless() {
+        return this.#status === 204 || this.#status === 304;
     }
 }
 
@@ -660,8 +673,10 @@ function validateFixture(fixture) {
     assert.match(fixture.source_hash, /^[0-9a-f]{64}$/);
     assert.match(fixture.build.commit, /^(?:unknown|[0-9a-fA-F]{7,64})$/);
     assert.equal(typeof fixture.build.dirty, "boolean");
-    assert.equal(fixture.operations.length, 40);
-    assert.equal(new Set(fixture.operations.map((operation) => operation.name)).size, 40);
+    // 41 client-facing operations plus `render asset`, the stylesheets, scripts
+    // and fonts rendered Markdown pages load. SDKs have no reason to call it.
+    assert.equal(fixture.operations.length, 42);
+    assert.equal(new Set(fixture.operations.map((operation) => operation.name)).size, 42);
     for (const operation of fixture.operations) {
         assert.equal(operation.outcomes_exact, true, `${operation.name} outcomes must be exact`);
         for (const outcome of [...operation.success_outcomes, ...operation.error_outcomes]) {
@@ -985,6 +1000,7 @@ function canonicalOutcome(
             return empty({ ...base, Location: "/hello/", "Content-Length": "0" });
         case "site index":
         case "site file":
+        case "file raw":
         case "immutable blob":
             return hosted(base, status);
         case "unnamed put":

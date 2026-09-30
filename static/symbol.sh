@@ -110,6 +110,7 @@ usage:
   symbol put [-u] [--replace] [--managed] [NAME [FILE [DEST]]]
   symbol clone NAME [DIR]
   symbol get NAME [ARCHIVE]
+  symbol raw NAME/PATH [-o FILE]
   symbol pop NAME [ARCHIVE]
   symbol copy [--managed] SRC [DST]
   symbol remix [--managed] SRC [DST]
@@ -144,6 +145,7 @@ streams:
   - put reads a pipe without - only when a terminal is attached
     and no file source is given; SYMBOL_STDIN=always|never overrides
   - as get/pop output writes archive bytes to stdout
+  raw writes the stored file bytes to stdout unless -o FILE is given
 
 aliases:
   push -> put; pull -> clone; rename -> move; add -> put; x -> remix
@@ -186,6 +188,18 @@ symbol get: download a site without deleting it
 usage: symbol get NAME [ARCHIVE|-]
 
 writes a tar.gz, tar, or zip. - writes archive bytes to stdout.
+EOF
+      ;;
+    raw) cat <<'EOF'
+symbol raw: download one file's stored bytes exactly
+usage: symbol raw NAME/PATH [-o FILE|-]
+       symbol raw NAME PATH [-o FILE|-]
+
+fetches NAME/PATH/RAW: the bytes as uploaded, with no .html fallback,
+pretty-URL redirect, index resolution, or rendering. directories,
+including the site root, are not files and fail with 404.
+writes to stdout by default. -o FILE replaces FILE only after the whole
+body has arrived; -o - is stdout.
 EOF
       ;;
     pop) cat <<'EOF'
@@ -1065,6 +1079,7 @@ put put push add
 pop pop
 clone clone pull
 get get download
+raw raw
 copy copy
 remix remix x
 move move rename
@@ -1241,7 +1256,7 @@ validate_remote_path() {
   esac
   terminal=$(basename "./${remote}")
   case "${terminal}" in
-    symbol.toml|.symbol-token|.symbol-claim|FILES|HASH|UNDO|EXPIRES)
+    symbol.toml|.symbol-token|.symbol-claim|FILES|HASH|RAW|UNDO|EXPIRES)
       usage_error "reserved remote path: ${remote}"
       ;;
   esac
@@ -1258,7 +1273,8 @@ canonical_alias_target() (
       terminal = parts[count]
       return terminal == "symbol.toml" || terminal == ".symbol-token" ||
         terminal == ".symbol-claim" || terminal == "FILES" ||
-        terminal == "HASH" || terminal == "UNDO" || terminal == "EXPIRES"
+        terminal == "HASH" || terminal == "RAW" || terminal == "UNDO" ||
+        terminal == "EXPIRES"
     }
     function noise(path, count, parts, i, part, lower) {
       count = split(path, parts, "/")
@@ -3476,6 +3492,60 @@ case "${cmd}" in
     is_site_name "${name}" || usage_error "invalid site name: ${name}"
     archive_transfer GET "${HOST}" "${name}" "${dest}"
     [ "${dest}" = "-" ] || printf 'downloaded %s\n' "${dest}"
+    ;;
+  raw)
+    raw_dest=-
+    raw_first=
+    raw_second=
+    raw_count=0
+    raw_flags=1
+    while [ "$#" -gt 0 ]; do
+      if [ "${raw_flags}" -eq 1 ]; then
+        case "$1" in
+          -o|--output)
+            [ "$#" -ge 2 ] || usage_error "$1 requires FILE"
+            raw_dest=$2
+            shift 2
+            continue
+            ;;
+          --) raw_flags=0; shift; continue ;;
+          -?*) usage_error "unknown flag: $1" ;;
+        esac
+      fi
+      raw_count=$((raw_count + 1))
+      case "${raw_count}" in
+        1) raw_first=$1 ;;
+        2) raw_second=$1 ;;
+        *) usage_error "usage: symbol raw NAME/PATH [-o FILE]" ;;
+      esac
+      shift
+    done
+    case "${raw_count}" in
+      1)
+        case "${raw_first}" in
+          */*) name=${raw_first%%/*}; remote_path=${raw_first#*/} ;;
+          *) usage_error "usage: symbol raw NAME/PATH [-o FILE]" ;;
+        esac
+        ;;
+      2) name=${raw_first}; remote_path=${raw_second} ;;
+      *) usage_error "usage: symbol raw NAME/PATH [-o FILE]" ;;
+    esac
+    is_site_name "${name}" || usage_error "invalid site name: ${name}"
+    [ -n "${remote_path}" ] || usage_error "raw requires a file path: ${name}/PATH"
+    validate_remote_path "${remote_path}"
+    raw_url="${HOST}/${name}/$(urlencode_path "${remote_path}")/RAW"
+    if [ "${raw_dest}" = - ]; then
+      curl -sS -f "${raw_url}" || die "raw download failed: ${name}/${remote_path}"
+    else
+      tmp=$(mktemp) || exit 1
+      if curl -sS -f "${raw_url}" -o "${tmp}"; then
+        mv "${tmp}" "${raw_dest}"
+        printf 'downloaded %s\n' "${raw_dest}"
+      else
+        rm -f "${tmp}"
+        die "raw download failed: ${name}/${remote_path}"
+      fi
+    fi
     ;;
   pop)
     [ "$#" -ge 1 ] && [ "$#" -le 2 ] || usage_error "usage: symbol pop NAME [ARCHIVE]"

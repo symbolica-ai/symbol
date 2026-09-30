@@ -13,17 +13,27 @@ README is for building and operating the service.
 The crate requires Rust 1.98 or newer.
 
 ```sh
+python3 tooling/fetch_vendor.py
 cargo build --release --locked
 ```
 
-With Nix:
+The first line fetches the KaTeX and highlight.js files that rendered Markdown
+pages use into `static/vendor/`. They are not committed: `static/vendor.toml`
+pins each npm tarball by its published sha512, and the script checks every
+download against it. The build stops with instructions if they are missing or
+stale.
+
+With Nix, which fetches and verifies them itself:
 
 ```sh
 nix build
 nix develop
 ```
 
-The documentation, client, installer, and CSS are compiled into the binary.
+`nix develop` also puts them in `static/vendor/` for plain `cargo` use.
+
+The documentation, client, installer, CSS, and those files are compiled into
+the binary.
 
 ## Run
 

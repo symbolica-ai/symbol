@@ -14,9 +14,10 @@ pub(super) const SQLITE_DELETE_BATCH_SIZE: usize = 500;
 
 pub(super) const MANIFEST_PATH: &str = "symbol.toml";
 
-pub(super) const RESERVED_TERMINALS: [&str; 7] = [
+pub(super) const RESERVED_TERMINALS: [&str; 8] = [
     "FILES",
     "HASH",
+    "RAW",
     "UNDO",
     "EXPIRES",
     "symbol.toml",

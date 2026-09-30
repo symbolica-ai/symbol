@@ -90,6 +90,24 @@ symbol sync --check
 symbol sync
 ```
 
+## markdown pages
+
+a `.md` file opens as a styled page in a browser: math, footnotes, highlighted
+code, and controls for theme, width, and text size. curl and the clients still
+get the file itself, and `RAW` always returns the exact bytes.
+
+publish notes, then read the source back
+
+```
+printf '%s\n' '# notes' '' 'euler: $e^{i\pi} + 1 = 0$' > notes.md
+curl -T notes.md ${host}/hello/notes.md
+curl ${host}/hello/notes.md/RAW
+symbol raw hello/notes.md
+```
+
+front matter sets the title, theme, and custom CSS; the protocol manual lists
+every option.
+
 ## API manuals
 
 See [${host}/API/](${host}/API/)

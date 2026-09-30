@@ -100,6 +100,7 @@ export type EndpointName =
   | "files inventory"
   | "files subtree"
   | "file hash"
+  | "file raw"
   | "undo stack"
   | "expiry inventory"
   | "expiry target"
@@ -1382,6 +1383,7 @@ export interface EndpointErrorMap {
   readonly "files inventory": NotFoundError | ServerError;
   readonly "files subtree": NotFoundError | ServerError;
   readonly "file hash": ValidationError | NotFoundError;
+  readonly "file raw": ReadProtocolError;
   readonly "undo stack": NotFoundError | ServerError;
   readonly "expiry inventory": NotFoundError | ServerError;
   readonly "expiry target": ValidationError | NotFoundError | ServerError;
@@ -2429,6 +2431,7 @@ export class FolderClient {
 export class FileClient {
   readonly path: string;
   readonly url: URL;
+  readonly rawUrl: URL;
   private readonly client: SymbolClient;
   private readonly site: string;
   private readonly defaults: RequestOptions;
@@ -2439,6 +2442,7 @@ export class FileClient {
     this.path = normalizedPath(path);
     this.defaults = defaults;
     this.url = endpointUrl(client, [this.site, ...pathSegments(this.path)]);
+    this.rawUrl = endpointUrl(client, [this.site, ...pathSegments(this.path), "RAW"]);
   }
 
   get(options: FileGetOptions = {}): Operation<DisposableResponse> {
@@ -2447,6 +2451,21 @@ export class FileClient {
       "site file",
       encodedPath([this.site, ...pathSegments(this.path)]),
       mergedOptions(this.defaults, options),
+    );
+  }
+
+  raw(options: FileGetOptions = {}): Operation<DisposableResponse> {
+    const merged: FileGetOptions = {
+      ...mergedOptions(this.defaults, options),
+      range: options.range,
+      ifRange: options.ifRange,
+      ifNoneMatch: options.ifNoneMatch,
+    };
+    return hostedResponseOperation(
+      this.client,
+      "file raw",
+      encodedPath([this.site, ...pathSegments(this.path), "RAW"]),
+      merged,
     );
   }
 
@@ -3044,17 +3063,13 @@ async function executeRequest<T>(
 
 function hostedResponseOperation(
   client: SymbolClient,
-  endpoint: "site index" | "site file" | "immutable blob",
+  endpoint: "site index" | "site file" | "file raw" | "immutable blob",
   path: string,
   options: FileGetOptions,
 ): Operation<DisposableResponse> {
   const headers = fileGetHeaders(options);
   const successes =
-    endpoint === "site index"
-      ? [200, 206, 304, 307]
-      : endpoint === "site file"
-        ? [200, 206, 304, 307]
-        : [200, 206, 304];
+    endpoint === "site index" || endpoint === "site file" ? [200, 206, 304, 307] : [200, 206, 304];
   return requestOperation(client, {
     endpoint,
     path,
@@ -3642,9 +3657,16 @@ function validateBasename(value: string): string {
     value.includes("/") ||
     value.includes("\\") ||
     /[\0-\x1f\x7f]/.test(value) ||
-    ["FILES", "HASH", "UNDO", "EXPIRES", "symbol.toml", ".symbol-token", ".symbol-claim"].includes(
-      value,
-    )
+    [
+      "FILES",
+      "HASH",
+      "RAW",
+      "UNDO",
+      "EXPIRES",
+      "symbol.toml",
+      ".symbol-token",
+      ".symbol-claim",
+    ].includes(value)
   ) {
     throw new TypeError("allocation callback must return one safe basename");
   }

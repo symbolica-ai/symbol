@@ -90,11 +90,70 @@
           ./release-check
           ./schema.sql
           ./ops
-          ./static
+          # Fetched, never committed: renderVendor supplies it below. Excluded
+          # so a local copy in a `path:` flake cannot shadow the pinned one.
+          (lib.fileset.difference ./static (lib.fileset.maybeMissing ./static/vendor))
           ./tests
           ./tooling
         ];
       };
+      vendorManifest = builtins.fromTOML (builtins.readFile ./static/vendor.toml);
+      # The KaTeX and highlight.js files served to rendered Markdown pages:
+      # each npm tarball fetched and checked against the integrity pinned in
+      # static/vendor.toml, laid out exactly as tooling/fetch_vendor.py does,
+      # with the manifest copied beside them as the build expects.
+      renderVendor =
+        pkgs:
+        pkgs.runCommand "symbol-render-vendor" { } (
+          ''
+            mkdir -p "$out"
+          ''
+          + lib.concatMapStrings (
+            package:
+            let
+              tarball = pkgs.fetchurl {
+                inherit (package) url;
+                hash = package.integrity;
+              };
+            in
+            ''
+              unpack=$(mktemp -d)
+              tar -xzf ${tarball} -C "$unpack"
+            ''
+            + lib.concatMapStrings (
+              file:
+              if file ? suffix then
+                ''
+                  mkdir -p "$out/${file.to}"
+                  found=
+                  for path in "$unpack/${file.from}"/*${file.suffix}; do
+                    [ -f "$path" ] || continue
+                    cp "$path" "$out/${file.to}/"
+                    found=1
+                  done
+                  [ -n "$found" ]
+                ''
+              else
+                ''
+                  mkdir -p "$(dirname "$out/${file.to}")"
+                  cp "$unpack/${file.from}" "$out/${file.to}"
+                ''
+            ) package.files
+          ) vendorManifest.package
+          + ''
+            cp ${./static/vendor.toml} "$out/vendor.toml"
+          ''
+        );
+      # The source every build and check uses: the repository plus the
+      # fetched files, in the place a plain cargo build finds them.
+      sourceFor =
+        pkgs:
+        pkgs.runCommand "symbol-source" { } ''
+          cp -R ${src} "$out"
+          chmod -R u+w "$out"
+          cp -R ${renderVendor pkgs} "$out/static/vendor"
+          chmod -R u+w "$out/static/vendor"
+        '';
     in
     {
       packages = forEachSystem (
@@ -108,7 +167,7 @@
           symbol = rustPlatform.buildRustPackage {
             pname = "symbol";
             version = "0.1.0";
-            inherit src;
+            src = sourceFor pkgs;
             cargoLock.lockFile = ./Cargo.lock;
             cargoTestFlags = [
               "--workspace"
@@ -131,6 +190,7 @@
         {
           inherit symbol;
           default = symbol;
+          render-vendor = renderVendor pkgs;
         }
       );
 
@@ -199,7 +259,7 @@
           generatedSources = rustPlatform.buildRustPackage {
             pname = "symbol-generated-sources";
             version = "0.1.0";
-            inherit src;
+            src = sourceFor pkgs;
             cargoLock.lockFile = ./Cargo.lock;
             cargoBuildFlags = [
               "-p"
@@ -271,7 +331,7 @@
           sdkCheck =
             name: nativeBuildInputs: command:
             pkgs.runCommand name {
-              inherit src;
+              src = sourceFor pkgs;
               SYMBOL_GENERATED_DIR = generatedSources;
               inherit nativeBuildInputs;
             } ''
@@ -425,6 +485,16 @@
             pkgs.typescript
             pkgs.uv
           ] ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.chromium ];
+          # Put the pinned Markdown page assets where cargo expects them, from
+          # the Nix store, whenever they are missing or out of date.
+          shellHook = ''
+            if [ -f static/vendor.toml ] \
+              && ! cmp -s static/vendor.toml static/vendor/vendor.toml 2>/dev/null; then
+              rm -rf static/vendor
+              cp -R ${renderVendor pkgs} static/vendor
+              chmod -R u+w static/vendor
+            fi
+          '';
         };
       });
 

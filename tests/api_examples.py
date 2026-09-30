@@ -163,6 +163,29 @@ def execute_raw_http(example: HttpExample, managed_token: str, etag: str) -> Non
                 ("Idempotency-Key", "replace-data-v2"),
             ),
         )
+    elif example.request_line == "GET /hello/notes.md/RAW HTTP/1.1":
+        source = b"---\ntitle: Notes\n---\n# Notes\n\nEuler: $e^{i\\pi} + 1 = 0$\n"
+        fixture = request(
+            "PUT",
+            "/hello/notes.md",
+            source,
+            (("Authorization", f"Bearer {managed_token}"),),
+        )
+        require_status("raw RAW fixture", fixture, 200)
+        browser = (("Accept", "text/html,application/xhtml+xml,*/*;q=0.8"),)
+        rendered = request("GET", "/hello/notes.md", headers=browser)
+        require_status("documented Markdown rendering", rendered, 200)
+        if not rendered.header("Content-Type").startswith("text/html"):
+            raise AssertionError("a browser navigation did not receive rendered Markdown")
+        observed = request(method, path, headers=browser)
+        require_status(example.request_line, observed, example.expected_status)
+        if observed.body != source:
+            raise AssertionError("RAW did not return exactly the stored bytes")
+        if observed.header("Content-Type") != "text/markdown; charset=utf-8":
+            raise AssertionError("RAW changed the stored media type")
+        if request("GET", "/hello/notes.md").body != source:
+            raise AssertionError("a non-browser GET did not receive the Markdown source")
+        return
     elif example.request_line == "PATCH /hello/data.bin HTTP/1.1":
         content_hash = request("GET", f"{path}/HASH").body.decode().strip()
         observed = request(
@@ -188,6 +211,7 @@ def raw_http_examples() -> tuple[HttpExample, ...]:
         "PUT /hello HTTP/1.1": 200,
         "ALIAS /hello/current HTTP/1.1": 201,
         "REPLACE /hello/data.bin HTTP/1.1": 200,
+        "GET /hello/notes.md/RAW HTTP/1.1": 200,
         "PATCH /hello/data.bin HTTP/1.1": 200,
     }
     found: list[HttpExample] = []
@@ -379,7 +403,7 @@ def execute_phase_five_contract_examples() -> None:
     require_readable_location("allocation finalization", finalized)
     custom = request("GET", "/phase-five/custom/chosen")
     require_status("custom allocation media type", custom, 200)
-    if custom.header("Content-Type") != "text/plain":
+    if custom.header("Content-Type") != "text/plain; charset=utf-8":
         raise AssertionError("custom allocation did not preserve its media type")
 
     inventory = request(
@@ -437,7 +461,11 @@ require_status("raw merge fixture inventory", inventory, 200)
 baseline = inventory.header("ETag")
 
 examples = raw_http_examples()
-for raw_example in examples:
+# The RAW example publishes a Markdown fixture, which would invalidate the
+# baseline ETag that the documented merge example sends as If-Match.
+for raw_example in sorted(
+    examples, key=lambda item: item.request_line.endswith("/RAW HTTP/1.1")
+):
     execute_raw_http(raw_example, token, baseline)
 
 released_raw_state = request(
