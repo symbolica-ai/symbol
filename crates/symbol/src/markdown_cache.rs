@@ -31,22 +31,33 @@ pub static CACHE: LazyLock<RenderCache> =
 /// Identifies the renderer, so a deploy that changes rendering changes every
 /// key and a browser's old `ETag` stops matching.
 ///
-/// Covers the rendering module, the assets its pages link to, and the exact
-/// dependency versions, which include the Markdown parser.
+/// The build's commit covers every change to any file, which is what makes
+/// the tags safe across deploys: rendering also depends on code outside this
+/// module. A commit alone misses edits in a dirty working tree, so the
+/// rendering module, its assets and the exact dependency versions (the
+/// Markdown parser among them) are hashed as well.
 static RENDERER: LazyLock<blake3::Hash> = LazyLock::new(|| {
+    renderer_identity(
+        env!("SYMBOL_API_COMMIT"),
+        env!("SYMBOL_API_DIRTY"),
+        &[
+            include_str!("markdown.rs"),
+            include_str!("markdown_cache.rs"),
+            crate::assets::BUNDLE.as_str(),
+            include_str!("../../../Cargo.lock"),
+        ],
+    )
+});
+
+fn renderer_identity(commit: &str, dirty: &str, sources: &[&str]) -> blake3::Hash {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"symbol-markdown-renderer-v1\0");
-    for part in [
-        include_str!("markdown.rs"),
-        include_str!("markdown_cache.rs"),
-        crate::assets::BUNDLE.as_str(),
-        include_str!("../../../Cargo.lock"),
-    ] {
+    hasher.update(b"symbol-markdown-renderer-v2\0");
+    for part in [commit, dirty].iter().chain(sources) {
         hasher.update(&(part.len() as u64).to_le_bytes());
         hasher.update(part.as_bytes());
     }
     hasher.finalize()
-});
+}
 
 pub type Key = [u8; 32];
 
@@ -164,6 +175,32 @@ mod tests {
         // Length prefixes keep the boundary between name and path unambiguous.
         assert_ne!(key(content("a"), "ab", "c"), key(content("a"), "a", "bc"));
         assert!(etag(&base).starts_with("\"md-"));
+    }
+
+    #[test]
+    fn any_new_build_is_a_new_renderer() {
+        let base = renderer_identity("abc123", "false", &["module", "assets"]);
+        assert_eq!(
+            base,
+            renderer_identity("abc123", "false", &["module", "assets"])
+        );
+        // Another commit, even with the rendering sources untouched: the change
+        // may be in code those sources call.
+        assert_ne!(
+            base,
+            renderer_identity("def456", "false", &["module", "assets"])
+        );
+        // A dirty build of the same commit.
+        assert_ne!(
+            base,
+            renderer_identity("abc123", "true", &["module", "assets"])
+        );
+        // An uncommitted edit to the renderer on the same dirty commit.
+        assert_ne!(
+            renderer_identity("abc123", "true", &["module", "assets"]),
+            renderer_identity("abc123", "true", &["module edited", "assets"])
+        );
+        assert!(RENDERER.as_bytes() != &[0; 32]);
     }
 
     #[test]
