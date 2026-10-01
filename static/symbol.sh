@@ -121,7 +121,7 @@ usage:
   symbol expire [NAME [PATH]] [POLICY]
   symbol manage [NAME ACTION]
   symbol recover
-  symbol ls [-l] [--json] [NAME]
+  symbol ls [-l] [-R] [-p PAGE] [--limit N|--all] [--json] [NAME [PATH]]
   symbol rm NAME [PATH]
   symbol url NAME
   symbol api [--json]
@@ -291,12 +291,16 @@ idempotency identity.
 EOF
       ;;
     ls) cat <<'EOF'
-symbol ls: list sites or one site tree
-usage: symbol ls [-l|--links] [--json] [NAME]
+symbol ls: list sites, or one directory of a site
+usage: symbol ls [-l] [-R] [-p PAGE] [--limit N | --all] [--json] [NAME [PATH]]
 
-without NAME, lists sites. with NAME, lists every file and alias path.
--l adds URLs. names are taken from JSON fields and are not parsed from
-the table. --json writes the server listing or inventory document.
+without NAME, lists sites. NAME lists the site's top directory, and
+NAME PATH that directory: folders with their file count and size, then
+files and aliases. -R lists every file and alias in the site instead.
+
+in a terminal, 50 entries a page: -p 2 shows the next, --limit N sets
+the page size, --all shows everything. piped output is never paged.
+-l adds URLs. --json writes the server listing or inventory document.
 EOF
       ;;
     rm) cat <<'EOF'
@@ -356,12 +360,6 @@ request() {
   path=$2
   shift 2
   curl -sS -X "${method}" "$@" "${HOST}${path}"
-}
-
-# A listing or inventory as TSV. --fail turns a 404 into an error instead of
-# an error body the table printer would reject with a vaguer message.
-listing_tsv() {
-  curl -fsS -X "$1" -H 'Accept: text/tab-separated-values' "${HOST}$2"
 }
 
 print_api() {
@@ -585,37 +583,45 @@ function human_size(n,    units, i, value) {
 AWK
 }
 
-# Both listings arrive as TSV (Accept: text/tab-separated-values): a header
-# line, then one entry per line. Stored names contain no tabs or newlines, so
-# a field split is exact and the whole listing is read in one linear pass.
-print_listing() {
+# Listings arrive as TSV (Accept: text/tab-separated-values): a header line,
+# then one entry per line. Stored names contain no tabs or newlines, so a field
+# split is exact and a listing is read in one linear pass.
+#
+# print_entries reads site and directory listings (kind files bytes name
+# target); print_inventory reads the recursive inventory (kind size value path).
+print_entries() {
   base=${1%/}
   links=$2
-  LC_ALL=C awk -F '\t' -v base="${base}" -v links="${links}" "$(ls_awk_lib)"'
+  complete=$3
+  LC_ALL=C awk -F '\t' -v base="${base}" -v links="${links}" -v complete="${complete}" "$(ls_awk_lib)"'
     NR == 1 {
-      if ($0 != "kind\tfiles\tbytes\tname") { bad = 1; exit 1 }
+      if ($0 != "kind\tfiles\tbytes\tname\ttarget") { bad = 1; exit 1 }
       next
     }
     {
-      kind = $1; files = $2; bytes = $3; name = $4
+      kind = $1; files = $2; bytes = $3; name = $4; target = $5
       n++
+      folder = kind == "site" || kind == "builtin" || kind == "directory"
       row = links ? base "/" name : name
-      if (!links && (kind == "site" || kind == "builtin")) row = name "/"
+      if (folder) row = row "/"
+      if (kind == "alias") row = row " -> " target
       rows[n] = row
       if (kind == "builtin") meta[n] = "built-in"
-      else {
-        meta[n] = files " files   " human_size(bytes)
-        total_files += files
-        total_bytes += bytes
-      }
+      else if (kind == "alias") meta[n] = ""
+      else if (folder) meta[n] = files " files   " human_size(bytes)
+      else meta[n] = human_size(bytes)
+      if (kind == "site") { total_files += files; total_bytes += bytes; sites++ }
       w[n] = cols(row)
       if (w[n] > width) width = w[n]
     }
     END {
       if (bad || NR == 0) exit 1
-      for (i = 1; i <= n; i++)
-        printf "%s%s  %s\n", rows[i], spaces(width - w[i]), meta[i]
-      printf "%s  %d files   %s total\n", spaces(width), total_files, human_size(total_bytes)
+      for (i = 1; i <= n; i++) {
+        if (meta[i] == "") print rows[i]
+        else printf "%s%s  %s\n", rows[i], spaces(width - w[i]), meta[i]
+      }
+      if (sites && complete)
+        printf "%s  %d files   %s total\n", spaces(width), total_files, human_size(total_bytes)
     }
   '
 }
@@ -646,6 +652,47 @@ print_inventory() {
       }
     }
   '
+}
+
+# Lists one page of a TSV listing, then says how to see the rest.
+#   list_page URL_PATH PRINTER DISPLAY_BASE LINKS LIMIT PAGE COMMAND
+# LIMIT is empty for everything. COMMAND is the user's ls invocation without
+# paging flags, for the hint.
+list_page() {
+  lp_path=$1
+  lp_printer=$2
+  lp_base=$3
+  lp_links=$4
+  lp_limit=$5
+  lp_page=$6
+  lp_command=$7
+  lp_url="${HOST}${lp_path}"
+  if [ -n "${lp_limit}" ]; then
+    case "${lp_path}" in
+      *\?*) lp_url="${lp_url}&limit=${lp_limit}&page=${lp_page}" ;;
+      *) lp_url="${lp_url}?limit=${lp_limit}&page=${lp_page}" ;;
+    esac
+  fi
+  http_request GET "${lp_url}" -L -H 'Accept: text/tab-separated-values' || exit 1
+  lp_total=$(header_value Entry-Count)
+  [ -n "${lp_total}" ] ||
+    die "${HOST} did not return a paged listing; it may predate this client"
+  lp_complete=1
+  [ -z "${lp_limit}" ] || [ "${lp_total}" -le "${lp_limit}" ] || lp_complete=0
+  if [ "${lp_printer}" = entries ]; then
+    print_entries "${lp_base}" "${lp_links}" "${lp_complete}" < "${HTTP_BODY}"
+  else
+    print_inventory "${lp_base}" "${lp_links}" < "${HTTP_BODY}"
+  fi || die "${HOST} returned a listing this client cannot read"
+  [ -n "${lp_limit}" ] || return 0
+  lp_pages=$(( (lp_total + lp_limit - 1) / lp_limit ))
+  [ "${lp_pages}" -gt 1 ] || return 0
+  if [ "${lp_page}" -lt "${lp_pages}" ]; then
+    printf '\npage %s of %s (%s entries): %s -p %s for more, --all for everything\n' \
+      "${lp_page}" "${lp_pages}" "${lp_total}" "${lp_command}" "$(( lp_page + 1 ))" >&2
+  else
+    printf '\npage %s of %s (%s entries)\n' "${lp_page}" "${lp_pages}" "${lp_total}" >&2
+  fi
 }
 
 die() {
@@ -2961,7 +3008,7 @@ sync_project() {
   baseline_entry_map "${MANIFEST}" | LC_ALL=C sort > "${baseline}"
   local_entry_map "${MANIFEST_DIR}" "${MANIFEST}" "${baseline}" \
     "${MANIFEST_HOST}" "${MANIFEST_NAME}" | LC_ALL=C sort > "${localmap}"
-  if ! http_request GET "${MANIFEST_HOST}/${MANIFEST_NAME}/FILES" \
+  if ! http_request GET "${MANIFEST_HOST}/${MANIFEST_NAME}/FILES?recursive" \
     -H 'Accept: text/tab-separated-values'; then
     rm -rf "${work}"
     return 1
@@ -3118,7 +3165,7 @@ sync_project() {
   if [ "${sync_failed}" -eq 1 ] && [ "${sync_response_lost}" -eq 1 ] &&
     [ "${HTTP_STATUS:-}" = 412 ]; then
     recovered_upstream=${work}/recovered-upstream
-    if http_request GET "${MANIFEST_HOST}/${MANIFEST_NAME}/FILES" \
+    if http_request GET "${MANIFEST_HOST}/${MANIFEST_NAME}/FILES?recursive" \
       -H 'Accept: text/tab-separated-values'; then
       upstream_entry_map "${HTTP_BODY}" | LC_ALL=C sort > "${recovered_upstream}"
       sync_verify_failed=0
@@ -3328,32 +3375,94 @@ case "${cmd}" in
     ;;
   ls)
     links=0
+    recursive=0
+    ls_limit=
+    ls_page=1
+    ls_all=0
+    ls_flags=
+    ls_name=
+    ls_where=
+    ls_args=0
+    # Flags may come before or after NAME and PATH: `symbol ls nlab -p 2`.
     while [ "$#" -gt 0 ]; do
       case "$1" in
-        -l|--links) links=1; shift ;;
-        --) shift; break ;;
-        -*) usage_error "unknown flag: $1" ;;
-        *) break ;;
+        -l|--links) links=1; ls_flags="${ls_flags} -l"; shift ;;
+        -R|--recursive) recursive=1; ls_flags="${ls_flags} -R"; shift ;;
+        -a|--all) ls_all=1; shift ;;
+        -p|--page)
+          [ "$#" -ge 2 ] || usage_error "$1 needs a page number"
+          ls_page=$2; shift 2 ;;
+        --page=*) ls_page=${1#--page=}; shift ;;
+        -n|--limit)
+          [ "$#" -ge 2 ] || usage_error "$1 needs a number of entries"
+          ls_limit=$2; ls_flags="${ls_flags} --limit $2"; shift 2 ;;
+        --limit=*) ls_limit=${1#--limit=}; ls_flags="${ls_flags} --limit ${ls_limit}"; shift ;;
+        --)
+          shift
+          while [ "$#" -gt 0 ]; do
+            ls_args=$((ls_args + 1))
+            case "${ls_args}" in 1) ls_name=$1 ;; 2) ls_where=$1 ;; esac
+            shift
+          done
+          ;;
+        -?*) usage_error "unknown flag: $1" ;;
+        *)
+          ls_args=$((ls_args + 1))
+          case "${ls_args}" in 1) ls_name=$1 ;; 2) ls_where=$1 ;; esac
+          shift
+          ;;
       esac
     done
-    [ "$#" -le 1 ] || usage_error "ls accepts at most one site name"
+    [ "${ls_args}" -le 2 ] || usage_error "usage: symbol ls [NAME [PATH]]"
+    set --
+    [ "${ls_args}" -lt 1 ] || set -- "${ls_name}"
+    [ "${ls_args}" -lt 2 ] || set -- "${ls_name}" "${ls_where}"
+    for ls_number in "${ls_page}" "${ls_limit:-1}"; do
+      case "${ls_number}" in
+        ''|*[!0123456789]*|0*) usage_error "page and limit must be whole numbers from 1" ;;
+      esac
+    done
+    [ "${recursive}" -eq 0 ] || [ "$#" -eq 1 ] || usage_error "ls -R takes exactly one site name"
+    # Like ls(1) choosing columns, page only for a person: a pipe gets every
+    # entry, so `symbol ls nlab | grep x` searches the whole directory.
+    if [ "${ls_all}" -eq 1 ]; then
+      ls_limit=
+    elif [ -z "${ls_limit}" ] && [ -t 1 ]; then
+      ls_limit=50
+    fi
+    if [ -z "${ls_limit}" ] && [ "${ls_page}" -ne 1 ]; then
+      usage_error "-p needs a limit; output is not a terminal, so pass --limit"
+    fi
     if [ "$#" -eq 0 ]; then
       if [ "${JSON_OUTPUT}" -eq 1 ]; then
         request GET /FILES -H 'Accept: application/json'
         printf '\n'
       else
-        listing_tsv GET /FILES | print_listing "${HOST}" "${links}" ||
-          die "${HOST} did not return a site listing"
+        list_page /FILES entries "${HOST}" "${links}" "${ls_limit}" "${ls_page}" \
+          "symbol ls${ls_flags}"
       fi
     else
       name=$1
       is_site_name "${name}" || usage_error "invalid site name: ${name}"
-      if [ "${JSON_OUTPUT}" -eq 1 ]; then
-        request GET "/${name}/FILES" -H 'Accept: application/json'
-        printf '\n'
+      ls_dir=${2:-}
+      ls_dir=${ls_dir#/}
+      ls_dir=${ls_dir%/}
+      if [ -n "${ls_dir}" ]; then
+        ls_path="/${name}/FILES/$(urlencode_path "${ls_dir}")/"
+        ls_base="${HOST}/${name}/${ls_dir}"
       else
-        listing_tsv GET "/${name}/FILES" | print_inventory "${HOST}/${name}" "${links}" ||
-          die "${HOST} did not return an inventory for ${name}"
+        ls_path="/${name}/FILES"
+        ls_base="${HOST}/${name}"
+      fi
+      if [ "${JSON_OUTPUT}" -eq 1 ]; then
+        request GET "${ls_path}" -L -H 'Accept: application/json'
+        printf '\n'
+      elif [ "${recursive}" -eq 1 ]; then
+        list_page "/${name}/FILES?recursive" inventory "${ls_base}" "${links}" \
+          "${ls_limit}" "${ls_page}" "symbol ls${ls_flags} ${name}"
+      else
+        list_page "${ls_path}" entries "${ls_base}" "${links}" "${ls_limit}" "${ls_page}" \
+          "symbol ls${ls_flags} ${name}${2:+ ${2}}"
       fi
     fi
     ;;

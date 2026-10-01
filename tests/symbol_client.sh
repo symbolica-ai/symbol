@@ -55,7 +55,8 @@ done
 } >> "$MOCK_CURL_LOG"
 
 status=200 body=ok location=
-case "$method:$url" in
+url_path=${url%%\?*}
+case "$method:$url_path" in
   COPY:*)
     status=201
     destination=$(printf '%s\n' "$headers" | awk -F ': ' '$1=="Destination"{print $2}')
@@ -125,7 +126,7 @@ tree_hash = "blake3:new"
   GET:http://mock/FILES)
     body='{"path":"/","files":2,"bytes":10,"entries":[{"kind":"site","name":"hello","files":2,"bytes":10}]}'
     ;;
-  GET:*/FILES)
+  GET:*/FILES|GET:*/FILES/*)
     if [ "${MOCK_LIST_ALIASES:-0}" = 1 ]; then
       body='{"site":"hello","content_revision":1,"tree_hash":"blake3:base","files":[],"aliases":[{"path":"file-link","target":"index.html","target_kind":"file"},{"path":"dir-link","target":"assets","target_kind":"directory"}]}'
     elif [ -n "${MOCK_LARGE_INVENTORY:-}" ]; then
@@ -180,36 +181,73 @@ if [ "${MOCK_DROP_ONCE_METHOD:-}" = "$method" ] &&
 fi
 
 # The server serves listings and inventories as TSV when asked; derive that
-# representation, and the identity headers it carries, from the JSON fixture.
-files_etag= files_revision=
-case "$method:$url" in
-  GET:*/FILES|GET:*/FILES/)
+# representation, its paging, and the headers it carries, from the JSON
+# fixture: the site list, one directory of the inventory, or (with
+# ?recursive) the whole inventory.
+files_etag= files_revision= files_count= files_link=
+case "$method:$url_path" in
+  GET:*/FILES|GET:*/FILES/|GET:*/FILES/*)
     if printf '%s\n' "$headers" | grep -q '^Accept: text/tab-separated-values'; then
-      files_meta=$(printf '%s' "$body" | python3 -c '
-import json, sys
+      files_out=$(printf '%s' "$body" | python3 -c '
+import json, sys, urllib.parse
+url = sys.argv[1]
 d = json.load(sys.stdin)
+split = urllib.parse.urlsplit(url)
+query = urllib.parse.parse_qs(split.query, keep_blank_values=True)
+def cell(f):
+    return "" if f is None else str(f)
+def row(*fields):
+    return "\t".join(cell(f) for f in fields)
+if "entries" in d:
+    header = "kind\tfiles\tbytes\tname\ttarget"
+    rows = [row(e["kind"], e.get("files"), e["bytes"], e["name"], e.get("target")) for e in d["entries"]]
+elif "recursive" in query:
+    header = "kind\tsize\tvalue\tpath"
+    rows = [row("file", f["size"], f["hash"], f["path"]) for f in d.get("files", [])]
+    rows += [row("alias", a.get("size"), a["target"], a["path"]) for a in d.get("aliases", [])]
+else:
+    path = urllib.parse.unquote(split.path)
+    prefix = path.split("/FILES", 1)[1].strip("/")
+    prefix = prefix + "/" if prefix else ""
+    dirs, files, aliases = {}, [], []
+    for f in d.get("files", []):
+        if not f["path"].startswith(prefix):
+            continue
+        rest = f["path"][len(prefix):]
+        if "/" in rest:
+            name = rest.split("/", 1)[0]
+            count, size = dirs.get(name, (0, 0))
+            dirs[name] = (count + 1, size + f["size"])
+        else:
+            files.append((rest, f["size"]))
+    entries = [(n, "directory", c, b) for n, (c, b) in dirs.items()] + [(n, "file", None, b) for n, b in files]
+    header = "kind\tfiles\tbytes\tname\ttarget"
+    rows = [row(k, c, b, n, None) for n, k, c, b in sorted(entries)]
+    for a in d.get("aliases", []):
+        if a["path"].startswith(prefix) and "/" not in a["path"][len(prefix):]:
+            rows.append(row("alias", None, a.get("size"), a["path"][len(prefix):], a["target"]))
+total = len(rows)
+limit = int(query["limit"][0]) if "limit" in query else None
+page = int(query["page"][0]) if "page" in query else 1
+link = ""
+if limit:
+    rows = rows[(page - 1) * limit : page * limit]
+    pages = max(1, -(-total // limit))
+    if page < pages:
+        link = "<%s?limit=%d&page=%d>; rel=\"next\"" % (split.path, limit, page + 1)
 print(d.get("tree_hash", ""))
 print(d.get("content_revision", ""))
-')
-      files_etag=$(printf '%s\n' "$files_meta" | sed -n 1p)
-      files_revision=$(printf '%s\n' "$files_meta" | sed -n 2p)
-      body=$(printf '%s' "$body" | python3 -c '
-import json, sys
-d = json.load(sys.stdin)
-def row(*fields):
-    print("\t".join("" if f is None else str(f) for f in fields))
-if "entries" in d:
-    row("kind", "files", "bytes", "name")
-    for e in d["entries"]:
-        row(e["kind"], e.get("files"), e["bytes"], e["name"])
-else:
-    row("kind", "size", "value", "path")
-    for f in d.get("files", []):
-        row("file", f["size"], f["hash"], f["path"])
-    for a in d.get("aliases", []):
-        row("alias", a.get("size"), a["target"], a["path"])
-')
-      body="${body}
+print(total)
+print(link)
+print(header)
+for r in rows:
+    print(r)
+' "$url")
+      files_etag=$(printf '%s\n' "$files_out" | sed -n 1p)
+      files_revision=$(printf '%s\n' "$files_out" | sed -n 2p)
+      files_count=$(printf '%s\n' "$files_out" | sed -n 3p)
+      files_link=$(printf '%s\n' "$files_out" | sed -n 4p)
+      body="$(printf '%s\n' "$files_out" | sed '1,4d')
 "
     fi
     ;;
@@ -226,6 +264,8 @@ if [ -n "$dump" ]; then
     [ -z "$location" ] || printf 'Location: %s\r\n' "$location"
     [ -z "$files_etag" ] || printf 'ETag: "%s"\r\n' "$files_etag"
     [ -z "$files_revision" ] || printf 'Content-Revision: %s\r\n' "$files_revision"
+    [ -z "$files_count" ] || printf 'Entry-Count: %s\r\n' "$files_count"
+    [ -z "$files_link" ] || printf 'Link: %s\r\n' "$files_link"
     case "$method" in
       PUT|DELETE|COPY|MOVE|ALIAS|EXPIRE)
         printf 'Undo-Token: undo1\r\nUndo-Expires: 2027-01-01T00:00:00Z\r\n'
@@ -442,11 +482,36 @@ contains "${out}" 'http://mock/hello/12 B.txt' &&
 # One linear pass: 20000 entries took about ten minutes when the client parsed
 # the JSON inventory with awk string scanning.
 large_started=$(date +%s)
-large_rows=$(MOCK_LARGE_INVENTORY=20000 "${CLIENT}" ls hello | awk 'END{print NR}')
+large_rows=$(MOCK_LARGE_INVENTORY=20000 "${CLIENT}" ls -R hello | awk 'END{print NR}')
 large_seconds=$(( $(date +%s) - large_started ))
 [ "${large_rows}" -eq 20000 ] && [ "${large_seconds}" -lt 30 ] &&
-  ok 'ls lists a 20000-entry inventory in one pass' ||
-  not_ok "ls lists a 20000-entry inventory in one pass (${large_rows} rows, ${large_seconds}s)"
+  ok 'ls -R lists a 20000-entry inventory in one pass' ||
+  not_ok "ls -R lists a 20000-entry inventory in one pass (${large_rows} rows, ${large_seconds}s)"
+
+out=$(MOCK_LARGE_INVENTORY=20000 "${CLIENT}" ls hello)
+contains "${out}" 'section-000/  200 files' &&
+  [ "$(printf '%s\n' "${out}" | awk 'END{print NR}')" -eq 100 ] &&
+  ok 'ls NAME lists the top directory with folder counts' ||
+  not_ok 'ls NAME lists the top directory with folder counts'
+
+out=$(MOCK_LARGE_INVENTORY=20000 "${CLIENT}" ls hello section-007 --limit 3 -p 2 2>"${ROOT}/ls-err")
+err=$(cat "${ROOT}/ls-err")
+contains "${out}" 'page-000307/  1 files' &&
+  [ "$(printf '%s\n' "${out}" | awk 'END{print NR}')" -eq 3 ] &&
+  contains "${err}" 'page 2 of 67 (200 entries): symbol ls --limit 3 hello section-007 -p 3 for more' &&
+  ok 'ls pages a subdirectory with --limit and -p after the names' ||
+  not_ok 'ls pages a subdirectory with --limit and -p after the names'
+
+out=$(MOCK_LARGE_INVENTORY=20000 "${CLIENT}" ls hello 2>"${ROOT}/ls-err")
+[ ! -s "${ROOT}/ls-err" ] &&
+  ok 'piped ls is never paged' ||
+  not_ok 'piped ls is never paged'
+
+if "${CLIENT}" ls hello -p 2 >/dev/null 2>&1; then
+  not_ok 'piped ls -p without --limit is a usage error'
+else
+  ok 'piped ls -p without --limit is a usage error'
+fi
 
 out=$("${CLIENT}" ls --json hello)
 contains "${out}" '"path":"index.html"' &&
