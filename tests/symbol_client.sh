@@ -128,6 +128,13 @@ tree_hash = "blake3:new"
   GET:*/FILES)
     if [ "${MOCK_LIST_ALIASES:-0}" = 1 ]; then
       body='{"site":"hello","content_revision":1,"tree_hash":"blake3:base","files":[],"aliases":[{"path":"file-link","target":"index.html","target_kind":"file"},{"path":"dir-link","target":"assets","target_kind":"directory"}]}'
+    elif [ -n "${MOCK_LARGE_INVENTORY:-}" ]; then
+      body=$(python3 -c '
+import json, sys
+n = int(sys.argv[1])
+files = [{"path": "section-%03d/page-%06d/index.html" % (i % 100, i), "hash": "blake3:x", "size": i} for i in range(n)]
+print(json.dumps({"site": "hello", "content_revision": 1, "tree_hash": "blake3:base", "files": files, "aliases": []}))
+' "${MOCK_LARGE_INVENTORY}")
     elif [ "${MOCK_AWKWARD_NAMES:-0}" = 1 ]; then
       body='{"site":"hello","content_revision":1,"tree_hash":"blake3:base","files":[{"path":"12 B.txt","hash":"blake3:local","size":3},{"path":"-leading.txt","hash":"blake3:local","size":1},{"path":"has -> arrow.txt","hash":"blake3:local","size":4},{"path":"my file.txt","hash":"blake3:local","size":5},{"path":"unicodé.txt","hash":"blake3:local","size":2}],"aliases":[{"path":"link","target":"my file.txt","target_kind":"file"}]}'
     elif [ "${MOCK_ALIAS_INVENTORY:-0}" = 1 ]; then
@@ -172,6 +179,42 @@ if [ "${MOCK_DROP_ONCE_METHOD:-}" = "$method" ] &&
   exit 52
 fi
 
+# The server serves listings and inventories as TSV when asked; derive that
+# representation, and the identity headers it carries, from the JSON fixture.
+files_etag= files_revision=
+case "$method:$url" in
+  GET:*/FILES|GET:*/FILES/)
+    if printf '%s\n' "$headers" | grep -q '^Accept: text/tab-separated-values'; then
+      files_meta=$(printf '%s' "$body" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+print(d.get("tree_hash", ""))
+print(d.get("content_revision", ""))
+')
+      files_etag=$(printf '%s\n' "$files_meta" | sed -n 1p)
+      files_revision=$(printf '%s\n' "$files_meta" | sed -n 2p)
+      body=$(printf '%s' "$body" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+def row(*fields):
+    print("\t".join("" if f is None else str(f) for f in fields))
+if "entries" in d:
+    row("kind", "files", "bytes", "name")
+    for e in d["entries"]:
+        row(e["kind"], e.get("files"), e["bytes"], e["name"])
+else:
+    row("kind", "size", "value", "path")
+    for f in d.get("files", []):
+        row("file", f["size"], f["hash"], f["path"])
+    for a in d.get("aliases", []):
+        row("alias", a.get("size"), a["target"], a["path"])
+')
+      body="${body}
+"
+    fi
+    ;;
+esac
+
 if [ "$fail" = 1 ] && [ "$fail_status" = 1 ]; then
   printf 'curl: (22) The requested URL returned error: %s\n' "$status" >&2
   exit 22
@@ -181,6 +224,8 @@ if [ -n "$dump" ]; then
   {
     printf 'HTTP/1.1 %s OK\r\n' "$status"
     [ -z "$location" ] || printf 'Location: %s\r\n' "$location"
+    [ -z "$files_etag" ] || printf 'ETag: "%s"\r\n' "$files_etag"
+    [ -z "$files_revision" ] || printf 'Content-Revision: %s\r\n' "$files_revision"
     case "$method" in
       PUT|DELETE|COPY|MOVE|ALIAS|EXPIRE)
         printf 'Undo-Token: undo1\r\nUndo-Expires: 2027-01-01T00:00:00Z\r\n'
@@ -393,6 +438,15 @@ contains "${out}" 'http://mock/hello/12 B.txt' &&
   contains "${out}" 'http://mock/hello/link -> my file.txt' &&
   ok 'ls -l URLs are exact for awkward names' ||
   not_ok 'ls -l URLs are exact for awkward names'
+
+# One linear pass: 20000 entries took about ten minutes when the client parsed
+# the JSON inventory with awk string scanning.
+large_started=$(date +%s)
+large_rows=$(MOCK_LARGE_INVENTORY=20000 "${CLIENT}" ls hello | awk 'END{print NR}')
+large_seconds=$(( $(date +%s) - large_started ))
+[ "${large_rows}" -eq 20000 ] && [ "${large_seconds}" -lt 30 ] &&
+  ok 'ls lists a 20000-entry inventory in one pass' ||
+  not_ok "ls lists a 20000-entry inventory in one pass (${large_rows} rows, ${large_seconds}s)"
 
 out=$("${CLIENT}" ls --json hello)
 contains "${out}" '"path":"index.html"' &&

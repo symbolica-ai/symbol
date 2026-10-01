@@ -13,6 +13,9 @@ use crate::pathutil::pretty_html_name;
 use crate::store::{AliasResolvedKind, DirList, EntryKind, SiteList};
 
 pub fn sites(headers: &HeaderMap, list: &SiteList) -> Response {
+    if wants_tsv(headers) {
+        return cached_response(headers, sites_tsv(list), TSV_TYPE);
+    }
     if wants_json(headers) {
         let mut entries = vec![ListingEntry {
             kind: ListingKind::Builtin,
@@ -348,6 +351,56 @@ fn display_path(site: &str, rel: &str) -> String {
     } else {
         format!("{site}/{rel}/")
     }
+}
+
+/// The media type of the line-oriented listings: one entry per line, fields
+/// separated by tabs, a header line naming them. Stored names contain no
+/// control characters, so no field needs quoting, and any `awk` reads it.
+pub const TSV_TYPE: &str = "text/tab-separated-values; charset=utf-8";
+
+pub fn wants_tsv(headers: &HeaderMap) -> bool {
+    accepts(headers, "text/tab-separated-values")
+}
+
+/// A site's inventory as TSV: files, then aliases, each sorted by path.
+///
+/// `kind` is `file` or `alias`; `size` is bytes (empty for a dangling alias);
+/// `value` is a file's content hash or an alias's target.
+pub fn inventory_tsv(inventory: &symbol_contract::SiteInventory) -> String {
+    let mut out = String::with_capacity(64 + inventory.files.len() * 96);
+    out.push_str("kind\tsize\tvalue\tpath\n");
+    for file in &inventory.files {
+        let _ = writeln!(out, "file\t{}\t{}\t{}", file.size, file.hash, file.path);
+    }
+    for alias in &inventory.aliases {
+        let size = alias.size.map(|size| size.to_string()).unwrap_or_default();
+        let _ = writeln!(out, "alias\t{size}\t{}\t{}", alias.target, alias.path);
+    }
+    out
+}
+
+fn sites_tsv(list: &SiteList) -> String {
+    let mut out = String::from("kind\tfiles\tbytes\tname\n");
+    out.push_str("builtin\t\t0\tAPI\n");
+    for entry in &list.entries {
+        let _ = writeln!(
+            out,
+            "site\t{}\t{}\t{}",
+            entry.files, entry.bytes, entry.name
+        );
+    }
+    out
+}
+
+fn accepts(headers: &HeaderMap, media_type: &str) -> bool {
+    headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|accept| {
+            accept
+                .split(',')
+                .any(|part| part.trim().split(';').next().map(str::trim) == Some(media_type))
+        })
 }
 
 fn wants_json(headers: &HeaderMap) -> bool {

@@ -1450,7 +1450,14 @@ Canonical client: `symbol stats`.
 ### `GET /FILES` and `GET /FILES/`
 
 Lists all sites. HTML/plain negotiation follows `/`; exact
-`Accept: application/json` (parameters allowed) selects JSON.
+`Accept: application/json` (parameters allowed) selects JSON, and
+`Accept: text/tab-separated-values` selects TSV:
+
+```text
+kind	files	bytes	name
+builtin		0	API
+site	3	1200	hello
+```
 Generated `symbol.toml` contributes to these listing counts and logical bytes,
 unlike `/STATS`.
 
@@ -1673,7 +1680,26 @@ the newest-first publish timeline (`created`, `publish`, `rename`, `restore`),
 capped at 100 entries, where `files` counts changed paths. GET responses carry
 `Last-Modified` from the site's last publish time.
 The inventory JSON path does not process `If-None-Match`; it always returns
-`200`. Without JSON Accept, this route returns a cached body listing with the
+`200`.
+
+`Accept: text/tab-separated-values` selects the same inventory as TSV, with the
+same `ETag`, `Content-Revision`, and `Cache-Control` headers and
+`Vary: Accept`. It is the form for scripts and the shell client, which read it
+in one pass with any `awk`:
+
+```text
+kind	size	value	path
+file	14	blake3:<file hash>	index.html
+alias	14	index.html	home
+```
+
+The first line names the fields. Each further line is one file or alias, files
+first, each sorted by path. `size` is bytes, empty for a dangling alias, and
+`value` is a file's content hash or an alias's target. Fields need no quoting:
+stored paths never contain a tab, newline, or any other control character, as
+uploads containing one are rejected with `400`.
+
+Without JSON or TSV Accept, this route returns a cached body listing with the
 listing schema below.
 
 Canonical client: `symbol ls NAME`; `symbol sync` uses inventory JSON.

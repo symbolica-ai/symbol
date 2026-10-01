@@ -358,6 +358,12 @@ request() {
   curl -sS -X "${method}" "$@" "${HOST}${path}"
 }
 
+# A listing or inventory as TSV. --fail turns a 404 into an error instead of
+# an error body the table printer would reject with a vaguer message.
+listing_tsv() {
+  curl -fsS -X "$1" -H 'Accept: text/tab-separated-values' "${HOST}$2"
+}
+
 print_api() {
   json=$(cat)
   version=$(printf '%s\n' "${json}" | json_string api_version) ||
@@ -551,100 +557,19 @@ print_stats() {
   '
 }
 
-json_ls_lib() {
+ls_awk_lib() {
   cat <<'AWK'
+# Display columns of a UTF-8 string. The listings run under LC_ALL=C, so every
+# awk measures bytes; continuation bytes (0x80-0xBF) start no character.
+function cols(s,    t) {
+  t = s
+  gsub(/[\200-\277]/, "", t)
+  return length(t)
+}
 function spaces(n, out) {
   out = ""
   while (n-- > 0) out = out " "
   return out
-}
-function skip_string(s, i,    c) {
-  i++
-  while (i <= length(s)) {
-    c = substr(s, i, 1)
-    if (c == "\\") { i += 2; continue }
-    if (c == "\"") return i
-    i++
-  }
-  return i
-}
-function collect_objects(text, dest,    i, c, depth, start, n) {
-  n = 0
-  depth = 0
-  for (i = 1; i <= length(text); i++) {
-    c = substr(text, i, 1)
-    if (c == "\"") { i = skip_string(text, i); continue }
-    if (c == "{") {
-      if (depth == 0) start = i
-      depth++
-    } else if (c == "}") {
-      depth--
-      if (depth == 0) {
-        n++
-        dest[n] = substr(text, start, i - start + 1)
-      }
-    }
-  }
-  return n
-}
-function array_after(text, key,    token, start, i, c, depth) {
-  token = "\"" key "\""
-  start = index(text, token)
-  if (!start) return ""
-  text = substr(text, start + length(token))
-  sub(/^[[:space:]]*:[[:space:]]*/, "", text)
-  if (substr(text, 1, 1) != "[") return ""
-  depth = 0
-  for (i = 1; i <= length(text); i++) {
-    c = substr(text, i, 1)
-    if (c == "\"") { i = skip_string(text, i); continue }
-    if (c == "[") depth++
-    else if (c == "]") {
-      depth--
-      if (depth == 0) return substr(text, 1, i)
-    }
-  }
-  return text
-}
-function unescape(s,    out, i, c, n) {
-  out = ""
-  n = length(s)
-  for (i = 1; i <= n; i++) {
-    c = substr(s, i, 1)
-    if (c == "\\" && i < n) {
-      i++
-      c = substr(s, i, 1)
-      if (c == "n") out = out "\n"
-      else if (c == "t") out = out "\t"
-      else if (c == "r") out = out "\r"
-      else out = out c
-    } else out = out c
-  }
-  return out
-}
-function json_str(obj, key,    token, rest, i, c, start) {
-  token = "\"" key "\""
-  start = index(obj, token)
-  if (!start) return ""
-  rest = substr(obj, start + length(token))
-  sub(/^[[:space:]]*:[[:space:]]*/, "", rest)
-  if (substr(rest, 1, 1) != "\"") return ""
-  for (i = 2; i <= length(rest); i++) {
-    c = substr(rest, i, 1)
-    if (c == "\\") { i++; continue }
-    if (c == "\"") return unescape(substr(rest, 2, i - 2))
-  }
-  return ""
-}
-function json_num(obj, key,    token, rest, value) {
-  token = "\"" key "\""
-  if (!index(obj, token)) return ""
-  rest = substr(obj, index(obj, token) + length(token))
-  sub(/^[[:space:]]*:[[:space:]]*/, "", rest)
-  if (substr(rest, 1, 4) == "null") return ""
-  split(rest, value, /[,}]/)
-  gsub(/[[:space:]]/, "", value[1])
-  return value[1]
 }
 function human_size(n,    units, i, value) {
   units[1] = "B"; units[2] = "KiB"; units[3] = "MiB"
@@ -660,45 +585,37 @@ function human_size(n,    units, i, value) {
 AWK
 }
 
+# Both listings arrive as TSV (Accept: text/tab-separated-values): a header
+# line, then one entry per line. Stored names contain no tabs or newlines, so
+# a field split is exact and the whole listing is read in one linear pass.
 print_listing() {
   base=${1%/}
   links=$2
-  awk -v base="${base}" -v links="${links}" "$(json_ls_lib)"'
+  LC_ALL=C awk -F '\t' -v base="${base}" -v links="${links}" "$(ls_awk_lib)"'
+    NR == 1 {
+      if ($0 != "kind\tfiles\tbytes\tname") { bad = 1; exit 1 }
+      next
+    }
     {
-      text = text $0
+      kind = $1; files = $2; bytes = $3; name = $4
+      n++
+      row = links ? base "/" name : name
+      if (!links && (kind == "site" || kind == "builtin")) row = name "/"
+      rows[n] = row
+      if (kind == "builtin") meta[n] = "built-in"
+      else {
+        meta[n] = files " files   " human_size(bytes)
+        total_files += files
+        total_bytes += bytes
+      }
+      w[n] = cols(row)
+      if (w[n] > width) width = w[n]
     }
     END {
-      n = collect_objects(array_after(text, "entries"), obj)
-      for (i = 1; i <= n; i++) {
-        kind = json_str(obj[i], "kind")
-        name = json_str(obj[i], "name")
-        target = json_str(obj[i], "target")
-        files = json_num(obj[i], "files")
-        bytes = json_num(obj[i], "bytes")
-        label = name
-        if (kind == "site" || kind == "directory" || kind == "builtin") label = name "/"
-        if (links) {
-          if (kind == "builtin") row = base "/" name
-          else row = base "/" name
-        } else row = label
-        if (kind == "alias" && target != "") row = row " -> " target
-        rows[i] = row
-        if (kind == "builtin") meta[i] = "built-in"
-        else if (files != "") meta[i] = files " files   " human_size(bytes)
-        else if (bytes != "") meta[i] = human_size(bytes)
-        else meta[i] = ""
-        if (length(row) > width) width = length(row)
-      }
-      for (i = 1; i <= n; i++) {
-        if (meta[i] == "") print rows[i]
-        else printf "%s%s  %s\n", rows[i], spaces(width - length(rows[i])), meta[i]
-      }
-      total_files = json_num(text, "files")
-      total_bytes = json_num(text, "bytes")
-      if (total_files != "") {
-        printf "%s%s  %s files   %s total\n",
-          spaces(width), "", total_files, human_size(total_bytes)
-      }
+      if (bad || NR == 0) exit 1
+      for (i = 1; i <= n; i++)
+        printf "%s%s  %s\n", rows[i], spaces(width - w[i]), meta[i]
+      printf "%s  %d files   %s total\n", spaces(width), total_files, human_size(total_bytes)
     }
   '
 }
@@ -706,36 +623,26 @@ print_listing() {
 print_inventory() {
   base=${1%/}
   links=$2
-  awk -v base="${base}" -v links="${links}" "$(json_ls_lib)"'
+  LC_ALL=C awk -F '\t' -v base="${base}" -v links="${links}" "$(ls_awk_lib)"'
+    NR == 1 {
+      if ($0 != "kind\tsize\tvalue\tpath") { bad = 1; exit 1 }
+      next
+    }
     {
-      text = text $0
+      kind = $1; size = $2; value = $3; path = $4
+      n++
+      row = links ? base "/" path : path
+      if (kind == "alias") { row = row " -> " value; meta[n] = "" }
+      else meta[n] = human_size(size)
+      rows[n] = row
+      w[n] = cols(row)
+      if (w[n] > width) width = w[n]
     }
     END {
-      n = 0
-      files = collect_objects(array_after(text, "files"), fileobj)
-      for (i = 1; i <= files; i++) {
-        n++
-        path = json_str(fileobj[i], "path")
-        bytes = json_num(fileobj[i], "size")
-        row = links ? base "/" path : path
-        rows[n] = row
-        meta[n] = human_size(bytes)
-        if (length(row) > width) width = length(row)
-      }
-      aliases = collect_objects(array_after(text, "aliases"), aliasobj)
-      for (i = 1; i <= aliases; i++) {
-        n++
-        path = json_str(aliasobj[i], "path")
-        target = json_str(aliasobj[i], "target")
-        row = links ? base "/" path : path
-        if (target != "") row = row " -> " target
-        rows[n] = row
-        meta[n] = ""
-        if (length(row) > width) width = length(row)
-      }
+      if (bad || NR == 0) exit 1
       for (i = 1; i <= n; i++) {
         if (meta[i] == "") print rows[i]
-        else printf "%s%s  %s\n", rows[i], spaces(width - length(rows[i])), meta[i]
+        else printf "%s%s  %s\n", rows[i], spaces(width - w[i]), meta[i]
       }
     }
   '
@@ -2921,48 +2828,10 @@ local_entry_map() (
 )
 
 upstream_entry_map() {
-  awk '
-    {
-      text=text $0
-    }
-    END {
-      rest=text
-      while (match(rest, /\{"path"[[:space:]]*:[[:space:]]*"[^"]*"[^}]*"hash"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
-        object=substr(rest,RSTART,RLENGTH)
-        path=object
-        sub(/^.*"path"[[:space:]]*:[[:space:]]*"/,"",path)
-        sub(/".*$/,"",path)
-        hash=object
-        sub(/^.*"hash"[[:space:]]*:[[:space:]]*"/,"",hash)
-        sub(/".*$/,"",hash)
-        if (path != "symbol.toml") print path "\tF\t" hash
-        rest=substr(rest,RSTART+RLENGTH)
-      }
-      rest=text
-      while (match(rest, /\{"path"[[:space:]]*:[[:space:]]*"[^"]*"[^}]*"target"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
-        object=substr(rest,RSTART,RLENGTH)
-        path=object
-        sub(/^.*"path"[[:space:]]*:[[:space:]]*"/,"",path)
-        sub(/".*$/,"",path)
-        target=object
-        sub(/^.*"target"[[:space:]]*:[[:space:]]*"/,"",target)
-        sub(/".*$/,"",target)
-        print path "\tA\t" target
-        rest=substr(rest,RSTART+RLENGTH)
-      }
-      rest=text
-      while (match(rest, /\{"path"[[:space:]]*:[[:space:]]*"[^"]*"[^}]*"canonical_target"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
-        object=substr(rest,RSTART,RLENGTH)
-        path=object
-        sub(/^.*"path"[[:space:]]*:[[:space:]]*"/,"",path)
-        sub(/".*$/,"",path)
-        target=object
-        sub(/^.*"canonical_target"[[:space:]]*:[[:space:]]*"/,"",target)
-        sub(/".*$/,"",target)
-        print path "\tA\t" target
-        rest=substr(rest,RSTART+RLENGTH)
-      }
-    }
+  awk -F '\t' '
+    NR == 1 { next }
+    $1 == "file" && $4 != "symbol.toml" { print $4 "\tF\t" $3 }
+    $1 == "alias" { print $4 "\tA\t" $3 }
   ' "$1" | LC_ALL=C sort
 }
 
@@ -3092,12 +2961,13 @@ sync_project() {
   baseline_entry_map "${MANIFEST}" | LC_ALL=C sort > "${baseline}"
   local_entry_map "${MANIFEST_DIR}" "${MANIFEST}" "${baseline}" \
     "${MANIFEST_HOST}" "${MANIFEST_NAME}" | LC_ALL=C sort > "${localmap}"
-  if ! http_request GET "${MANIFEST_HOST}/${MANIFEST_NAME}/FILES" -H 'Accept: application/json'; then
+  if ! http_request GET "${MANIFEST_HOST}/${MANIFEST_NAME}/FILES" \
+    -H 'Accept: text/tab-separated-values'; then
     rm -rf "${work}"
     return 1
   fi
-  upstream_tree=$(json_string tree_hash < "${HTTP_BODY}")
-  upstream_revision=$(json_string content_revision < "${HTTP_BODY}")
+  upstream_tree=$(header_value ETag | tr -d '"')
+  upstream_revision=$(header_value Content-Revision)
   upstream_entry_map "${HTTP_BODY}" > "${upstream}"
   if [ "${upstream_tree}" != "${baseline_tree}" ] || ! cmp -s "${baseline}" "${upstream}"; then
     printf 'error: upstream changed since this checkout\n\n' >&2
@@ -3249,7 +3119,7 @@ sync_project() {
     [ "${HTTP_STATUS:-}" = 412 ]; then
     recovered_upstream=${work}/recovered-upstream
     if http_request GET "${MANIFEST_HOST}/${MANIFEST_NAME}/FILES" \
-      -H 'Accept: application/json'; then
+      -H 'Accept: text/tab-separated-values'; then
       upstream_entry_map "${HTTP_BODY}" | LC_ALL=C sort > "${recovered_upstream}"
       sync_verify_failed=0
       while IFS='	' read -r sync_action sync_path sync_kind sync_value; do
@@ -3468,20 +3338,22 @@ case "${cmd}" in
     done
     [ "$#" -le 1 ] || usage_error "ls accepts at most one site name"
     if [ "$#" -eq 0 ]; then
-      listing=$(request GET /FILES -H 'Accept: application/json')
       if [ "${JSON_OUTPUT}" -eq 1 ]; then
-        printf '%s\n' "${listing}"
+        request GET /FILES -H 'Accept: application/json'
+        printf '\n'
       else
-        printf '%s\n' "${listing}" | print_listing "${HOST}" "${links}"
+        listing_tsv GET /FILES | print_listing "${HOST}" "${links}" ||
+          die "${HOST} did not return a site listing"
       fi
     else
       name=$1
       is_site_name "${name}" || usage_error "invalid site name: ${name}"
-      inventory=$(request GET "/${name}/FILES" -H 'Accept: application/json')
       if [ "${JSON_OUTPUT}" -eq 1 ]; then
-        printf '%s\n' "${inventory}"
+        request GET "/${name}/FILES" -H 'Accept: application/json'
+        printf '\n'
       else
-        printf '%s\n' "${inventory}" | print_inventory "${HOST}/${name}" "${links}"
+        listing_tsv GET "/${name}/FILES" | print_inventory "${HOST}/${name}" "${links}" ||
+          die "${HOST} did not return an inventory for ${name}"
       fi
     fi
     ;;
