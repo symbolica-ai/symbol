@@ -887,16 +887,26 @@ return a token once; release makes writes open again. `--json` writes the
 
 ```sh
 symbol ls [--json]
-symbol ls -l [--json] NAME
+symbol ls nlab
+symbol ls nlab -p 2
+symbol ls --limit 200 nlab pagefind
+symbol ls --all -l nlab
+symbol ls -R nlab
 symbol stats [--json]
 symbol url NAME
 symbol api
 symbol api --json
 ```
 
-`ls` lists sites or one site tree from listing/inventory JSON fields, so
-names are never parsed out of the table. `-l` adds URLs. `ls -l --json` is
-the same as `ls --json`. `stats` shows logical/physical bytes, deduplication,
+`ls` lists sites, or one directory of a site: `NAME` is its top directory and
+`NAME PATH` a subdirectory, with folders showing their file count and size.
+`-R` lists every file and alias in the site instead. In a terminal, `ls` shows
+50 entries a page and says how many there are; `-p PAGE` picks a page,
+`--limit N` sets the page size, and `--all` shows everything. Piped output is
+never paged, so `symbol ls nlab | grep x` searches the whole directory. Flags
+may come before or after the names. `ls` reads the TSV listings, so names are
+never parsed out of a table. `-l` adds URLs. `--json` writes the server's JSON
+listing or inventory, unpaged. `stats` shows logical/physical bytes, deduplication,
 distributions, cache, and reader metrics. `url` prints one canonical site
 URL for scripting. `api` prints the live `/API/VERSION` document: semantic
 version, absolute revision, source hash, git commit, and dirty bit. `--json`
@@ -1454,10 +1464,38 @@ Lists all sites. HTML/plain negotiation follows `/`; exact
 `Accept: text/tab-separated-values` selects TSV:
 
 ```text
-kind	files	bytes	name
-builtin		0	API
-site	3	1200	hello
+kind	files	bytes	name	target
+builtin		0	API	
+site	3	1200	hello	
 ```
+
+#### TSV listings and paging
+
+Every listing route (`/FILES`, `/{name}/FILES`, `/{name}/FILES/{path...}`)
+serves TSV for scripts and the shell client. The first line names the fields;
+each further line is one entry. Fields need no quoting: stored paths never
+contain a tab, newline, or any other control character, as uploads containing
+one are rejected with `400`.
+
+A listing has the columns `kind files bytes name target`. `kind` is `builtin`,
+`site`, `directory`, `file`, or `alias`; `files` is the file count of a site,
+directory, or directory alias; `bytes` is its size; `target` is set for aliases
+only. A directory lists its subdirectories and files in name order, then its
+aliases.
+
+TSV responses take two query parameters:
+
+`limit`
+: The most entries to return, from 1 to 100000. Without it, every entry.
+
+`page`
+: Which page of `limit` entries, from 1. Requires `limit`. A page past the end
+  is empty, not an error.
+
+Every TSV response carries `Entry-Count`, the number of entries before paging.
+A paged response also carries `Link` with `rel="prev"` and `rel="next"` URLs
+for the neighbouring pages, keeping the other query parameters. Invalid
+paging parameters return `400`. JSON, HTML, and plain responses ignore them.
 Generated `symbol.toml` contributes to these listing counts and logical bytes,
 unlike `/STATS`.
 
@@ -1682,10 +1720,11 @@ capped at 100 entries, where `files` counts changed paths. GET responses carry
 The inventory JSON path does not process `If-None-Match`; it always returns
 `200`.
 
-`Accept: text/tab-separated-values` selects the same inventory as TSV, with the
-same `ETag`, `Content-Revision`, and `Cache-Control` headers and
-`Vary: Accept`. It is the form for scripts and the shell client, which read it
-in one pass with any `awk`:
+`Accept: text/tab-separated-values` returns the site's top directory as a TSV
+listing (see `/FILES`), paged with `limit` and `page` and carrying
+`Entry-Count` and `Link`. Adding `?recursive` returns the whole inventory as
+TSV instead, with the same `ETag`, `Content-Revision`, and `Cache-Control`
+headers as the JSON form and `Vary: Accept`:
 
 ```text
 kind	size	value	path
@@ -1693,11 +1732,9 @@ file	14	blake3:<file hash>	index.html
 alias	14	index.html	home
 ```
 
-The first line names the fields. Each further line is one file or alias, files
-first, each sorted by path. `size` is bytes, empty for a dangling alias, and
-`value` is a file's content hash or an alias's target. Fields need no quoting:
-stored paths never contain a tab, newline, or any other control character, as
-uploads containing one are rejected with `400`.
+Files come first, then aliases, each sorted by path. `size` is bytes, empty for
+a dangling alias, and `value` is a file's content hash or an alias's target.
+`limit` and `page` page it too; `symbol sync` reads it whole.
 
 Without JSON or TSV Accept, this route returns a cached body listing with the
 listing schema below.
@@ -1723,7 +1760,9 @@ file redirects with `307` to its content URL. JSON listing schema:
 ```
 
 `kind` is `directory` or `file`. `files` is omitted on file entries. Success,
-caching, and content negotiation match `/FILES`.
+caching, and content negotiation match `/FILES`, including the TSV listing with
+`limit`, `page`, `Entry-Count`, and `Link`. The trailing-slash redirect keeps
+the query string.
 
 <!-- contract:site put -->
 ### `PUT /{name}` and `PUT /{name}/`

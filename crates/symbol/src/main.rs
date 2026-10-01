@@ -41,7 +41,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use axum::body::Body;
-use axum::extract::{ConnectInfo, Extension, Path, State};
+use axum::extract::{ConnectInfo, Extension, OriginalUri, Path, Query, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Redirect, Response};
@@ -1044,9 +1044,14 @@ async fn symbol_sh(State(app): State<App>, headers: HeaderMap) -> Response {
     render_script(SYMBOL_SH, &app.public_url, &headers)
 }
 
-async fn list_sites(State(app): State<App>, headers: HeaderMap) -> Response {
+async fn list_sites(
+    State(app): State<App>,
+    OriginalUri(uri): OriginalUri,
+    Query(query): Query<browse::ListingQuery>,
+    headers: HeaderMap,
+) -> Response {
     match app.run_store(|store| store.list_sites()).await {
-        Ok(names) => browse::sites(&headers, &names),
+        Ok(names) => browse::sites(&headers, &uri, &query, &names),
         Err(err) => err.into_response(),
     }
 }
@@ -2282,6 +2287,8 @@ async fn redirect_site(State(app): State<App>, Path(name): Path<String>) -> Resp
 async fn browse_root(
     State(app): State<App>,
     Path(name): Path<String>,
+    OriginalUri(uri): OriginalUri,
+    Query(query): Query<browse::ListingQuery>,
     headers: HeaderMap,
 ) -> Response {
     if headers
@@ -2321,6 +2328,13 @@ async fn browse_root(
         };
     }
     if browse::wants_tsv(&headers) {
+        let paging = match browse::Paging::parse(&query) {
+            Ok(paging) => paging,
+            Err(message) => return browse::bad_query(message),
+        };
+        if !query.recursive() {
+            return browse_dir(&app, &name, "", true, &headers, Some((&uri, paging))).await;
+        }
         let result = app
             .run_store({
                 let name = name.clone();
@@ -2329,13 +2343,14 @@ async fn browse_root(
             .await;
         return match result {
             Ok(inventory) => {
-                let body = browse::inventory_tsv(&inventory);
+                let page = browse::inventory_tsv(&inventory, paging);
+                let total = page.total;
                 let mut response = (
                     [(
                         header::CONTENT_TYPE,
                         HeaderValue::from_static(browse::TSV_TYPE),
                     )],
-                    body,
+                    page.body,
                 )
                     .into_response();
                 let response_headers = response.headers_mut();
@@ -2352,17 +2367,20 @@ async fn browse_root(
                 response_headers
                     .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
                 response_headers.insert(header::VARY, HeaderValue::from_static("Accept"));
+                browse::add_paging_headers(&mut response, &uri, paging, total);
                 response
             }
             Err(err) => err.into_response(),
         };
     }
-    browse_dir(&app, &name, "", true, &headers).await
+    browse_dir(&app, &name, "", true, &headers, None).await
 }
 
 async fn browse_path(
     State(app): State<App>,
     Path((name, path)): Path<(String, String)>,
+    OriginalUri(uri): OriginalUri,
+    Query(query): Query<browse::ListingQuery>,
     headers: HeaderMap,
 ) -> Response {
     let rel = path.trim_end_matches('/');
@@ -2376,9 +2394,22 @@ async fn browse_path(
     match node {
         Ok(store::Node::Dir) => {
             if !path.is_empty() && !path.ends_with('/') {
-                return Redirect::temporary(&format!("/{name}/FILES/{path}/")).into_response();
+                let query = uri
+                    .query()
+                    .map(|query| format!("?{query}"))
+                    .unwrap_or_default();
+                return Redirect::temporary(&format!("/{name}/FILES/{path}/{query}"))
+                    .into_response();
             }
-            browse_dir(&app, &name, rel, true, &headers).await
+            let tsv = if browse::wants_tsv(&headers) {
+                match browse::Paging::parse(&query) {
+                    Ok(paging) => Some((&uri, paging)),
+                    Err(message) => return browse::bad_query(message),
+                }
+            } else {
+                None
+            };
+            browse_dir(&app, &name, rel, true, &headers, tsv).await
         }
         Ok(store::Node::File { .. }) => {
             let target = app
@@ -2403,6 +2434,7 @@ async fn browse_dir(
     rel: &str,
     files_view: bool,
     headers: &HeaderMap,
+    tsv: Option<(&axum::http::Uri, browse::Paging)>,
 ) -> Response {
     let result = app
         .run_store({
@@ -2412,7 +2444,7 @@ async fn browse_dir(
         })
         .await;
     match result {
-        Ok(entries) => browse::listing(headers, name, rel, &entries, files_view),
+        Ok(entries) => browse::listing(headers, name, rel, &entries, files_view, tsv),
         Err(err) => err.into_response(),
     }
 }
@@ -2510,7 +2542,7 @@ async fn serve_from(app: &App, name: &str, rel: &str, headers: &HeaderMap) -> Re
                 Ok(None) => {}
                 Err(err) => return err.into_response(),
             }
-            let mut response = browse_dir(app, name, rel, false, headers).await;
+            let mut response = browse_dir(app, name, rel, false, headers, None).await;
             add_target_expiry_headers(app, name, rel, response.headers_mut()).await;
             response
         }
@@ -3689,66 +3721,187 @@ mod tests {
         assert_eq!(rejected.status(), StatusCode::METHOD_NOT_ALLOWED);
     }
 
+    fn tsv_rows(body: &str) -> Vec<Vec<String>> {
+        body.lines()
+            .map(|line| line.split('\t').map(str::to_string).collect())
+            .collect()
+    }
+
     #[tokio::test]
-    async fn inventories_and_listings_are_served_as_tsv() {
+    async fn listings_and_inventories_are_served_as_tsv() {
         let root = tempfile::tempdir().unwrap();
         let store = Store::new(root.path().to_path_buf()).unwrap();
         store.put_file("tsv", "b dir/x y.txt", b"hello").unwrap();
+        store.put_file("tsv", "b dir/deep/z.txt", b"zz").unwrap();
         store.put_file("tsv", "a.txt", b"12").unwrap();
         store.put_file("tsv", "caf\u{e9}.md", b"#").unwrap();
+        store
+            .put_alias(
+                "tsv",
+                "link",
+                "a.txt",
+                store::FileMutationOptions::default(),
+            )
+            .unwrap();
         let app = router(test_app(store));
+        let tsv = [("accept", "text/tab-separated-values")];
 
-        let response = get_with(
-            &app,
-            "/tsv/FILES",
-            &[("accept", "text/tab-separated-values")],
-        )
-        .await;
+        // One directory: its folders, files, then aliases.
+        let response = get_with(&app, "/tsv/FILES", &tsv).await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response.headers()[header::CONTENT_TYPE],
             "text/tab-separated-values; charset=utf-8"
         );
-        for required in ["etag", "content-revision", "cache-control"] {
+        let rows = tsv_rows(&String::from_utf8(body_bytes(response).await).unwrap());
+        assert_eq!(rows[0], ["kind", "files", "bytes", "name", "target"]);
+        let names: Vec<&str> = rows[1..].iter().map(|row| row[3].as_str()).collect();
+        assert!(names.contains(&"b dir") && names.contains(&"a.txt") && names.contains(&"link"));
+        assert!(
+            !names.iter().any(|name| name.contains('/')),
+            "one level only: {names:?}"
+        );
+        let dir = rows.iter().find(|row| row[3] == "b dir").unwrap();
+        assert_eq!(
+            (dir[0].as_str(), dir[1].as_str(), dir[2].as_str()),
+            ("directory", "2", "7")
+        );
+        let alias = rows.iter().find(|row| row[3] == "link").unwrap();
+        assert_eq!((alias[0].as_str(), alias[4].as_str()), ("alias", "a.txt"));
+
+        // A subdirectory, and its trailing-slash redirect keeping the query.
+        let sub = get_with(&app, "/tsv/FILES/b%20dir/", &tsv).await;
+        let rows = tsv_rows(&String::from_utf8(body_bytes(sub).await).unwrap());
+        let names: Vec<&str> = rows[1..].iter().map(|row| row[3].as_str()).collect();
+        assert_eq!(names, ["deep", "x y.txt"]);
+        let redirect = get_with(&app, "/tsv/FILES/b%20dir?limit=1", &tsv).await;
+        assert_eq!(redirect.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert!(
+            redirect.headers()[header::LOCATION]
+                .to_str()
+                .unwrap()
+                .ends_with("/?limit=1")
+        );
+
+        // ?recursive is the whole inventory, with the site identity headers.
+        let response = get_with(&app, "/tsv/FILES?recursive", &tsv).await;
+        for required in ["etag", "content-revision", "cache-control", "entry-count"] {
             assert!(response.headers().contains_key(required), "{required}");
         }
-        assert_eq!(response.headers()[header::VARY], "Accept");
-        let body = String::from_utf8(body_bytes(response).await).unwrap();
-        let lines: Vec<&str> = body.lines().collect();
-        assert_eq!(lines[0], "kind\tsize\tvalue\tpath");
-        let rows: Vec<Vec<&str>> = lines[1..]
-            .iter()
-            .map(|line| line.split('\t').collect())
-            .collect();
-        assert!(rows.iter().all(|row| row.len() == 4), "{body}");
-        let paths: Vec<&str> = rows.iter().map(|row| row[3]).collect();
+        let rows = tsv_rows(&String::from_utf8(body_bytes(response).await).unwrap());
+        assert_eq!(rows[0], ["kind", "size", "value", "path"]);
+        let paths: Vec<&str> = rows[1..].iter().map(|row| row[3].as_str()).collect();
         assert_eq!(
             paths,
-            ["a.txt", "b dir/x y.txt", "caf\u{e9}.md"],
-            "sorted, symbol.toml excluded"
+            [
+                "a.txt",
+                "b dir/deep/z.txt",
+                "b dir/x y.txt",
+                "caf\u{e9}.md",
+                "link"
+            ],
+            "files sorted, symbol.toml excluded, aliases last"
         );
-        assert_eq!(rows[0][0], "file");
-        assert_eq!(rows[0][1], "2");
-        assert!(rows[0][2].starts_with("blake3:"));
+        assert!(rows[1][2].starts_with("blake3:"));
 
-        let sites = get_with(&app, "/FILES", &[("accept", "text/tab-separated-values")]).await;
+        let sites = get_with(&app, "/FILES", &tsv).await;
         let body = String::from_utf8(body_bytes(sites).await).unwrap();
         assert!(
-            body.starts_with("kind\tfiles\tbytes\tname\nbuiltin\t\t0\tAPI\n"),
+            body.starts_with("kind\tfiles\tbytes\tname\ttarget\nbuiltin\t\t0\tAPI\t\n"),
             "{body}"
         );
         assert!(
             body.lines()
-                .any(|line| line.starts_with("site\t") && line.ends_with("\ttsv"))
+                .any(|line| line.starts_with("site\t") && line.ends_with("\ttsv\t"))
         );
 
-        let missing = get_with(
+        let missing = get_with(&app, "/nope/FILES", &tsv).await;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn tsv_listings_page_with_limit_and_page() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::new(root.path().to_path_buf()).unwrap();
+        for index in 0..7 {
+            store
+                .put_file("paged", &format!("f{index}.txt"), b"x")
+                .unwrap();
+        }
+        let app = router(test_app(store));
+        let tsv = [("accept", "text/tab-separated-values")];
+        let names = |body: String| -> Vec<String> {
+            tsv_rows(&body)[1..]
+                .iter()
+                .map(|row| row[3].clone())
+                .collect()
+        };
+
+        // Seven files plus the generated symbol.toml.
+        let first = get_with(&app, "/paged/FILES?limit=3", &tsv).await;
+        assert_eq!(first.headers()["entry-count"], "8");
+        assert_eq!(
+            first.headers()[header::LINK],
+            "</paged/FILES?limit=3&page=2>; rel=\"next\""
+        );
+        assert_eq!(
+            names(String::from_utf8(body_bytes(first).await).unwrap()),
+            ["f0.txt", "f1.txt", "f2.txt"]
+        );
+
+        let middle = get_with(&app, "/paged/FILES?limit=3&page=2", &tsv).await;
+        assert_eq!(
+            middle.headers()[header::LINK],
+            "</paged/FILES?limit=3&page=1>; rel=\"prev\", </paged/FILES?limit=3&page=3>; rel=\"next\""
+        );
+        let last = get_with(&app, "/paged/FILES?limit=3&page=3", &tsv).await;
+        assert_eq!(
+            last.headers()[header::LINK],
+            "</paged/FILES?limit=3&page=2>; rel=\"prev\""
+        );
+        assert_eq!(
+            names(String::from_utf8(body_bytes(last).await).unwrap()),
+            ["f6.txt", "symbol.toml"]
+        );
+        let beyond = get_with(&app, "/paged/FILES?limit=3&page=9", &tsv).await;
+        assert_eq!(beyond.status(), StatusCode::OK);
+        assert!(names(String::from_utf8(body_bytes(beyond).await).unwrap()).is_empty());
+
+        let recursive = get_with(&app, "/paged/FILES?recursive&limit=2&page=2", &tsv).await;
+        assert_eq!(
+            recursive.headers()["entry-count"],
+            "7",
+            "the inventory excludes symbol.toml"
+        );
+        assert!(
+            recursive.headers()[header::LINK]
+                .to_str()
+                .unwrap()
+                .contains("recursive&limit=2&page=3")
+        );
+
+        let unpaged = get_with(&app, "/paged/FILES", &tsv).await;
+        assert!(unpaged.headers().get(header::LINK).is_none());
+        assert_eq!(unpaged.headers()["entry-count"], "8");
+
+        for bad in [
+            "limit=0",
+            "limit=x",
+            "page=2",
+            "limit=3&page=0",
+            "limit=100001",
+        ] {
+            let response = get_with(&app, &format!("/paged/FILES?{bad}"), &tsv).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{bad}");
+        }
+        // Paging parameters are ignored outside TSV, as before.
+        let json = get_with(
             &app,
-            "/nope/FILES",
-            &[("accept", "text/tab-separated-values")],
+            "/paged/FILES?limit=0",
+            &[("accept", "application/json")],
         )
         .await;
-        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        assert_eq!(json.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -4428,20 +4581,20 @@ mod tests {
         let store = Store::new(root.path().to_path_buf()).unwrap();
         store.put_file("hello", "a.txt", b"a").unwrap();
         let app = test_app(store.clone());
-        let response = browse_dir(&app, "hello", "", true, &HeaderMap::new()).await;
+        let response = browse_dir(&app, "hello", "", true, &HeaderMap::new(), None).await;
         let etag = response.headers()[header::ETAG].clone();
 
         let mut conditional = HeaderMap::new();
         conditional.insert(header::IF_NONE_MATCH, etag.clone());
         assert_eq!(
-            browse_dir(&app, "hello", "", true, &conditional)
+            browse_dir(&app, "hello", "", true, &conditional, None)
                 .await
                 .status(),
             StatusCode::NOT_MODIFIED
         );
 
         store.put_file("hello", "b.txt", b"bb").unwrap();
-        let response = browse_dir(&app, "hello", "", true, &conditional).await;
+        let response = browse_dir(&app, "hello", "", true, &conditional, None).await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_ne!(response.headers()[header::ETAG], etag);
     }

@@ -1,6 +1,6 @@
 {
   "format": 1,
-  "baseline_contract_sha256": "8fb320ef498f006330268806b21116994be914b5270c767b16d33482dbeeb9aa",
+  "baseline_contract_sha256": "639382f4bf3b1973e53c77bfb0feb41d91d99949fd711d0817c03c80800a7463",
   "baseline_endpoint_sha256": {
     "archive get": "6ae0a4026b29693b62df0ab0ff81feb1671d06c1abf4996418295bb26f0745df",
     "archive pop": "d5873a32e83f622c84641a05fb89f04cee62889d06ec92a824e78636d138fa09",
@@ -14,8 +14,8 @@
     "file expire": "5d40ebd2418ccc618e464dc5004caf1963505158c3819760fc93aae2ecd0a459",
     "file hash": "9213d900395ec6a3461a8a9df53894af79d9d7fb1c57320fb6ca501cc490e7bf",
     "file put": "d3ed4c45a1b86a45dc2af3c78801aab091060ee8c2cf9935bc34db1e43812547",
-    "files inventory": "a9f6c602bbbe4e9bf73d648a2adcae25262e4782bca4a3b33ced590aeb175e32",
-    "files subtree": "4d6ec5eb00fa7757cf902d8d5b93d48728c1e96252572d163301a3ff52e4f9f7",
+    "files inventory": "cc3fc353a1e48502886e6506bb188380e297f8578e4f60cc666025924f216f47",
+    "files subtree": "057a6805f59842d8d24f4cb52df1252bf60e796e0e36f939a12d1e392b3ce80b",
     "immutable blob": "1b6687ecdd2fb8795943d7870c16e8fd6d535ffde177e2a228adf4bf38e8014d",
     "installer": "e7869009b01bd59de3db403584847fd4cdf0ae37a364602098165c9d25939060",
     "installer hash": "2852fead1a63a646fab838c30f81be2fd9cf7f256e0e8b3ed3b3d7276df90c3d",
@@ -23,7 +23,7 @@
     "site expire": "8c94e5726498d769d9503be78497d84e22f32b4b16afceeadf88807cf5ecdefa",
     "site file": "9a0c881d8a61b906c7d337531837e45aa086937f37d3999a45e7952c338fc38e",
     "site index": "e81a927421d9059b4491d85a2cd264307b52719f6783435c3953de2346a5ed65",
-    "site listing": "f66ee659e8d83066bca572901b47ea87745a40b63d14c34465e504eba84b91aa",
+    "site listing": "005bbae1f6f1c4de6bdd0736476ce763f496777d339bc608168d04adce641d7e",
     "site management": "99ebcca6eb7f6974669023fa3710c441ac52763184fbd227938fcedb38ab307c",
     "site move": "55062e05695b05fb91545e977e3a5a7ae70f29a626bbffed85860c7d3380f5f8",
     "site pop": "a49732d18a7acd1b93f041788d6ae8df3569093a5c36bb1c38b1c19c18e09ac7",
@@ -222,6 +222,7 @@
     ],
     "response_headers": [
       "Content-Location",
+      "Entry-Count",
       "Symbol-API-Revision",
       "Symbol-API-Source-Hash",
       "Symbol-API-Version"
