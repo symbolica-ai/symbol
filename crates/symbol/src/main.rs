@@ -2320,6 +2320,43 @@ async fn browse_root(
             Err(err) => err.into_response(),
         };
     }
+    if browse::wants_tsv(&headers) {
+        let result = app
+            .run_store({
+                let name = name.clone();
+                move |store| store.site_inventory(&name)
+            })
+            .await;
+        return match result {
+            Ok(inventory) => {
+                let body = browse::inventory_tsv(&inventory);
+                let mut response = (
+                    [(
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_static(browse::TSV_TYPE),
+                    )],
+                    body,
+                )
+                    .into_response();
+                let response_headers = response.headers_mut();
+                response_headers.insert(
+                    header::ETAG,
+                    HeaderValue::from_str(&format!("\"{}\"", inventory.tree_hash))
+                        .expect("valid site ETag"),
+                );
+                response_headers.insert(
+                    "content-revision",
+                    HeaderValue::from_str(&inventory.content_revision.to_string())
+                        .expect("valid revision"),
+                );
+                response_headers
+                    .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+                response_headers.insert(header::VARY, HeaderValue::from_static("Accept"));
+                response
+            }
+            Err(err) => err.into_response(),
+        };
+    }
     browse_dir(&app, &name, "", true, &headers).await
 }
 
@@ -3650,6 +3687,91 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rejected.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn inventories_and_listings_are_served_as_tsv() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::new(root.path().to_path_buf()).unwrap();
+        store.put_file("tsv", "b dir/x y.txt", b"hello").unwrap();
+        store.put_file("tsv", "a.txt", b"12").unwrap();
+        store.put_file("tsv", "caf\u{e9}.md", b"#").unwrap();
+        let app = router(test_app(store));
+
+        let response = get_with(
+            &app,
+            "/tsv/FILES",
+            &[("accept", "text/tab-separated-values")],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/tab-separated-values; charset=utf-8"
+        );
+        for required in ["etag", "content-revision", "cache-control"] {
+            assert!(response.headers().contains_key(required), "{required}");
+        }
+        assert_eq!(response.headers()[header::VARY], "Accept");
+        let body = String::from_utf8(body_bytes(response).await).unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines[0], "kind\tsize\tvalue\tpath");
+        let rows: Vec<Vec<&str>> = lines[1..]
+            .iter()
+            .map(|line| line.split('\t').collect())
+            .collect();
+        assert!(rows.iter().all(|row| row.len() == 4), "{body}");
+        let paths: Vec<&str> = rows.iter().map(|row| row[3]).collect();
+        assert_eq!(
+            paths,
+            ["a.txt", "b dir/x y.txt", "caf\u{e9}.md"],
+            "sorted, symbol.toml excluded"
+        );
+        assert_eq!(rows[0][0], "file");
+        assert_eq!(rows[0][1], "2");
+        assert!(rows[0][2].starts_with("blake3:"));
+
+        let sites = get_with(&app, "/FILES", &[("accept", "text/tab-separated-values")]).await;
+        let body = String::from_utf8(body_bytes(sites).await).unwrap();
+        assert!(
+            body.starts_with("kind\tfiles\tbytes\tname\nbuiltin\t\t0\tAPI\n"),
+            "{body}"
+        );
+        assert!(
+            body.lines()
+                .any(|line| line.starts_with("site\t") && line.ends_with("\ttsv"))
+        );
+
+        let missing = get_with(
+            &app,
+            "/nope/FILES",
+            &[("accept", "text/tab-separated-values")],
+        )
+        .await;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn control_characters_in_paths_are_rejected_not_fatal() {
+        let app = markdown_app();
+        for path in [
+            "/hello/tab%09name.txt",
+            "/hello/new%0Aline.txt",
+            "/hello/esc%1B.txt",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(path)
+                        .body(Body::from("x"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+        }
     }
 
     #[tokio::test]
