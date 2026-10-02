@@ -832,7 +832,9 @@ fn validate_public_url(url: &str) -> Result<(), &'static str> {
 }
 
 fn script_body(template: &str, public_url: &str) -> String {
-    template.replace("__HOST__", public_url)
+    template
+        .replace("__HOST__", public_url)
+        .replace("__API_VERSION__", API_VERSION)
 }
 
 fn render_script(template: &str, public_url: &str, headers: &HeaderMap) -> Response {
@@ -3925,6 +3927,18 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
         }
+    }
+
+    #[tokio::test]
+    async fn the_served_client_knows_its_api_version() {
+        let app = markdown_app();
+        let body =
+            String::from_utf8(body_bytes(get_with(&app, "/symbol.sh", &[]).await).await).unwrap();
+        assert!(
+            body.contains(&format!("CLIENT_API_VERSION='{API_VERSION}'")),
+            "{body:.400}"
+        );
+        assert!(!body.contains("__API_VERSION__") && !body.contains("__HOST__"));
     }
 
     #[tokio::test]

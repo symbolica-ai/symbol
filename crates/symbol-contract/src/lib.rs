@@ -4998,9 +4998,13 @@ pub struct SiteInventory {
     pub updated_at: String,
     pub content_revision: u64,
     pub tree_hash: String,
-    pub events: Vec<SiteEvent>,
+    // `files` and `aliases` precede `events` on purpose. Shell clients before
+    // 1.0 scan this JSON for the first `"files"` key, and each event carries
+    // a `files` count of its own; with events first they found that count
+    // instead of the array and listed nothing.
     pub files: Vec<InventoryFile>,
     pub aliases: Vec<InventoryAlias>,
+    pub events: Vec<SiteEvent>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]

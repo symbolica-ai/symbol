@@ -265,6 +265,7 @@ if [ -n "$dump" ]; then
     [ -z "$files_etag" ] || printf 'ETag: "%s"\r\n' "$files_etag"
     [ -z "$files_revision" ] || printf 'Content-Revision: %s\r\n' "$files_revision"
     [ -z "$files_count" ] || printf 'Entry-Count: %s\r\n' "$files_count"
+    [ -z "${MOCK_SERVER_API_VERSION:-}" ] || printf 'Symbol-API-Version: %s\r\n' "${MOCK_SERVER_API_VERSION}"
     [ -z "$files_link" ] || printf 'Link: %s\r\n' "$files_link"
     case "$method" in
       PUT|DELETE|COPY|MOVE|ALIAS|EXPIRE)
@@ -512,6 +513,26 @@ if "${CLIENT}" ls hello -p 2 >/dev/null 2>&1; then
 else
   ok 'piped ls -p without --limit is a usage error'
 fi
+
+# The client is told its API version when served; a different major version
+# on the server is an incompatible API, reported on stderr every run.
+sed "s/^CLIENT_API_VERSION=.*/CLIENT_API_VERSION='1.4.2'/" "${CLIENT}" > "${ROOT}/versioned-client"
+chmod +x "${ROOT}/versioned-client"
+cp "$(dirname "${CLIENT}")/.symbol.blake3" "${ROOT}/.symbol.blake3" 2>/dev/null || true
+MOCK_SERVER_API_VERSION=2.0.0 "${ROOT}/versioned-client" ls hello >"${ROOT}/ver-out" 2>"${ROOT}/ver-err" || true
+contains "$(cat "${ROOT}/ver-err")" 'runs API 2.0.0, but this client was built for 1.4.2' &&
+  contains "$(cat "${ROOT}/ver-err")" 'symbol update' &&
+  contains "$(cat "${ROOT}/ver-out")" 'index.html' &&
+  ok 'a newer major server version tells the user to update' ||
+  not_ok 'a newer major server version tells the user to update'
+MOCK_SERVER_API_VERSION=1.9.0 "${ROOT}/versioned-client" ls hello >/dev/null 2>"${ROOT}/ver-err" || true
+contains "$(cat "${ROOT}/ver-err")" 'API' &&
+  not_ok 'a same-major server version stays quiet' ||
+  ok 'a same-major server version stays quiet'
+MOCK_SERVER_API_VERSION=0.1.109 "${ROOT}/versioned-client" ls hello >/dev/null 2>"${ROOT}/ver-err" || true
+contains "$(cat "${ROOT}/ver-err")" 'is newer than' &&
+  ok 'an older major server version says the client is ahead' ||
+  not_ok 'an older major server version says the client is ahead'
 
 out=$("${CLIENT}" ls --json hello)
 contains "${out}" '"path":"index.html"' &&

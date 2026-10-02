@@ -1144,7 +1144,11 @@ test("version compatibility accepts newer peers and rejects impossible identitie
                 absoluteRevision: 1,
                 sourceHash: "3".repeat(64),
             },
-            error: esm.OperationUnavailableError,
+            // Older than every operation: within major 0 that is a missing
+            // operation, from a later major an incompatible API.
+            error: current.api_version.startsWith("0.")
+                ? esm.OperationUnavailableError
+                : esm.IncompatibleApiVersionError,
         },
     ];
     for (const scenario of identities) {

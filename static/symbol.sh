@@ -4,6 +4,10 @@
 set -eu
 
 HOST="${SYMBOL_HOST:-__HOST__}"
+# The API version of the server this copy was downloaded from, filled in when
+# the server serves it. Compared with the version every response carries.
+CLIENT_API_VERSION='__API_VERSION__'
+SERVER_API_VERSION=
 HOST=${HOST%/}
 
 UPDATE_PID=
@@ -72,10 +76,42 @@ start_update_check() {
   UPDATE_PID=$!
 }
 
+# A major version difference is an incompatible API, so say so on every run,
+# not only once a day like the routine out-of-date notice.
+api_mismatch_note() {
+  case "${CLIENT_API_VERSION}" in
+    [0-9]*.[0-9]*.[0-9]*) ;;
+    *) return 1 ;;
+  esac
+  case "${SERVER_API_VERSION}" in
+    [0-9]*.[0-9]*.[0-9]*) ;;
+    *) return 1 ;;
+  esac
+  client_major=${CLIENT_API_VERSION%%.*}
+  server_major=${SERVER_API_VERSION%%.*}
+  [ "${client_major}" != "${server_major}" ] || return 1
+  if [ "${server_major}" -gt "${client_major}" ]; then
+    printf '\nsymbol: %s runs API %s, but this client was built for %s,\nand the change is incompatible. update the client:\n  symbol update\n' \
+      "${HOST}" "${SERVER_API_VERSION}" "${CLIENT_API_VERSION}"
+  else
+    printf '\nsymbol: this client (API %s) is newer than %s (API %s),\nso some commands will not work. install the client that server provides:\n  symbol update\n' \
+      "${CLIENT_API_VERSION}" "${HOST}" "${SERVER_API_VERSION}"
+  fi
+}
+
 join_update_check() {
   if [ -n "${UPDATE_PID:-}" ]; then
     wait "${UPDATE_PID}" 2>/dev/null || true
     UPDATE_PID=
+  fi
+  if mismatch=$(api_mismatch_note); then
+    if update_check_color; then
+      printf '\033[33m%s\033[0m\n' "${mismatch}" >&2
+    else
+      printf '%s\n' "${mismatch}" >&2
+    fi
+    [ -z "${UPDATE_NOTE:-}" ] || rm -f "${UPDATE_NOTE}"
+    UPDATE_NOTE=
   fi
   if [ -n "${UPDATE_NOTE:-}" ]; then
     if [ -s "${UPDATE_NOTE}" ]; then
@@ -929,6 +965,8 @@ http_request() {
       [ -s "${HTTP_BODY}" ] && cat "${HTTP_BODY}" >&2
       return "${status}"
     }
+  [ -n "${SERVER_API_VERSION}" ] ||
+    SERVER_API_VERSION=$(header_value Symbol-API-Version 2>/dev/null || true)
   case "${HTTP_STATUS}" in
     2??) return 0 ;;
     *) [ -s "${HTTP_BODY}" ] && cat "${HTTP_BODY}" >&2; return 1 ;;
