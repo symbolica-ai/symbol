@@ -742,6 +742,12 @@ set to `always`. `never` requires `-`.
 `SYMBOL_NO_UPDATE_CHECK=1` skips the client update nag. The nag is also
 throttled to once per 24 hours.
 
+The client knows the API version of the server it was downloaded from, and
+every response carries the server's `Symbol-API-Version`. When the two differ
+in their major version, which marks an incompatible change, the client says so
+on stderr after every command and points at `symbol update`, whether the
+server is newer or older than it. Output on stdout is unaffected.
+
 `-` means stdin in an upload/source position and stdout in a download
 destination position. The client keeps binary stdout clean so archives can be
 piped safely.
@@ -1385,7 +1391,8 @@ Success: `200`.
 <!-- contract:client -->
 ### `GET /symbol.sh`
 
-Returns the shell client with the configured public URL substituted.
+Returns the shell client with the configured public URL and the server's API
+version substituted.
 
 Success: `200`; conditional `If-None-Match`: `304`.
 
@@ -1709,7 +1716,7 @@ Content-Revision: 4
 Cache-Control: no-cache
 Content-Type: application/json
 
-{"site":"hello","created_at":"2026-01-02T03:04:05Z","updated_at":"2026-01-02T03:04:05Z","content_revision":4,"tree_hash":"blake3:<tree hash>","events":[{"kind":"created","at":"2026-01-02T03:04:05Z","files":0}],"files":[{"path":"index.html","hash":"blake3:<file hash>","size":14}],"aliases":[]}
+{"site":"hello","created_at":"2026-01-02T03:04:05Z","updated_at":"2026-01-02T03:04:05Z","content_revision":4,"tree_hash":"blake3:<tree hash>","files":[{"path":"index.html","hash":"blake3:<file hash>","size":14}],"aliases":[],"events":[{"kind":"created","at":"2026-01-02T03:04:05Z","files":0}]}
 ```
 
 Inventory files are sorted by path and exclude generated `symbol.toml`.

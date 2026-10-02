@@ -144,6 +144,15 @@ checks, and client conformance tests. The guide and the API manuals are
 rendered at build time, so their renderers are covered by the
 `crates/symbol/generation` tests rather than at runtime.
 
+## Versioning
+
+`api-version.toml` records the API version. Any change to the API's canonical
+inputs bumps the patch version automatically (`./api-version update`). A change
+that can break an existing client or script, such as a changed response shape
+or different `symbol` command output, takes `./api-version bump-major`
+instead: the shell client compares major versions with the server it talks to
+and tells the user to run `symbol update` when they differ.
+
 ## Continuous integration
 
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs `sh nix/check.sh`
