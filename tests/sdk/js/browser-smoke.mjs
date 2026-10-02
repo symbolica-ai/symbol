@@ -57,10 +57,17 @@ try {
 } catch (error) {
   result.textContent = "fail: " + (error.operation ?? "browser") + ": " + error.message;
 }
+// Report back rather than leave the outcome in the DOM for a timed dump: on a
+// busy runner the script can outlast any fixed virtual-time budget.
+await fetch("/report", { method: "POST", body: result.textContent });
 </script>
 `);
     let statsCalls = 0;
     let streamDisposed = false;
+    let reportPage;
+    const reported = new Promise((resolve) => {
+        reportPage = resolve;
+    });
     const identity = {
         "Symbol-API-Version": artifacts.fixture.api_version,
         "Symbol-API-Revision": String(artifacts.fixture.absolute_revision),
@@ -113,6 +120,16 @@ try {
             response.once("close", () => {
                 streamDisposed = true;
             });
+        } else if (request.url === "/report" && request.method === "POST") {
+            let body = "";
+            request.on("data", (chunk) => {
+                body += chunk.toString();
+            });
+            request.on("end", () => {
+                response.writeHead(204);
+                response.end();
+                reportPage(body);
+            });
         } else if (request.url === "/disposed-check") {
             response.writeHead(200, { "Content-Type": "text/plain" });
             response.end(String(streamDisposed));
@@ -133,7 +150,9 @@ try {
     await mkdir(config);
     await mkdir(cache);
     try {
-        const result = await run(chromium, [
+        // --remote-debugging-port keeps headless Chromium running until it is
+        // stopped, so the page has as long as it needs to report.
+        const browser = spawn(chromium, [
             "--headless=new",
             "--no-sandbox",
             "--disable-gpu",
@@ -142,17 +161,37 @@ try {
             "--disable-crash-reporter",
             "--noerrdialogs",
             `--user-data-dir=${profile}`,
-            "--virtual-time-budget=3000",
-            "--dump-dom",
+            "--remote-debugging-port=0",
             `http://127.0.0.1:${address.port}/`,
         ], {
-            ...process.env,
-            HOME: profile,
-            XDG_CACHE_HOME: cache,
-            XDG_CONFIG_HOME: config,
+            env: {
+                ...process.env,
+                HOME: profile,
+                XDG_CACHE_HOME: cache,
+                XDG_CONFIG_HOME: config,
+            },
+            stdio: ["ignore", "ignore", "pipe"],
         });
-        assert.match(result.stdout, /<pre id="result">pass<\/pre>/);
-        assert.doesNotMatch(result.stdout, /<pre id="result">fail:/);
+        let browserLog = "";
+        browser.stderr.on("data", (chunk) => {
+            browserLog += chunk.toString();
+        });
+        const exited = new Promise((resolve) => {
+            browser.once("exit", (code) => resolve(`Chromium exited ${code}`));
+            browser.once("error", (error) => resolve(`Chromium failed to start: ${error.message}`));
+        });
+        let timer;
+        const timedOut = new Promise((resolve) => {
+            timer = setTimeout(() => resolve("timeout"), 60_000);
+        });
+        let outcome;
+        try {
+            outcome = await Promise.race([reported, exited, timedOut]);
+        } finally {
+            clearTimeout(timer);
+            browser.kill("SIGKILL");
+        }
+        assert.equal(outcome, "pass", `browser page reported: ${outcome}\n${browserLog}`);
         console.log("browser SDK smoke (headless Chromium): ok");
     } finally {
         await rm(profile, { recursive: true, force: true });
@@ -176,27 +215,4 @@ function statsFixture() {
             readers: { operations: 0, waits: 0, wait_micros: 0, query_micros: 0 },
         },
     };
-}
-
-async function run(command, arguments_, environment) {
-    const child = spawn(command, arguments_, {
-        env: environment,
-        stdio: ["ignore", "pipe", "pipe"],
-    });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (chunk) => {
-        stdout += chunk.toString();
-    });
-    child.stderr.on("data", (chunk) => {
-        stderr += chunk.toString();
-    });
-    const code = await new Promise((resolveExit, rejectExit) => {
-        child.once("error", rejectExit);
-        child.once("exit", resolveExit);
-    });
-    if (code !== 0) {
-        throw new Error(`Chromium exited ${code}\n${stdout}${stderr}`);
-    }
-    return { stdout, stderr };
 }
