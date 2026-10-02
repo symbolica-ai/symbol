@@ -4,6 +4,10 @@
 set -eu
 
 HOST="${SYMBOL_HOST:-__HOST__}"
+# The API version of the server this copy was downloaded from, filled in when
+# the server serves it. Compared with the version every response carries.
+CLIENT_API_VERSION='__API_VERSION__'
+SERVER_API_VERSION=
 HOST=${HOST%/}
 
 UPDATE_PID=
@@ -72,10 +76,42 @@ start_update_check() {
   UPDATE_PID=$!
 }
 
+# A major version difference is an incompatible API, so say so on every run,
+# not only once a day like the routine out-of-date notice.
+api_mismatch_note() {
+  case "${CLIENT_API_VERSION}" in
+    [0-9]*.[0-9]*.[0-9]*) ;;
+    *) return 1 ;;
+  esac
+  case "${SERVER_API_VERSION}" in
+    [0-9]*.[0-9]*.[0-9]*) ;;
+    *) return 1 ;;
+  esac
+  client_major=${CLIENT_API_VERSION%%.*}
+  server_major=${SERVER_API_VERSION%%.*}
+  [ "${client_major}" != "${server_major}" ] || return 1
+  if [ "${server_major}" -gt "${client_major}" ]; then
+    printf '\nsymbol: %s runs API %s, but this client was built for %s,\nand the change is incompatible. update the client:\n  symbol update\n' \
+      "${HOST}" "${SERVER_API_VERSION}" "${CLIENT_API_VERSION}"
+  else
+    printf '\nsymbol: this client (API %s) is newer than %s (API %s),\nso some commands will not work. install the client that server provides:\n  symbol update\n' \
+      "${CLIENT_API_VERSION}" "${HOST}" "${SERVER_API_VERSION}"
+  fi
+}
+
 join_update_check() {
   if [ -n "${UPDATE_PID:-}" ]; then
     wait "${UPDATE_PID}" 2>/dev/null || true
     UPDATE_PID=
+  fi
+  if mismatch=$(api_mismatch_note); then
+    if update_check_color; then
+      printf '\033[33m%s\033[0m\n' "${mismatch}" >&2
+    else
+      printf '%s\n' "${mismatch}" >&2
+    fi
+    [ -z "${UPDATE_NOTE:-}" ] || rm -f "${UPDATE_NOTE}"
+    UPDATE_NOTE=
   fi
   if [ -n "${UPDATE_NOTE:-}" ]; then
     if [ -s "${UPDATE_NOTE}" ]; then
@@ -121,7 +157,7 @@ usage:
   symbol expire [NAME [PATH]] [POLICY]
   symbol manage [NAME ACTION]
   symbol recover
-  symbol ls [-l] [--json] [NAME]
+  symbol ls [-l] [-R] [-p PAGE] [--limit N|--all] [--json] [NAME [PATH]]
   symbol rm NAME [PATH]
   symbol url NAME
   symbol api [--json]
@@ -291,12 +327,16 @@ idempotency identity.
 EOF
       ;;
     ls) cat <<'EOF'
-symbol ls: list sites or one site tree
-usage: symbol ls [-l|--links] [--json] [NAME]
+symbol ls: list sites, or one directory of a site
+usage: symbol ls [-l] [-R] [-p PAGE] [--limit N | --all] [--json] [NAME [PATH]]
 
-without NAME, lists sites. with NAME, lists every file and alias path.
--l adds URLs. names are taken from JSON fields and are not parsed from
-the table. --json writes the server listing or inventory document.
+without NAME, lists sites. NAME lists the site's top directory, and
+NAME PATH that directory: folders with their file count and size, then
+files and aliases. -R lists every file and alias in the site instead.
+
+in a terminal, 50 entries a page: -p 2 shows the next, --limit N sets
+the page size, --all shows everything. piped output is never paged.
+-l adds URLs. --json writes the server listing or inventory document.
 EOF
       ;;
     rm) cat <<'EOF'
@@ -551,100 +591,19 @@ print_stats() {
   '
 }
 
-json_ls_lib() {
+ls_awk_lib() {
   cat <<'AWK'
+# Display columns of a UTF-8 string. The listings run under LC_ALL=C, so every
+# awk measures bytes; continuation bytes (0x80-0xBF) start no character.
+function cols(s,    t) {
+  t = s
+  gsub(/[\200-\277]/, "", t)
+  return length(t)
+}
 function spaces(n, out) {
   out = ""
   while (n-- > 0) out = out " "
   return out
-}
-function skip_string(s, i,    c) {
-  i++
-  while (i <= length(s)) {
-    c = substr(s, i, 1)
-    if (c == "\\") { i += 2; continue }
-    if (c == "\"") return i
-    i++
-  }
-  return i
-}
-function collect_objects(text, dest,    i, c, depth, start, n) {
-  n = 0
-  depth = 0
-  for (i = 1; i <= length(text); i++) {
-    c = substr(text, i, 1)
-    if (c == "\"") { i = skip_string(text, i); continue }
-    if (c == "{") {
-      if (depth == 0) start = i
-      depth++
-    } else if (c == "}") {
-      depth--
-      if (depth == 0) {
-        n++
-        dest[n] = substr(text, start, i - start + 1)
-      }
-    }
-  }
-  return n
-}
-function array_after(text, key,    token, start, i, c, depth) {
-  token = "\"" key "\""
-  start = index(text, token)
-  if (!start) return ""
-  text = substr(text, start + length(token))
-  sub(/^[[:space:]]*:[[:space:]]*/, "", text)
-  if (substr(text, 1, 1) != "[") return ""
-  depth = 0
-  for (i = 1; i <= length(text); i++) {
-    c = substr(text, i, 1)
-    if (c == "\"") { i = skip_string(text, i); continue }
-    if (c == "[") depth++
-    else if (c == "]") {
-      depth--
-      if (depth == 0) return substr(text, 1, i)
-    }
-  }
-  return text
-}
-function unescape(s,    out, i, c, n) {
-  out = ""
-  n = length(s)
-  for (i = 1; i <= n; i++) {
-    c = substr(s, i, 1)
-    if (c == "\\" && i < n) {
-      i++
-      c = substr(s, i, 1)
-      if (c == "n") out = out "\n"
-      else if (c == "t") out = out "\t"
-      else if (c == "r") out = out "\r"
-      else out = out c
-    } else out = out c
-  }
-  return out
-}
-function json_str(obj, key,    token, rest, i, c, start) {
-  token = "\"" key "\""
-  start = index(obj, token)
-  if (!start) return ""
-  rest = substr(obj, start + length(token))
-  sub(/^[[:space:]]*:[[:space:]]*/, "", rest)
-  if (substr(rest, 1, 1) != "\"") return ""
-  for (i = 2; i <= length(rest); i++) {
-    c = substr(rest, i, 1)
-    if (c == "\\") { i++; continue }
-    if (c == "\"") return unescape(substr(rest, 2, i - 2))
-  }
-  return ""
-}
-function json_num(obj, key,    token, rest, value) {
-  token = "\"" key "\""
-  if (!index(obj, token)) return ""
-  rest = substr(obj, index(obj, token) + length(token))
-  sub(/^[[:space:]]*:[[:space:]]*/, "", rest)
-  if (substr(rest, 1, 4) == "null") return ""
-  split(rest, value, /[,}]/)
-  gsub(/[[:space:]]/, "", value[1])
-  return value[1]
 }
 function human_size(n,    units, i, value) {
   units[1] = "B"; units[2] = "KiB"; units[3] = "MiB"
@@ -660,45 +619,45 @@ function human_size(n,    units, i, value) {
 AWK
 }
 
-print_listing() {
+# Listings arrive as TSV (Accept: text/tab-separated-values): a header line,
+# then one entry per line. Stored names contain no tabs or newlines, so a field
+# split is exact and a listing is read in one linear pass.
+#
+# print_entries reads site and directory listings (kind files bytes name
+# target); print_inventory reads the recursive inventory (kind size value path).
+print_entries() {
   base=${1%/}
   links=$2
-  awk -v base="${base}" -v links="${links}" "$(json_ls_lib)"'
+  complete=$3
+  LC_ALL=C awk -F '\t' -v base="${base}" -v links="${links}" -v complete="${complete}" "$(ls_awk_lib)"'
+    NR == 1 {
+      if ($0 != "kind\tfiles\tbytes\tname\ttarget") { bad = 1; exit 1 }
+      next
+    }
     {
-      text = text $0
+      kind = $1; files = $2; bytes = $3; name = $4; target = $5
+      n++
+      folder = kind == "site" || kind == "builtin" || kind == "directory"
+      row = links ? base "/" name : name
+      if (folder) row = row "/"
+      if (kind == "alias") row = row " -> " target
+      rows[n] = row
+      if (kind == "builtin") meta[n] = "built-in"
+      else if (kind == "alias") meta[n] = ""
+      else if (folder) meta[n] = files " files   " human_size(bytes)
+      else meta[n] = human_size(bytes)
+      if (kind == "site") { total_files += files; total_bytes += bytes; sites++ }
+      w[n] = cols(row)
+      if (w[n] > width) width = w[n]
     }
     END {
-      n = collect_objects(array_after(text, "entries"), obj)
-      for (i = 1; i <= n; i++) {
-        kind = json_str(obj[i], "kind")
-        name = json_str(obj[i], "name")
-        target = json_str(obj[i], "target")
-        files = json_num(obj[i], "files")
-        bytes = json_num(obj[i], "bytes")
-        label = name
-        if (kind == "site" || kind == "directory" || kind == "builtin") label = name "/"
-        if (links) {
-          if (kind == "builtin") row = base "/" name
-          else row = base "/" name
-        } else row = label
-        if (kind == "alias" && target != "") row = row " -> " target
-        rows[i] = row
-        if (kind == "builtin") meta[i] = "built-in"
-        else if (files != "") meta[i] = files " files   " human_size(bytes)
-        else if (bytes != "") meta[i] = human_size(bytes)
-        else meta[i] = ""
-        if (length(row) > width) width = length(row)
-      }
+      if (bad || NR == 0) exit 1
       for (i = 1; i <= n; i++) {
         if (meta[i] == "") print rows[i]
-        else printf "%s%s  %s\n", rows[i], spaces(width - length(rows[i])), meta[i]
+        else printf "%s%s  %s\n", rows[i], spaces(width - w[i]), meta[i]
       }
-      total_files = json_num(text, "files")
-      total_bytes = json_num(text, "bytes")
-      if (total_files != "") {
-        printf "%s%s  %s files   %s total\n",
-          spaces(width), "", total_files, human_size(total_bytes)
-      }
+      if (sites && complete)
+        printf "%s  %d files   %s total\n", spaces(width), total_files, human_size(total_bytes)
     }
   '
 }
@@ -706,39 +665,70 @@ print_listing() {
 print_inventory() {
   base=${1%/}
   links=$2
-  awk -v base="${base}" -v links="${links}" "$(json_ls_lib)"'
+  LC_ALL=C awk -F '\t' -v base="${base}" -v links="${links}" "$(ls_awk_lib)"'
+    NR == 1 {
+      if ($0 != "kind\tsize\tvalue\tpath") { bad = 1; exit 1 }
+      next
+    }
     {
-      text = text $0
+      kind = $1; size = $2; value = $3; path = $4
+      n++
+      row = links ? base "/" path : path
+      if (kind == "alias") { row = row " -> " value; meta[n] = "" }
+      else meta[n] = human_size(size)
+      rows[n] = row
+      w[n] = cols(row)
+      if (w[n] > width) width = w[n]
     }
     END {
-      n = 0
-      files = collect_objects(array_after(text, "files"), fileobj)
-      for (i = 1; i <= files; i++) {
-        n++
-        path = json_str(fileobj[i], "path")
-        bytes = json_num(fileobj[i], "size")
-        row = links ? base "/" path : path
-        rows[n] = row
-        meta[n] = human_size(bytes)
-        if (length(row) > width) width = length(row)
-      }
-      aliases = collect_objects(array_after(text, "aliases"), aliasobj)
-      for (i = 1; i <= aliases; i++) {
-        n++
-        path = json_str(aliasobj[i], "path")
-        target = json_str(aliasobj[i], "target")
-        row = links ? base "/" path : path
-        if (target != "") row = row " -> " target
-        rows[n] = row
-        meta[n] = ""
-        if (length(row) > width) width = length(row)
-      }
+      if (bad || NR == 0) exit 1
       for (i = 1; i <= n; i++) {
         if (meta[i] == "") print rows[i]
-        else printf "%s%s  %s\n", rows[i], spaces(width - length(rows[i])), meta[i]
+        else printf "%s%s  %s\n", rows[i], spaces(width - w[i]), meta[i]
       }
     }
   '
+}
+
+# Lists one page of a TSV listing, then says how to see the rest.
+#   list_page URL_PATH PRINTER DISPLAY_BASE LINKS LIMIT PAGE COMMAND
+# LIMIT is empty for everything. COMMAND is the user's ls invocation without
+# paging flags, for the hint.
+list_page() {
+  lp_path=$1
+  lp_printer=$2
+  lp_base=$3
+  lp_links=$4
+  lp_limit=$5
+  lp_page=$6
+  lp_command=$7
+  lp_url="${HOST}${lp_path}"
+  if [ -n "${lp_limit}" ]; then
+    case "${lp_path}" in
+      *\?*) lp_url="${lp_url}&limit=${lp_limit}&page=${lp_page}" ;;
+      *) lp_url="${lp_url}?limit=${lp_limit}&page=${lp_page}" ;;
+    esac
+  fi
+  http_request GET "${lp_url}" -L -H 'Accept: text/tab-separated-values' || exit 1
+  lp_total=$(header_value Entry-Count)
+  [ -n "${lp_total}" ] ||
+    die "${HOST} did not return a paged listing; it may predate this client"
+  lp_complete=1
+  [ -z "${lp_limit}" ] || [ "${lp_total}" -le "${lp_limit}" ] || lp_complete=0
+  if [ "${lp_printer}" = entries ]; then
+    print_entries "${lp_base}" "${lp_links}" "${lp_complete}" < "${HTTP_BODY}"
+  else
+    print_inventory "${lp_base}" "${lp_links}" < "${HTTP_BODY}"
+  fi || die "${HOST} returned a listing this client cannot read"
+  [ -n "${lp_limit}" ] || return 0
+  lp_pages=$(( (lp_total + lp_limit - 1) / lp_limit ))
+  [ "${lp_pages}" -gt 1 ] || return 0
+  if [ "${lp_page}" -lt "${lp_pages}" ]; then
+    printf '\npage %s of %s (%s entries): %s -p %s for more, --all for everything\n' \
+      "${lp_page}" "${lp_pages}" "${lp_total}" "${lp_command}" "$(( lp_page + 1 ))" >&2
+  else
+    printf '\npage %s of %s (%s entries)\n' "${lp_page}" "${lp_pages}" "${lp_total}" >&2
+  fi
 }
 
 die() {
@@ -975,6 +965,8 @@ http_request() {
       [ -s "${HTTP_BODY}" ] && cat "${HTTP_BODY}" >&2
       return "${status}"
     }
+  [ -n "${SERVER_API_VERSION}" ] ||
+    SERVER_API_VERSION=$(header_value Symbol-API-Version 2>/dev/null || true)
   case "${HTTP_STATUS}" in
     2??) return 0 ;;
     *) [ -s "${HTTP_BODY}" ] && cat "${HTTP_BODY}" >&2; return 1 ;;
@@ -2921,48 +2913,10 @@ local_entry_map() (
 )
 
 upstream_entry_map() {
-  awk '
-    {
-      text=text $0
-    }
-    END {
-      rest=text
-      while (match(rest, /\{"path"[[:space:]]*:[[:space:]]*"[^"]*"[^}]*"hash"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
-        object=substr(rest,RSTART,RLENGTH)
-        path=object
-        sub(/^.*"path"[[:space:]]*:[[:space:]]*"/,"",path)
-        sub(/".*$/,"",path)
-        hash=object
-        sub(/^.*"hash"[[:space:]]*:[[:space:]]*"/,"",hash)
-        sub(/".*$/,"",hash)
-        if (path != "symbol.toml") print path "\tF\t" hash
-        rest=substr(rest,RSTART+RLENGTH)
-      }
-      rest=text
-      while (match(rest, /\{"path"[[:space:]]*:[[:space:]]*"[^"]*"[^}]*"target"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
-        object=substr(rest,RSTART,RLENGTH)
-        path=object
-        sub(/^.*"path"[[:space:]]*:[[:space:]]*"/,"",path)
-        sub(/".*$/,"",path)
-        target=object
-        sub(/^.*"target"[[:space:]]*:[[:space:]]*"/,"",target)
-        sub(/".*$/,"",target)
-        print path "\tA\t" target
-        rest=substr(rest,RSTART+RLENGTH)
-      }
-      rest=text
-      while (match(rest, /\{"path"[[:space:]]*:[[:space:]]*"[^"]*"[^}]*"canonical_target"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
-        object=substr(rest,RSTART,RLENGTH)
-        path=object
-        sub(/^.*"path"[[:space:]]*:[[:space:]]*"/,"",path)
-        sub(/".*$/,"",path)
-        target=object
-        sub(/^.*"canonical_target"[[:space:]]*:[[:space:]]*"/,"",target)
-        sub(/".*$/,"",target)
-        print path "\tA\t" target
-        rest=substr(rest,RSTART+RLENGTH)
-      }
-    }
+  awk -F '\t' '
+    NR == 1 { next }
+    $1 == "file" && $4 != "symbol.toml" { print $4 "\tF\t" $3 }
+    $1 == "alias" { print $4 "\tA\t" $3 }
   ' "$1" | LC_ALL=C sort
 }
 
@@ -3092,12 +3046,13 @@ sync_project() {
   baseline_entry_map "${MANIFEST}" | LC_ALL=C sort > "${baseline}"
   local_entry_map "${MANIFEST_DIR}" "${MANIFEST}" "${baseline}" \
     "${MANIFEST_HOST}" "${MANIFEST_NAME}" | LC_ALL=C sort > "${localmap}"
-  if ! http_request GET "${MANIFEST_HOST}/${MANIFEST_NAME}/FILES" -H 'Accept: application/json'; then
+  if ! http_request GET "${MANIFEST_HOST}/${MANIFEST_NAME}/FILES?recursive" \
+    -H 'Accept: text/tab-separated-values'; then
     rm -rf "${work}"
     return 1
   fi
-  upstream_tree=$(json_string tree_hash < "${HTTP_BODY}")
-  upstream_revision=$(json_string content_revision < "${HTTP_BODY}")
+  upstream_tree=$(header_value ETag | tr -d '"')
+  upstream_revision=$(header_value Content-Revision)
   upstream_entry_map "${HTTP_BODY}" > "${upstream}"
   if [ "${upstream_tree}" != "${baseline_tree}" ] || ! cmp -s "${baseline}" "${upstream}"; then
     printf 'error: upstream changed since this checkout\n\n' >&2
@@ -3248,8 +3203,8 @@ sync_project() {
   if [ "${sync_failed}" -eq 1 ] && [ "${sync_response_lost}" -eq 1 ] &&
     [ "${HTTP_STATUS:-}" = 412 ]; then
     recovered_upstream=${work}/recovered-upstream
-    if http_request GET "${MANIFEST_HOST}/${MANIFEST_NAME}/FILES" \
-      -H 'Accept: application/json'; then
+    if http_request GET "${MANIFEST_HOST}/${MANIFEST_NAME}/FILES?recursive" \
+      -H 'Accept: text/tab-separated-values'; then
       upstream_entry_map "${HTTP_BODY}" | LC_ALL=C sort > "${recovered_upstream}"
       sync_verify_failed=0
       while IFS='	' read -r sync_action sync_path sync_kind sync_value; do
@@ -3458,30 +3413,94 @@ case "${cmd}" in
     ;;
   ls)
     links=0
+    recursive=0
+    ls_limit=
+    ls_page=1
+    ls_all=0
+    ls_flags=
+    ls_name=
+    ls_where=
+    ls_args=0
+    # Flags may come before or after NAME and PATH: `symbol ls nlab -p 2`.
     while [ "$#" -gt 0 ]; do
       case "$1" in
-        -l|--links) links=1; shift ;;
-        --) shift; break ;;
-        -*) usage_error "unknown flag: $1" ;;
-        *) break ;;
+        -l|--links) links=1; ls_flags="${ls_flags} -l"; shift ;;
+        -R|--recursive) recursive=1; ls_flags="${ls_flags} -R"; shift ;;
+        -a|--all) ls_all=1; shift ;;
+        -p|--page)
+          [ "$#" -ge 2 ] || usage_error "$1 needs a page number"
+          ls_page=$2; shift 2 ;;
+        --page=*) ls_page=${1#--page=}; shift ;;
+        -n|--limit)
+          [ "$#" -ge 2 ] || usage_error "$1 needs a number of entries"
+          ls_limit=$2; ls_flags="${ls_flags} --limit $2"; shift 2 ;;
+        --limit=*) ls_limit=${1#--limit=}; ls_flags="${ls_flags} --limit ${ls_limit}"; shift ;;
+        --)
+          shift
+          while [ "$#" -gt 0 ]; do
+            ls_args=$((ls_args + 1))
+            case "${ls_args}" in 1) ls_name=$1 ;; 2) ls_where=$1 ;; esac
+            shift
+          done
+          ;;
+        -?*) usage_error "unknown flag: $1" ;;
+        *)
+          ls_args=$((ls_args + 1))
+          case "${ls_args}" in 1) ls_name=$1 ;; 2) ls_where=$1 ;; esac
+          shift
+          ;;
       esac
     done
-    [ "$#" -le 1 ] || usage_error "ls accepts at most one site name"
+    [ "${ls_args}" -le 2 ] || usage_error "usage: symbol ls [NAME [PATH]]"
+    set --
+    [ "${ls_args}" -lt 1 ] || set -- "${ls_name}"
+    [ "${ls_args}" -lt 2 ] || set -- "${ls_name}" "${ls_where}"
+    for ls_number in "${ls_page}" "${ls_limit:-1}"; do
+      case "${ls_number}" in
+        ''|*[!0123456789]*|0*) usage_error "page and limit must be whole numbers from 1" ;;
+      esac
+    done
+    [ "${recursive}" -eq 0 ] || [ "$#" -eq 1 ] || usage_error "ls -R takes exactly one site name"
+    # Like ls(1) choosing columns, page only for a person: a pipe gets every
+    # entry, so `symbol ls nlab | grep x` searches the whole directory.
+    if [ "${ls_all}" -eq 1 ]; then
+      ls_limit=
+    elif [ -z "${ls_limit}" ] && [ -t 1 ]; then
+      ls_limit=50
+    fi
+    if [ -z "${ls_limit}" ] && [ "${ls_page}" -ne 1 ]; then
+      usage_error "-p needs a limit; output is not a terminal, so pass --limit"
+    fi
     if [ "$#" -eq 0 ]; then
-      listing=$(request GET /FILES -H 'Accept: application/json')
       if [ "${JSON_OUTPUT}" -eq 1 ]; then
-        printf '%s\n' "${listing}"
+        request GET /FILES -H 'Accept: application/json'
+        printf '\n'
       else
-        printf '%s\n' "${listing}" | print_listing "${HOST}" "${links}"
+        list_page /FILES entries "${HOST}" "${links}" "${ls_limit}" "${ls_page}" \
+          "symbol ls${ls_flags}"
       fi
     else
       name=$1
       is_site_name "${name}" || usage_error "invalid site name: ${name}"
-      inventory=$(request GET "/${name}/FILES" -H 'Accept: application/json')
-      if [ "${JSON_OUTPUT}" -eq 1 ]; then
-        printf '%s\n' "${inventory}"
+      ls_dir=${2:-}
+      ls_dir=${ls_dir#/}
+      ls_dir=${ls_dir%/}
+      if [ -n "${ls_dir}" ]; then
+        ls_path="/${name}/FILES/$(urlencode_path "${ls_dir}")/"
+        ls_base="${HOST}/${name}/${ls_dir}"
       else
-        printf '%s\n' "${inventory}" | print_inventory "${HOST}/${name}" "${links}"
+        ls_path="/${name}/FILES"
+        ls_base="${HOST}/${name}"
+      fi
+      if [ "${JSON_OUTPUT}" -eq 1 ]; then
+        request GET "${ls_path}" -L -H 'Accept: application/json'
+        printf '\n'
+      elif [ "${recursive}" -eq 1 ]; then
+        list_page "/${name}/FILES?recursive" inventory "${ls_base}" "${links}" \
+          "${ls_limit}" "${ls_page}" "symbol ls${ls_flags} ${name}"
+      else
+        list_page "${ls_path}" entries "${ls_base}" "${links}" "${ls_limit}" "${ls_page}" \
+          "symbol ls${ls_flags} ${name}${2:+ ${2}}"
       fi
     fi
     ;;

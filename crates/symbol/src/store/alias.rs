@@ -1066,7 +1066,10 @@ impl Store {
         }
         let mut requested = BTreeMap::new();
         for spec in specs {
-            if spec.path.starts_with(['/', '\\']) || spec.path.contains('\\') {
+            if spec.path.starts_with(['/', '\\'])
+                || spec.path.contains('\\')
+                || spec.path.chars().any(char::is_control)
+            {
                 return Err(StoreError::InvalidAliasTarget);
             }
             let path = normalize_rel(spec.path)?;

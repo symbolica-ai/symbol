@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::fmt::Write as _;
 
 use axum::body::Bytes;
-use axum::http::{HeaderMap, HeaderValue, header};
+use axum::http::{HeaderMap, HeaderValue, Uri, header};
 use axum::response::Response;
 use maud::{DOCTYPE, PreEscaped, html};
 use symbol_contract::{Listing, ListingEntry, ListingKind};
@@ -12,7 +12,13 @@ use crate::page;
 use crate::pathutil::pretty_html_name;
 use crate::store::{AliasResolvedKind, DirList, EntryKind, SiteList};
 
-pub fn sites(headers: &HeaderMap, list: &SiteList) -> Response {
+pub fn sites(headers: &HeaderMap, uri: &Uri, query: &ListingQuery, list: &SiteList) -> Response {
+    if wants_tsv(headers) {
+        return match Paging::parse(query) {
+            Ok(paging) => tsv_response(headers, uri, sites_tsv(list, paging), paging),
+            Err(message) => bad_query(message),
+        };
+    }
     if wants_json(headers) {
         let mut entries = vec![ListingEntry {
             kind: ListingKind::Builtin,
@@ -62,7 +68,11 @@ pub fn listing(
     rel: &str,
     list: &DirList,
     files_view: bool,
+    tsv: Option<(&Uri, Paging)>,
 ) -> Response {
+    if let Some((uri, paging)) = tsv {
+        return tsv_response(headers, uri, listing_tsv(rel, list, paging), paging);
+    }
     if wants_json(headers) {
         let mut entries = list
             .entries
@@ -348,6 +358,240 @@ fn display_path(site: &str, rel: &str) -> String {
     } else {
         format!("{site}/{rel}/")
     }
+}
+
+/// The media type of the line-oriented listings: one entry per line, fields
+/// separated by tabs, a header line naming them. Stored names contain no
+/// control characters, so no field needs quoting, and any `awk` reads it.
+pub const TSV_TYPE: &str = "text/tab-separated-values; charset=utf-8";
+
+const LISTING_HEADER: &str = "kind\tfiles\tbytes\tname\ttarget";
+const INVENTORY_HEADER: &str = "kind\tsize\tvalue\tpath";
+/// The most entries one page may ask for.
+pub const MAX_PAGE_LIMIT: usize = 100_000;
+
+pub fn wants_tsv(headers: &HeaderMap) -> bool {
+    accepts(headers, "text/tab-separated-values")
+}
+
+/// The query parameters of a TSV listing: `recursive`, `limit`, and `page`.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct ListingQuery {
+    recursive: Option<String>,
+    limit: Option<String>,
+    page: Option<String>,
+}
+
+impl ListingQuery {
+    /// `?recursive` asks for the whole inventory rather than one directory.
+    pub fn recursive(&self) -> bool {
+        self.recursive
+            .as_deref()
+            .is_some_and(|value| !matches!(value, "0" | "false" | "no"))
+    }
+}
+
+/// Which slice of a listing to return. `limit: None` is everything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Paging {
+    pub limit: Option<usize>,
+    pub page: usize,
+}
+
+impl Paging {
+    pub fn parse(query: &ListingQuery) -> Result<Self, String> {
+        let number = |name: &str, value: &str| -> Result<usize, String> {
+            value
+                .parse::<usize>()
+                .ok()
+                .filter(|value| *value >= 1)
+                .ok_or_else(|| format!("error: {name} must be a whole number of at least 1\n"))
+        };
+        let limit = query
+            .limit
+            .as_deref()
+            .map(|value| number("limit", value))
+            .transpose()?;
+        if limit.is_some_and(|limit| limit > MAX_PAGE_LIMIT) {
+            return Err(format!("error: limit must be at most {MAX_PAGE_LIMIT}\n"));
+        }
+        let page = query
+            .page
+            .as_deref()
+            .map(|value| number("page", value))
+            .transpose()?;
+        if page.is_some() && limit.is_none() {
+            return Err("error: page needs a limit\n".to_string());
+        }
+        Ok(Self {
+            limit,
+            page: page.unwrap_or(1),
+        })
+    }
+
+    fn slice<T>(self, rows: &[T]) -> &[T] {
+        let Some(limit) = self.limit else {
+            return rows;
+        };
+        let start = (self.page - 1).saturating_mul(limit).min(rows.len());
+        &rows[start..(start + limit).min(rows.len())]
+    }
+}
+
+/// A listing's rows as a TSV body, with the total before paging.
+pub struct TsvPage {
+    pub body: String,
+    pub total: usize,
+}
+
+fn tsv_page(header: &str, rows: &[String], paging: Paging) -> TsvPage {
+    let page = paging.slice(rows);
+    let mut body = String::with_capacity(
+        header.len() + 1 + page.iter().map(|row| row.len() + 1).sum::<usize>(),
+    );
+    body.push_str(header);
+    body.push('\n');
+    for row in page {
+        body.push_str(row);
+        body.push('\n');
+    }
+    TsvPage {
+        body,
+        total: rows.len(),
+    }
+}
+
+/// A site's whole inventory: files, then aliases, each sorted by path.
+///
+/// `kind` is `file` or `alias`; `size` is bytes (empty for a dangling alias);
+/// `value` is a file's content hash or an alias's target.
+pub fn inventory_tsv(inventory: &symbol_contract::SiteInventory, paging: Paging) -> TsvPage {
+    let mut rows = Vec::with_capacity(inventory.files.len() + inventory.aliases.len());
+    rows.extend(
+        inventory
+            .files
+            .iter()
+            .map(|file| format!("file\t{}\t{}\t{}", file.size, file.hash, file.path)),
+    );
+    rows.extend(inventory.aliases.iter().map(|alias| {
+        let size = alias.size.map(|size| size.to_string()).unwrap_or_default();
+        format!("alias\t{size}\t{}\t{}", alias.target, alias.path)
+    }));
+    tsv_page(INVENTORY_HEADER, &rows, paging)
+}
+
+/// One directory: subdirectories and files in name order, then aliases.
+///
+/// `files` is a directory's (or directory alias's) file count, `bytes` its
+/// size; `target` is set for aliases only.
+pub fn listing_tsv(rel: &str, list: &DirList, paging: Paging) -> TsvPage {
+    let mut rows = Vec::with_capacity(list.entries.len() + list.aliases.len());
+    rows.extend(list.entries.iter().map(|entry| match entry.kind {
+        EntryKind::Directory => format!(
+            "directory\t{}\t{}\t{}\t",
+            entry.files, entry.bytes, entry.name
+        ),
+        EntryKind::File => format!("file\t\t{}\t{}\t", entry.bytes, entry.name),
+    }));
+    rows.extend(list.aliases.iter().filter_map(|alias| {
+        direct_alias_name(rel, &alias.path).map(|name| {
+            let files = alias
+                .resolved_files
+                .map(|files| files.to_string())
+                .unwrap_or_default();
+            let bytes = alias
+                .resolved_size
+                .map(|bytes| bytes.to_string())
+                .unwrap_or_default();
+            format!(
+                "alias\t{files}\t{bytes}\t{name}\t{}",
+                alias.canonical_target
+            )
+        })
+    }));
+    tsv_page(LISTING_HEADER, &rows, paging)
+}
+
+fn sites_tsv(list: &SiteList, paging: Paging) -> TsvPage {
+    let mut rows = Vec::with_capacity(list.entries.len() + 1);
+    rows.push("builtin\t\t0\tAPI\t".to_string());
+    rows.extend(
+        list.entries
+            .iter()
+            .map(|entry| format!("site\t{}\t{}\t{}\t", entry.files, entry.bytes, entry.name)),
+    );
+    tsv_page(LISTING_HEADER, &rows, paging)
+}
+
+/// Adds `Entry-Count` and, when paged, `Link` to the neighbouring pages.
+///
+/// The links repeat the request's path and every other query parameter, so
+/// following `next` keeps `recursive` and the limit.
+pub fn add_paging_headers(response: &mut Response, uri: &Uri, paging: Paging, total: usize) {
+    let headers = response.headers_mut();
+    headers.insert(
+        "entry-count",
+        HeaderValue::from_str(&total.to_string()).expect("valid count"),
+    );
+    let Some(limit) = paging.limit else {
+        return;
+    };
+    let pages = total.div_ceil(limit).max(1);
+    let kept: Vec<&str> = uri
+        .query()
+        .unwrap_or("")
+        .split('&')
+        .filter(|pair| !pair.is_empty() && !pair.starts_with("page=") && *pair != "page")
+        .collect();
+    let link = |page: usize, rel: &str| {
+        let mut query = kept.join("&");
+        if !query.is_empty() {
+            query.push('&');
+        }
+        format!("<{}?{query}page={page}>; rel=\"{rel}\"", uri.path())
+    };
+    let mut links = Vec::new();
+    if paging.page > 1 {
+        links.push(link((paging.page - 1).min(pages), "prev"));
+    }
+    if paging.page < pages {
+        links.push(link(paging.page + 1, "next"));
+    }
+    if !links.is_empty()
+        && let Ok(value) = HeaderValue::from_str(&links.join(", "))
+    {
+        headers.insert(header::LINK, value);
+    }
+}
+
+pub fn tsv_response(headers: &HeaderMap, uri: &Uri, page: TsvPage, paging: Paging) -> Response {
+    let total = page.total;
+    let mut response = cached_response(headers, page.body, TSV_TYPE);
+    if response.status() == axum::http::StatusCode::OK {
+        add_paging_headers(&mut response, uri, paging, total);
+    }
+    response
+}
+
+pub fn bad_query(message: String) -> Response {
+    let mut response = Response::new(axum::body::Body::from(message));
+    *response.status_mut() = axum::http::StatusCode::BAD_REQUEST;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response
+}
+
+fn accepts(headers: &HeaderMap, media_type: &str) -> bool {
+    headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|accept| {
+            accept
+                .split(',')
+                .any(|part| part.trim().split(';').next().map(str::trim) == Some(media_type))
+        })
 }
 
 fn wants_json(headers: &HeaderMap) -> bool {
@@ -688,7 +932,12 @@ mod tests {
                 bytes: 512,
             }],
         };
-        let response = sites(&accept("application/json"), &list);
+        let response = sites(
+            &accept("application/json"),
+            &Uri::from_static("/FILES"),
+            &ListingQuery::default(),
+            &list,
+        );
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
         assert_eq!(
@@ -696,7 +945,12 @@ mod tests {
             r#"{"path":"/","files":1,"aliases":0,"bytes":512,"entries":[{"kind":"builtin","name":"API","files":null,"bytes":0},{"kind":"site","name":"hello","files":1,"bytes":512}]}"#
         );
 
-        let response = sites(&accept("text/html"), &list);
+        let response = sites(
+            &accept("text/html"),
+            &Uri::from_static("/FILES"),
+            &ListingQuery::default(),
+            &list,
+        );
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_text(response).await;
         assert!(body.contains("1 files · 512 B"));
@@ -717,17 +971,32 @@ mod tests {
                 bytes: 5,
             }],
         };
-        let response = sites(&HeaderMap::new(), &list);
+        let response = sites(
+            &HeaderMap::new(),
+            &Uri::from_static("/FILES"),
+            &ListingQuery::default(),
+            &list,
+        );
         let etag = response.headers()[header::ETAG].clone();
 
         let mut conditional = HeaderMap::new();
         conditional.insert(header::IF_NONE_MATCH, etag.clone());
-        let response = sites(&conditional, &list);
+        let response = sites(
+            &conditional,
+            &Uri::from_static("/FILES"),
+            &ListingQuery::default(),
+            &list,
+        );
         assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
 
         list.bytes += 1;
         list.entries[0].bytes += 1;
-        let response = sites(&conditional, &list);
+        let response = sites(
+            &conditional,
+            &Uri::from_static("/FILES"),
+            &ListingQuery::default(),
+            &list,
+        );
         assert_eq!(response.status(), StatusCode::OK);
         assert_ne!(response.headers()[header::ETAG], etag);
     }
@@ -865,7 +1134,7 @@ mod tests {
         assert!(render_plain("hello", "", &list).contains("latest -> releases/current"));
         assert!(render_html("hello", "", &list, true).contains("latest -&gt; releases/current"));
 
-        let response = listing(&accept("application/json"), "hello", "", &list, true);
+        let response = listing(&accept("application/json"), "hello", "", &list, true, None);
         let value: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
         assert_eq!(value["aliases"], 1);
         assert_eq!(value["entries"][0]["kind"], "alias");

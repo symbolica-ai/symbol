@@ -55,7 +55,8 @@ done
 } >> "$MOCK_CURL_LOG"
 
 status=200 body=ok location=
-case "$method:$url" in
+url_path=${url%%\?*}
+case "$method:$url_path" in
   COPY:*)
     status=201
     destination=$(printf '%s\n' "$headers" | awk -F ': ' '$1=="Destination"{print $2}')
@@ -125,9 +126,16 @@ tree_hash = "blake3:new"
   GET:http://mock/FILES)
     body='{"path":"/","files":2,"bytes":10,"entries":[{"kind":"site","name":"hello","files":2,"bytes":10}]}'
     ;;
-  GET:*/FILES)
+  GET:*/FILES|GET:*/FILES/*)
     if [ "${MOCK_LIST_ALIASES:-0}" = 1 ]; then
       body='{"site":"hello","content_revision":1,"tree_hash":"blake3:base","files":[],"aliases":[{"path":"file-link","target":"index.html","target_kind":"file"},{"path":"dir-link","target":"assets","target_kind":"directory"}]}'
+    elif [ -n "${MOCK_LARGE_INVENTORY:-}" ]; then
+      body=$(python3 -c '
+import json, sys
+n = int(sys.argv[1])
+files = [{"path": "section-%03d/page-%06d/index.html" % (i % 100, i), "hash": "blake3:x", "size": i} for i in range(n)]
+print(json.dumps({"site": "hello", "content_revision": 1, "tree_hash": "blake3:base", "files": files, "aliases": []}))
+' "${MOCK_LARGE_INVENTORY}")
     elif [ "${MOCK_AWKWARD_NAMES:-0}" = 1 ]; then
       body='{"site":"hello","content_revision":1,"tree_hash":"blake3:base","files":[{"path":"12 B.txt","hash":"blake3:local","size":3},{"path":"-leading.txt","hash":"blake3:local","size":1},{"path":"has -> arrow.txt","hash":"blake3:local","size":4},{"path":"my file.txt","hash":"blake3:local","size":5},{"path":"unicodé.txt","hash":"blake3:local","size":2}],"aliases":[{"path":"link","target":"my file.txt","target_kind":"file"}]}'
     elif [ "${MOCK_ALIAS_INVENTORY:-0}" = 1 ]; then
@@ -172,6 +180,79 @@ if [ "${MOCK_DROP_ONCE_METHOD:-}" = "$method" ] &&
   exit 52
 fi
 
+# The server serves listings and inventories as TSV when asked; derive that
+# representation, its paging, and the headers it carries, from the JSON
+# fixture: the site list, one directory of the inventory, or (with
+# ?recursive) the whole inventory.
+files_etag= files_revision= files_count= files_link=
+case "$method:$url_path" in
+  GET:*/FILES|GET:*/FILES/|GET:*/FILES/*)
+    if printf '%s\n' "$headers" | grep -q '^Accept: text/tab-separated-values'; then
+      files_out=$(printf '%s' "$body" | python3 -c '
+import json, sys, urllib.parse
+url = sys.argv[1]
+d = json.load(sys.stdin)
+split = urllib.parse.urlsplit(url)
+query = urllib.parse.parse_qs(split.query, keep_blank_values=True)
+def cell(f):
+    return "" if f is None else str(f)
+def row(*fields):
+    return "\t".join(cell(f) for f in fields)
+if "entries" in d:
+    header = "kind\tfiles\tbytes\tname\ttarget"
+    rows = [row(e["kind"], e.get("files"), e["bytes"], e["name"], e.get("target")) for e in d["entries"]]
+elif "recursive" in query:
+    header = "kind\tsize\tvalue\tpath"
+    rows = [row("file", f["size"], f["hash"], f["path"]) for f in d.get("files", [])]
+    rows += [row("alias", a.get("size"), a["target"], a["path"]) for a in d.get("aliases", [])]
+else:
+    path = urllib.parse.unquote(split.path)
+    prefix = path.split("/FILES", 1)[1].strip("/")
+    prefix = prefix + "/" if prefix else ""
+    dirs, files, aliases = {}, [], []
+    for f in d.get("files", []):
+        if not f["path"].startswith(prefix):
+            continue
+        rest = f["path"][len(prefix):]
+        if "/" in rest:
+            name = rest.split("/", 1)[0]
+            count, size = dirs.get(name, (0, 0))
+            dirs[name] = (count + 1, size + f["size"])
+        else:
+            files.append((rest, f["size"]))
+    entries = [(n, "directory", c, b) for n, (c, b) in dirs.items()] + [(n, "file", None, b) for n, b in files]
+    header = "kind\tfiles\tbytes\tname\ttarget"
+    rows = [row(k, c, b, n, None) for n, k, c, b in sorted(entries)]
+    for a in d.get("aliases", []):
+        if a["path"].startswith(prefix) and "/" not in a["path"][len(prefix):]:
+            rows.append(row("alias", None, a.get("size"), a["path"][len(prefix):], a["target"]))
+total = len(rows)
+limit = int(query["limit"][0]) if "limit" in query else None
+page = int(query["page"][0]) if "page" in query else 1
+link = ""
+if limit:
+    rows = rows[(page - 1) * limit : page * limit]
+    pages = max(1, -(-total // limit))
+    if page < pages:
+        link = "<%s?limit=%d&page=%d>; rel=\"next\"" % (split.path, limit, page + 1)
+print(d.get("tree_hash", ""))
+print(d.get("content_revision", ""))
+print(total)
+print(link)
+print(header)
+for r in rows:
+    print(r)
+' "$url")
+      files_etag=$(printf '%s\n' "$files_out" | sed -n 1p)
+      files_revision=$(printf '%s\n' "$files_out" | sed -n 2p)
+      files_count=$(printf '%s\n' "$files_out" | sed -n 3p)
+      files_link=$(printf '%s\n' "$files_out" | sed -n 4p)
+      body="$(printf '%s\n' "$files_out" | sed '1,4d')
+"
+    fi
+    ;;
+esac
+
 if [ "$fail" = 1 ] && [ "$fail_status" = 1 ]; then
   printf 'curl: (22) The requested URL returned error: %s\n' "$status" >&2
   exit 22
@@ -181,6 +262,11 @@ if [ -n "$dump" ]; then
   {
     printf 'HTTP/1.1 %s OK\r\n' "$status"
     [ -z "$location" ] || printf 'Location: %s\r\n' "$location"
+    [ -z "$files_etag" ] || printf 'ETag: "%s"\r\n' "$files_etag"
+    [ -z "$files_revision" ] || printf 'Content-Revision: %s\r\n' "$files_revision"
+    [ -z "$files_count" ] || printf 'Entry-Count: %s\r\n' "$files_count"
+    [ -z "${MOCK_SERVER_API_VERSION:-}" ] || printf 'Symbol-API-Version: %s\r\n' "${MOCK_SERVER_API_VERSION}"
+    [ -z "$files_link" ] || printf 'Link: %s\r\n' "$files_link"
     case "$method" in
       PUT|DELETE|COPY|MOVE|ALIAS|EXPIRE)
         printf 'Undo-Token: undo1\r\nUndo-Expires: 2027-01-01T00:00:00Z\r\n'
@@ -393,6 +479,60 @@ contains "${out}" 'http://mock/hello/12 B.txt' &&
   contains "${out}" 'http://mock/hello/link -> my file.txt' &&
   ok 'ls -l URLs are exact for awkward names' ||
   not_ok 'ls -l URLs are exact for awkward names'
+
+# One linear pass: 20000 entries took about ten minutes when the client parsed
+# the JSON inventory with awk string scanning.
+large_started=$(date +%s)
+large_rows=$(MOCK_LARGE_INVENTORY=20000 "${CLIENT}" ls -R hello | awk 'END{print NR}')
+large_seconds=$(( $(date +%s) - large_started ))
+[ "${large_rows}" -eq 20000 ] && [ "${large_seconds}" -lt 30 ] &&
+  ok 'ls -R lists a 20000-entry inventory in one pass' ||
+  not_ok "ls -R lists a 20000-entry inventory in one pass (${large_rows} rows, ${large_seconds}s)"
+
+out=$(MOCK_LARGE_INVENTORY=20000 "${CLIENT}" ls hello)
+contains "${out}" 'section-000/  200 files' &&
+  [ "$(printf '%s\n' "${out}" | awk 'END{print NR}')" -eq 100 ] &&
+  ok 'ls NAME lists the top directory with folder counts' ||
+  not_ok 'ls NAME lists the top directory with folder counts'
+
+out=$(MOCK_LARGE_INVENTORY=20000 "${CLIENT}" ls hello section-007 --limit 3 -p 2 2>"${ROOT}/ls-err")
+err=$(cat "${ROOT}/ls-err")
+contains "${out}" 'page-000307/  1 files' &&
+  [ "$(printf '%s\n' "${out}" | awk 'END{print NR}')" -eq 3 ] &&
+  contains "${err}" 'page 2 of 67 (200 entries): symbol ls --limit 3 hello section-007 -p 3 for more' &&
+  ok 'ls pages a subdirectory with --limit and -p after the names' ||
+  not_ok 'ls pages a subdirectory with --limit and -p after the names'
+
+out=$(MOCK_LARGE_INVENTORY=20000 "${CLIENT}" ls hello 2>"${ROOT}/ls-err")
+[ ! -s "${ROOT}/ls-err" ] &&
+  ok 'piped ls is never paged' ||
+  not_ok 'piped ls is never paged'
+
+if "${CLIENT}" ls hello -p 2 >/dev/null 2>&1; then
+  not_ok 'piped ls -p without --limit is a usage error'
+else
+  ok 'piped ls -p without --limit is a usage error'
+fi
+
+# The client is told its API version when served; a different major version
+# on the server is an incompatible API, reported on stderr every run.
+sed "s/^CLIENT_API_VERSION=.*/CLIENT_API_VERSION='1.4.2'/" "${CLIENT}" > "${ROOT}/versioned-client"
+chmod +x "${ROOT}/versioned-client"
+cp "$(dirname "${CLIENT}")/.symbol.blake3" "${ROOT}/.symbol.blake3" 2>/dev/null || true
+MOCK_SERVER_API_VERSION=2.0.0 "${ROOT}/versioned-client" ls hello >"${ROOT}/ver-out" 2>"${ROOT}/ver-err" || true
+contains "$(cat "${ROOT}/ver-err")" 'runs API 2.0.0, but this client was built for 1.4.2' &&
+  contains "$(cat "${ROOT}/ver-err")" 'symbol update' &&
+  contains "$(cat "${ROOT}/ver-out")" 'index.html' &&
+  ok 'a newer major server version tells the user to update' ||
+  not_ok 'a newer major server version tells the user to update'
+MOCK_SERVER_API_VERSION=1.9.0 "${ROOT}/versioned-client" ls hello >/dev/null 2>"${ROOT}/ver-err" || true
+contains "$(cat "${ROOT}/ver-err")" 'API' &&
+  not_ok 'a same-major server version stays quiet' ||
+  ok 'a same-major server version stays quiet'
+MOCK_SERVER_API_VERSION=0.1.109 "${ROOT}/versioned-client" ls hello >/dev/null 2>"${ROOT}/ver-err" || true
+contains "$(cat "${ROOT}/ver-err")" 'is newer than' &&
+  ok 'an older major server version says the client is ahead' ||
+  not_ok 'an older major server version says the client is ahead'
 
 out=$("${CLIENT}" ls --json hello)
 contains "${out}" '"path":"index.html"' &&

@@ -13,6 +13,12 @@ pub fn safe_rel_path(raw: &str) -> Result<PathBuf, PathError> {
     if raw.is_empty() || raw.contains('\0') {
         return Err(PathError::Empty);
     }
+    // No stored path contains a control character. Archives already refused
+    // them; direct uploads did not, and a newline or tab in a path breaks
+    // every line-oriented listing (and the `Location` header it is echoed in).
+    if raw.chars().any(char::is_control) {
+        return Err(PathError::Invalid);
+    }
     let mut out = PathBuf::new();
     for part in raw.split('/') {
         if part.is_empty() || part == "." {
@@ -95,6 +101,16 @@ mod tests {
     #[test]
     fn rejects_zip_slip() {
         assert!(safe_rel_path("../etc/passwd").is_err());
+        for control in [
+            "a\tb.txt",
+            "a\nb.txt",
+            "a\rb.txt",
+            "a\u{7f}b.txt",
+            "dir\u{1b}/x",
+        ] {
+            assert!(safe_rel_path(control).is_err(), "{control:?}");
+        }
+        assert!(safe_rel_path("unicod\u{e9} and spaces.txt").is_ok());
         assert!(safe_rel_path("foo/../../etc/passwd").is_err());
         assert!(safe_rel_path("/etc/passwd").is_ok()); // leading slash stripped
         assert_eq!(
