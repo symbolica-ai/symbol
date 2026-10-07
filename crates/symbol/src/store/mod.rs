@@ -33,6 +33,7 @@ use crate::expiry::{
 };
 use crate::hash::{ContentHash, HashParseError, TreeHash};
 use crate::name::{NameError, generate_id, parse_site_name};
+use crate::numeric::u64_to_f64;
 use crate::pathutil::{PathError, is_junk, is_noise_path, safe_rel_path};
 use crate::sanitize::{self, TokenCounts};
 use crate::schema::{
@@ -2121,14 +2122,6 @@ fn load_descendant_files(
 
 fn descendant_bounds(rel: &str) -> (String, String) {
     (format!("{rel}/"), format!("{rel}0"))
-}
-
-fn u64_to_f64(value: u64) -> f64 {
-    const U32_RADIX: f64 = u32::MAX as f64 + 1.0;
-
-    let high = u32::try_from(value >> u32::BITS).expect("upper half fits in u32");
-    let low = u32::try_from(value & u64::from(u32::MAX)).expect("lower half fits in u32");
-    f64::from(high).mul_add(U32_RADIX, f64::from(low))
 }
 
 fn quantile(sorted: &[u64], numerator: u8, denominator: u8) -> f64 {

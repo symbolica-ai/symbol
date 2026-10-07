@@ -23,6 +23,7 @@ mod markdown;
 mod markdown_cache;
 mod mutation_http;
 mod name;
+mod numeric;
 mod page;
 mod pathutil;
 mod sanitize;

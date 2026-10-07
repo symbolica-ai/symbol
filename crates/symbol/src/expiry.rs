@@ -4,6 +4,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use time::{Date, Month, OffsetDateTime, PrimitiveDateTime, Time, UtcOffset};
 
+use crate::numeric::{round_to_u64_within, u64_to_f64};
 use crate::units::{MIB, SECONDS_PER_DAY};
 
 pub const DEFAULT_MIN_AGE_SECONDS: u64 = 30 * SECONDS_PER_DAY;
@@ -104,11 +105,6 @@ impl DecayPolicy {
     ///
     /// The endpoint cases are handled exactly. Interior values use:
     /// `min_age + (max_age - min_age) * (1 - min(size, max_size) / max_size)^power`.
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_precision_loss,
-        clippy::cast_sign_loss
-    )]
     pub fn retention_seconds(self, size_bytes: u64) -> Result<u64, ExpiryError> {
         let policy = self.validate()?;
         if size_bytes == 0 {
@@ -118,13 +114,19 @@ impl DecayPolicy {
             return Ok(policy.min_age_seconds);
         }
 
-        let size_fraction = size_bytes as f64 / policy.max_size_bytes as f64;
-        let age_range = (policy.max_age_seconds - policy.min_age_seconds) as f64;
+        let size_fraction = u64_to_f64(size_bytes) / u64_to_f64(policy.max_size_bytes);
+        let age_range = u64_to_f64(policy.max_age_seconds - policy.min_age_seconds);
         let retention = age_range.mul_add(
             (1.0 - size_fraction).powf(policy.power),
-            policy.min_age_seconds as f64,
+            u64_to_f64(policy.min_age_seconds),
         );
-        Ok(retention.round() as u64)
+        // The curve runs from max_age at size 0 down to min_age at max_size,
+        // so the result belongs in that range.
+        Ok(round_to_u64_within(
+            retention,
+            policy.min_age_seconds,
+            policy.max_age_seconds,
+        ))
     }
 }
 
