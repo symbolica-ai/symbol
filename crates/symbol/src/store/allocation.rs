@@ -1379,6 +1379,7 @@ impl Store {
                     allocated_entries::suffix.eq(&destination.suffix),
                     allocated_entries::extension.eq(&destination.extension),
                     allocated_entries::media_type.eq(&destination.media_type),
+                    allocated_entries::modified.eq(now),
                 ))
                 .execute(tx)?;
             adjust_aggregates_locked(tx, site_id, &destination.path, staged.size, 1)?;

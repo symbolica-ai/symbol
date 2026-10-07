@@ -157,7 +157,7 @@ usage:
   symbol expire [NAME [PATH]] [POLICY]
   symbol manage [NAME ACTION]
   symbol recover
-  symbol ls [-l] [-R] [-p PAGE] [--limit N|--all] [--json] [NAME [PATH]]
+  symbol ls [-l] [-m|-S] [-r] [-R] [-p PAGE] [--limit N|--all] [--json] [NAME [PATH]]
   symbol rm NAME [PATH]
   symbol url NAME
   symbol api [--json]
@@ -328,11 +328,16 @@ EOF
       ;;
     ls) cat <<'EOF'
 symbol ls: list sites, or one directory of a site
-usage: symbol ls [-l] [-R] [-p PAGE] [--limit N | --all] [--json] [NAME [PATH]]
+usage: symbol ls [-l] [-m | -S] [-r] [-R] [-p PAGE] [--limit N | --all]
+                 [--json] [NAME [PATH]]
 
 without NAME, lists sites. NAME lists the site's top directory, and
 NAME PATH that directory: folders with their file count and size, then
-files and aliases. -R lists every file and alias in the site instead.
+files and aliases, each with the UTC time its content last changed.
+-R lists every file and alias in the site instead.
+
+entries sort by name; -m sorts newest first, -S largest first, and -r
+reverses the order. folders always come before files.
 
 in a terminal, 50 entries a page: -p 2 shows the next, --limit N sets
 the page size, --all shows everything. piped output is never paged.
@@ -616,6 +621,14 @@ function human_size(n,    units, i, value) {
   if (value >= 10) return sprintf("%.1f %s", value, units[i])
   return sprintf("%.2f %s", value, units[i])
 }
+# 2026-10-06T14:03:12Z -> 2026-10-06 14:03Z. Listings carry whole UTC seconds.
+function when(t) {
+  if (t == "") return ""
+  return substr(t, 1, 10) " " substr(t, 12, 5) "Z"
+}
+function lpad(s, n) {
+  return spaces(n - length(s)) s
+}
 AWK
 }
 
@@ -624,14 +637,21 @@ AWK
 # split is exact and a listing is read in one linear pass.
 #
 # print_entries reads site and directory listings (kind files bytes name
-# target); print_inventory reads the recursive inventory (kind size value path).
+# target, then modified when the server has it); print_inventory reads the
+# recursive inventory (kind size value path).
+#
+# Entries print as aligned columns: name, folder file count, size, and the UTC
+# time the content last changed. A server from before 1.1 sends no modified
+# column, and the listing simply has no dates.
 print_entries() {
   base=${1%/}
   links=$2
   complete=$3
   LC_ALL=C awk -F '\t' -v base="${base}" -v links="${links}" -v complete="${complete}" "$(ls_awk_lib)"'
     NR == 1 {
-      if ($0 != "kind\tfiles\tbytes\tname\ttarget") { bad = 1; exit 1 }
+      if ($0 == "kind\tfiles\tbytes\tname\ttarget") dated = 0
+      else if ($0 == "kind\tfiles\tbytes\tname\ttarget\tmodified") dated = 1
+      else { bad = 1; exit 1 }
       next
     }
     {
@@ -642,22 +662,35 @@ print_entries() {
       if (folder) row = row "/"
       if (kind == "alias") row = row " -> " target
       rows[n] = row
-      if (kind == "builtin") meta[n] = "built-in"
-      else if (kind == "alias") meta[n] = ""
-      else if (folder) meta[n] = files " files   " human_size(bytes)
-      else meta[n] = human_size(bytes)
+      count[n] = (folder && kind != "builtin") ? files " files" : ""
+      if (kind == "builtin") size[n] = "built-in"
+      else if (kind == "alias") size[n] = ""
+      else size[n] = human_size(bytes)
+      date[n] = dated ? when($6) : ""
       if (kind == "site") { total_files += files; total_bytes += bytes; sites++ }
       w[n] = cols(row)
       if (w[n] > width) width = w[n]
+      if (length(count[n]) > count_width) count_width = length(count[n])
+      if (length(size[n]) > size_width) size_width = length(size[n])
+    }
+    function line(name, name_width, files, size, date, suffix,    out) {
+      out = name spaces(width - name_width)
+      if (count_width) out = out "  " lpad(files, count_width)
+      out = out (count_width ? "   " : "  ") lpad(size, size_width) suffix
+      if (date != "") out = out "   " date
+      sub(/ +$/, "", out)
+      return out
     }
     END {
       if (bad || NR == 0) exit 1
-      for (i = 1; i <= n; i++) {
-        if (meta[i] == "") print rows[i]
-        else printf "%s%s  %s\n", rows[i], spaces(width - w[i]), meta[i]
+      if (sites && complete) {
+        total_count = total_files " files"
+        total_size = human_size(total_bytes)
+        if (length(total_count) > count_width) count_width = length(total_count)
+        if (length(total_size) > size_width) size_width = length(total_size)
       }
-      if (sites && complete)
-        printf "%s  %d files   %s total\n", spaces(width), total_files, human_size(total_bytes)
+      for (i = 1; i <= n; i++) print line(rows[i], w[i], count[i], size[i], date[i], "")
+      if (sites && complete) print line("", 0, total_count, total_size, "", " total")
     }
   '
 }
@@ -3421,11 +3454,16 @@ case "${cmd}" in
     ls_name=
     ls_where=
     ls_args=0
+    ls_sort=name
+    ls_reverse=0
     # Flags may come before or after NAME and PATH: `symbol ls nlab -p 2`.
     while [ "$#" -gt 0 ]; do
       case "$1" in
         -l|--links) links=1; ls_flags="${ls_flags} -l"; shift ;;
         -R|--recursive) recursive=1; ls_flags="${ls_flags} -R"; shift ;;
+        -m|--modified) ls_sort=modified; ls_flags="${ls_flags} -m"; shift ;;
+        -S|--size) ls_sort=size; ls_flags="${ls_flags} -S"; shift ;;
+        -r|--reverse) ls_reverse=1; ls_flags="${ls_flags} -r"; shift ;;
         -a|--all) ls_all=1; shift ;;
         -p|--page)
           [ "$#" -ge 2 ] || usage_error "$1 needs a page number"
@@ -3461,6 +3499,20 @@ case "${cmd}" in
       esac
     done
     [ "${recursive}" -eq 0 ] || [ "$#" -eq 1 ] || usage_error "ls -R takes exactly one site name"
+    [ "${recursive}" -eq 0 ] || { [ "${ls_sort}" = name ] && [ "${ls_reverse}" -eq 0 ]; } ||
+      usage_error "ls -R lists the whole site in path order; -m, -S and -r sort one directory"
+    # The server sorts, so paging stays consistent: folders first, then files,
+    # then aliases, each by the key. -m and -S put the newest or largest
+    # first, like ls(1) -t and -S; -r reverses whichever order applies. (-t is
+    # taken: it is the global --token.)
+    ls_query="columns=modified&sort=${ls_sort}"
+    if [ "${ls_reverse}" -eq 1 ]; then
+      if [ "${ls_sort}" = name ]; then
+        ls_query="${ls_query}&order=desc"
+      else
+        ls_query="${ls_query}&order=asc"
+      fi
+    fi
     # Like ls(1) choosing columns, page only for a person: a pipe gets every
     # entry, so `symbol ls nlab | grep x` searches the whole directory.
     if [ "${ls_all}" -eq 1 ]; then
@@ -3476,7 +3528,7 @@ case "${cmd}" in
         request GET /FILES -H 'Accept: application/json'
         printf '\n'
       else
-        list_page /FILES entries "${HOST}" "${links}" "${ls_limit}" "${ls_page}" \
+        list_page "/FILES?${ls_query}" entries "${HOST}" "${links}" "${ls_limit}" "${ls_page}" \
           "symbol ls${ls_flags}"
       fi
     else
@@ -3499,8 +3551,8 @@ case "${cmd}" in
         list_page "/${name}/FILES?recursive" inventory "${ls_base}" "${links}" \
           "${ls_limit}" "${ls_page}" "symbol ls${ls_flags} ${name}"
       else
-        list_page "${ls_path}" entries "${ls_base}" "${links}" "${ls_limit}" "${ls_page}" \
-          "symbol ls${ls_flags} ${name}${2:+ ${2}}"
+        list_page "${ls_path}?${ls_query}" entries "${ls_base}" "${links}" "${ls_limit}" \
+          "${ls_page}" "symbol ls${ls_flags} ${name}${2:+ ${2}}"
       fi
     fi
     ;;

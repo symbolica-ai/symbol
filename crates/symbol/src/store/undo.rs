@@ -72,12 +72,15 @@ pub(super) fn snapshot_site(
     snapshot_site_with_description(tx, name, kind, &description, now)
 }
 
+/// Records an allocated entry's state before a change. `entry` is its metadata
+/// and `modified` time, or `None` when the path did not exist.
 pub(super) fn insert_undo_allocated(
     tx: &mut SqliteConnection,
     token: &str,
     path: &str,
-    metadata: Option<&AllocatedMetadata>,
+    entry: Option<(&AllocatedMetadata, i64)>,
 ) -> Result<(), diesel::result::Error> {
+    let metadata = entry.map(|(metadata, _)| metadata);
     diesel::insert_into(undo_allocated_deltas::table)
         .values((
             undo_allocated_deltas::token.eq(token),
@@ -91,6 +94,7 @@ pub(super) fn insert_undo_allocated(
             undo_allocated_deltas::extension
                 .eq(metadata.and_then(|value| value.extension.as_deref())),
             undo_allocated_deltas::media_type.eq(metadata.map(|value| value.media_type.as_str())),
+            undo_allocated_deltas::modified.eq(entry.map(|(_, modified)| modified)),
         ))
         .execute(tx)?;
     Ok(())
@@ -111,6 +115,7 @@ pub(super) fn insert_undo_alias(
             undo_alias_deltas::resolved_kind.eq(alias.and_then(|row| row.resolved_kind)),
             undo_alias_deltas::resolved_hash.eq(alias.and_then(|row| row.resolved_hash)),
             undo_alias_deltas::resolved_size.eq(alias.and_then(|row| row.resolved_size)),
+            undo_alias_deltas::modified.eq(alias.map(|row| row.modified)),
         ))
         .execute(tx)?;
     Ok(())
@@ -188,15 +193,16 @@ pub(super) fn snapshot_site_with_description(
         let saved_files = files::table
             .filter(files::site_id.eq(site_id))
             .filter(files::path.ne(MANIFEST_PATH))
-            .select((files::path, files::hash, files::size))
-            .load::<(String, ContentHash, i64)>(tx)?;
-        for (path, hash, size) in saved_files {
+            .select((files::path, files::hash, files::size, files::modified))
+            .load::<(String, ContentHash, i64, i64)>(tx)?;
+        for (path, hash, size, modified) in saved_files {
             diesel::insert_into(undo_files::table)
                 .values((
                     undo_files::token.eq(&token),
                     undo_files::path.eq(path),
                     undo_files::hash.eq(hash),
                     undo_files::size.eq(size),
+                    undo_files::modified.eq(Some(modified)),
                 ))
                 .execute(tx)?;
         }
@@ -211,6 +217,7 @@ pub(super) fn snapshot_site_with_description(
                 allocated_entries::suffix,
                 allocated_entries::extension,
                 allocated_entries::media_type,
+                allocated_entries::modified,
             ))
             .load::<(
                 String,
@@ -221,23 +228,27 @@ pub(super) fn snapshot_site_with_description(
                 String,
                 Option<String>,
                 String,
+                i64,
             )>(tx)?;
-        for (path, hash, size, naming_mode, prefix, suffix, extension, media_type) in
+        for (path, hash, size, naming_mode, prefix, suffix, extension, media_type, modified) in
             saved_allocated
         {
             insert_undo_allocated(
                 tx,
                 &token,
                 &path,
-                Some(&AllocatedMetadata {
-                    hash,
-                    size,
-                    naming_mode: AllocatedNamingMode::try_from(naming_mode)?,
-                    prefix,
-                    suffix,
-                    extension,
-                    media_type,
-                }),
+                Some((
+                    &AllocatedMetadata {
+                        hash,
+                        size,
+                        naming_mode: AllocatedNamingMode::try_from(naming_mode)?,
+                        prefix,
+                        suffix,
+                        extension,
+                        media_type,
+                    },
+                    modified,
+                )),
             )?;
         }
         let saved_aliases = aliases::table
@@ -341,10 +352,10 @@ pub(super) fn snapshot_entry_deltas(
             .optional()?;
         match entry_kind {
             Some(entry_kind) if entry_kind == database::schema::FILE_ENTRY_KIND => {
-                let (hash, size) = files::table
+                let (hash, size, modified) = files::table
                     .find((site_id, *path))
-                    .select((files::hash, files::size))
-                    .first::<(ContentHash, i64)>(tx)?;
+                    .select((files::hash, files::size, files::modified))
+                    .first::<(ContentHash, i64, i64)>(tx)?;
                 diesel::insert_into(undo_file_deltas::table)
                     .values((
                         undo_file_deltas::token.eq(&token),
@@ -353,12 +364,17 @@ pub(super) fn snapshot_entry_deltas(
                         undo_file_deltas::kind.eq(Some(entry_kind)),
                         undo_file_deltas::hash.eq(Some(hash)),
                         undo_file_deltas::size.eq(Some(size)),
+                        undo_file_deltas::modified.eq(Some(modified)),
                     ))
                     .execute(tx)?;
             }
             Some(entry_kind) if entry_kind == database::schema::ALLOCATED_ENTRY_KIND => {
                 let metadata = allocated_metadata_locked(tx, site_id, path)?;
-                insert_undo_allocated(tx, &token, path, Some(&metadata))?;
+                let modified = allocated_entries::table
+                    .find((site_id, *path))
+                    .select(allocated_entries::modified)
+                    .first::<i64>(tx)?;
+                insert_undo_allocated(tx, &token, path, Some((&metadata, modified)))?;
             }
             Some(entry_kind) if entry_kind == database::schema::ALIAS_ENTRY_KIND => {
                 let alias = aliases::table
@@ -383,6 +399,7 @@ pub(super) fn snapshot_entry_deltas(
                         undo_file_deltas::kind.eq(Option::<i64>::None),
                         undo_file_deltas::hash.eq(Option::<ContentHash>::None),
                         undo_file_deltas::size.eq(Option::<i64>::None),
+                        undo_file_deltas::modified.eq(Option::<i64>::None),
                     ))
                     .execute(tx)?;
             }
@@ -414,8 +431,9 @@ pub(super) fn restore_entry_deltas(
             undo_file_deltas::existed,
             undo_file_deltas::hash,
             undo_file_deltas::size,
+            undo_file_deltas::modified,
         ))
-        .load::<(String, i64, Option<ContentHash>, Option<i64>)>(tx)?;
+        .load::<(String, i64, Option<ContentHash>, Option<i64>, Option<i64>)>(tx)?;
     let allocated_deltas = undo_allocated_deltas::table
         .filter(undo_allocated_deltas::token.eq(token))
         .select(UndoAllocatedMetadata::as_select())
@@ -424,6 +442,9 @@ pub(super) fn restore_entry_deltas(
         .filter(undo_alias_deltas::token.eq(token))
         .select(UndoAliasRow::as_select())
         .load::<UndoAliasRow>(tx)?;
+    // Snapshots taken before entries recorded `modified` restore the latest
+    // time their content can have changed: the site's own `updated` then.
+    let restored_modified = |modified: Option<i64>| modified.unwrap_or(updated);
     let entry_change_paths = file_deltas
         .iter()
         .map(|row| row.0.clone())
@@ -446,7 +467,7 @@ pub(super) fn restore_entry_deltas(
         )
         .execute(tx)?;
     }
-    for (path, existed, hash, size) in file_deltas {
+    for (path, existed, hash, size, modified) in file_deltas {
         if existed == 0 {
             continue;
         }
@@ -459,6 +480,7 @@ pub(super) fn restore_entry_deltas(
                 path,
                 hash,
                 size,
+                modified: restored_modified(modified),
             })
             .execute(tx)?;
     }
@@ -492,6 +514,7 @@ pub(super) fn restore_entry_deltas(
                 allocated_entries::media_type.eq(delta
                     .media_type
                     .expect("existing allocated delta has media type")),
+                allocated_entries::modified.eq(restored_modified(delta.modified)),
             ))
             .execute(tx)?;
     }
@@ -518,6 +541,7 @@ pub(super) fn restore_entry_deltas(
                 aliases::resolved_kind.eq(delta.resolved_kind),
                 aliases::resolved_hash.eq(delta.resolved_hash),
                 aliases::resolved_size.eq(delta.resolved_size),
+                aliases::modified.eq(restored_modified(delta.modified)),
             ))
             .execute(tx)?;
     }
@@ -806,11 +830,19 @@ impl Store {
                     ))
                     .execute(&mut *tx)?;
             }
+            // As in `restore_entry_deltas`: a snapshot from before entries
+            // recorded `modified` falls back to the site's `updated` then.
+            let restored_modified = |modified: Option<i64>| modified.unwrap_or(snapshot.updated);
             let saved_files = undo_files::table
                 .filter(undo_files::token.eq(&latest))
-                .select((undo_files::path, undo_files::hash, undo_files::size))
-                .load::<(String, ContentHash, i64)>(&mut *tx)?;
-            for (path, hash, size) in saved_files {
+                .select((
+                    undo_files::path,
+                    undo_files::hash,
+                    undo_files::size,
+                    undo_files::modified,
+                ))
+                .load::<(String, ContentHash, i64, Option<i64>)>(&mut *tx)?;
+            for (path, hash, size, modified) in saved_files {
                 ensure_file_entry(&mut tx, site_id, &path)?;
                 diesel::insert_into(files::table)
                     .values(NewFile {
@@ -818,6 +850,7 @@ impl Store {
                         path,
                         hash,
                         size,
+                        modified: restored_modified(modified),
                     })
                     .execute(&mut *tx)?;
             }
@@ -833,6 +866,7 @@ impl Store {
                     undo_allocated_deltas::suffix,
                     undo_allocated_deltas::extension,
                     undo_allocated_deltas::media_type,
+                    undo_allocated_deltas::modified,
                 ))
                 .load::<(
                     String,
@@ -843,8 +877,9 @@ impl Store {
                     Option<String>,
                     Option<String>,
                     Option<String>,
+                    Option<i64>,
                 )>(&mut *tx)?;
-            for (path, hash, size, naming_mode, prefix, suffix, extension, media_type) in
+            for (path, hash, size, naming_mode, prefix, suffix, extension, media_type, modified) in
                 saved_allocated
             {
                 diesel::insert_into(site_entries::table)
@@ -875,6 +910,7 @@ impl Store {
                             allocated_entries::media_type
                                 .eq(media_type
                                     .expect("whole-site allocated snapshot has media type")),
+                            allocated_entries::modified.eq(restored_modified(modified)),
                         ),
                     )
                     .execute(&mut *tx)?;
@@ -903,6 +939,7 @@ impl Store {
                         aliases::resolved_kind.eq(alias.resolved_kind),
                         aliases::resolved_hash.eq(alias.resolved_hash),
                         aliases::resolved_size.eq(alias.resolved_size),
+                        aliases::modified.eq(restored_modified(alias.modified)),
                     ))
                     .execute(&mut *tx)?;
             }

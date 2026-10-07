@@ -7,7 +7,7 @@ use sea_query::{
     IndexCreateStatement, IntoIden, IntoTableRef, SqliteQueryBuilder, Table, TableCreateStatement,
 };
 
-pub const LATEST_SCHEMA_VERSION: i64 = 11;
+pub const LATEST_SCHEMA_VERSION: i64 = 12;
 pub const FILE_ENTRY_KIND: i64 = 0;
 pub const ALLOCATED_ENTRY_KIND: i64 = 1;
 pub const ALIAS_ENTRY_KIND: i64 = 2;
@@ -45,6 +45,7 @@ enum Files {
     Kind,
     Hash,
     Size,
+    Modified,
 }
 
 #[derive(Iden)]
@@ -170,6 +171,7 @@ enum UndoFileDeltas {
     Kind,
     Hash,
     Size,
+    Modified,
 }
 
 #[derive(Iden)]
@@ -185,6 +187,7 @@ enum AllocatedEntries {
     Suffix,
     Extension,
     MediaType,
+    Modified,
 }
 
 #[derive(Iden)]
@@ -219,6 +222,7 @@ enum UndoAllocatedDeltas {
     Suffix,
     Extension,
     MediaType,
+    Modified,
 }
 
 #[derive(Iden)]
@@ -231,6 +235,7 @@ enum Aliases {
     ResolvedKind,
     ResolvedHash,
     ResolvedSize,
+    Modified,
 }
 
 #[derive(Iden)]
@@ -243,6 +248,7 @@ enum UndoAliasDeltas {
     ResolvedKind,
     ResolvedHash,
     ResolvedSize,
+    Modified,
 }
 
 #[derive(Iden)]
@@ -300,6 +306,7 @@ enum UndoFiles {
     Path,
     Hash,
     Size,
+    Modified,
 }
 
 #[derive(Iden)]
@@ -756,7 +763,7 @@ pub fn upgrade_v10_to_v11() -> Vec<String> {
             .table(Files::Table, FilesV10::Table)
             .to_owned()
             .to_string(SqliteQueryBuilder),
-        files_table().to_string(SqliteQueryBuilder),
+        files_table_v11().to_string(SqliteQueryBuilder),
         "INSERT INTO \"files\" (\"site_id\", \"path\", \"kind\", \"hash\", \"size\")
          SELECT \"site_id\", \"path\", \"kind\", unhex(\"hash\"), \"size\" FROM \"files_v10\""
             .to_string(),
@@ -781,7 +788,7 @@ pub fn upgrade_v10_to_v11() -> Vec<String> {
             .table(UndoFiles::Table, UndoFilesV10::Table)
             .to_owned()
             .to_string(SqliteQueryBuilder),
-        undo_files_table().to_string(SqliteQueryBuilder),
+        undo_files_table_v11().to_string(SqliteQueryBuilder),
         "INSERT INTO \"undo_files\" (\"token\", \"path\", \"hash\", \"size\")
          SELECT \"token\", \"path\", unhex(\"hash\"), \"size\" FROM \"undo_files_v10\""
             .to_string(),
@@ -794,7 +801,7 @@ pub fn upgrade_v10_to_v11() -> Vec<String> {
             .table(AllocatedEntries::Table, AllocatedEntriesV10::Table)
             .to_owned()
             .to_string(SqliteQueryBuilder),
-        allocated_entries_table().to_string(SqliteQueryBuilder),
+        allocated_entries_table_v11().to_string(SqliteQueryBuilder),
         "INSERT INTO \"allocated_entries\"
             (\"site_id\", \"path\", \"kind\", \"hash\", \"size\", \"naming_mode\", \"prefix\",
              \"suffix\", \"extension\", \"media_type\")
@@ -832,7 +839,7 @@ pub fn upgrade_v10_to_v11() -> Vec<String> {
             .table(UndoFileDeltas::Table, UndoFileDeltasV10::Table)
             .to_owned()
             .to_string(SqliteQueryBuilder),
-        undo_file_deltas_table().to_string(SqliteQueryBuilder),
+        undo_file_deltas_table_v11().to_string(SqliteQueryBuilder),
         "INSERT INTO \"undo_file_deltas\"
             (\"token\", \"path\", \"existed\", \"kind\", \"hash\", \"size\")
          SELECT \"token\", \"path\", \"existed\", \"kind\",
@@ -848,7 +855,7 @@ pub fn upgrade_v10_to_v11() -> Vec<String> {
             .table(UndoAllocatedDeltas::Table, UndoAllocatedDeltasV10::Table)
             .to_owned()
             .to_string(SqliteQueryBuilder),
-        undo_allocated_deltas_table().to_string(SqliteQueryBuilder),
+        undo_allocated_deltas_table_v11().to_string(SqliteQueryBuilder),
         "INSERT INTO \"undo_allocated_deltas\"
             (\"token\", \"path\", \"existed\", \"hash\", \"size\", \"naming_mode\", \"prefix\",
              \"suffix\", \"extension\", \"media_type\")
@@ -865,7 +872,7 @@ pub fn upgrade_v10_to_v11() -> Vec<String> {
             .table(Aliases::Table, AliasesV10::Table)
             .to_owned()
             .to_string(SqliteQueryBuilder),
-        aliases_table().to_string(SqliteQueryBuilder),
+        aliases_table_v11().to_string(SqliteQueryBuilder),
         "INSERT INTO \"aliases\"
             (\"site_id\", \"path\", \"kind\", \"canonical_target\", \"resolved_kind\",
              \"resolved_hash\", \"resolved_size\")
@@ -899,7 +906,7 @@ pub fn upgrade_v10_to_v11() -> Vec<String> {
             .table(UndoAliasDeltas::Table, UndoAliasDeltasV10::Table)
             .to_owned()
             .to_string(SqliteQueryBuilder),
-        undo_alias_deltas_table().to_string(SqliteQueryBuilder),
+        undo_alias_deltas_table_v11().to_string(SqliteQueryBuilder),
         "INSERT INTO \"undo_alias_deltas\"
             (\"token\", \"path\", \"existed\", \"canonical_target\", \"resolved_kind\",
              \"resolved_hash\", \"resolved_size\")
@@ -936,6 +943,84 @@ pub fn upgrade_v10_to_v11() -> Vec<String> {
             .to_string(SqliteQueryBuilder),
         "PRAGMA foreign_keys=ON".to_string(),
     ]
+}
+
+/// The tables that record when an entry's content last changed, and the
+/// undo tables that snapshot them.
+const MODIFIED_TABLES: [&str; 3] = ["files", "allocated_entries", "aliases"];
+#[cfg(test)]
+const UNDO_MODIFIED_TABLES: [&str; 4] = [
+    "undo_files",
+    "undo_file_deltas",
+    "undo_allocated_deltas",
+    "undo_alias_deltas",
+];
+
+/// Adds `modified`: when each entry's content last changed, in Unix
+/// milliseconds.
+///
+/// Entries that predate the column are backfilled with their site's `updated`,
+/// the latest moment their content can have changed. Undo snapshots taken
+/// before the column existed leave it `NULL`, and restoring one falls back to
+/// the snapshot's own `updated` for the same reason.
+pub fn upgrade_v11_to_v12() -> Vec<String> {
+    let mut statements = vec![
+        add_column(Files::Table, modified_column(Files::Modified)),
+        add_column(
+            AllocatedEntries::Table,
+            modified_column(AllocatedEntries::Modified),
+        ),
+        add_column(Aliases::Table, modified_column(Aliases::Modified)),
+        add_column(UndoFiles::Table, undo_modified_column(UndoFiles::Modified)),
+        add_column(
+            UndoFileDeltas::Table,
+            undo_modified_column(UndoFileDeltas::Modified),
+        ),
+        add_column(
+            UndoAllocatedDeltas::Table,
+            undo_modified_column(UndoAllocatedDeltas::Modified),
+        ),
+        add_column(
+            UndoAliasDeltas::Table,
+            undo_modified_column(UndoAliasDeltas::Modified),
+        ),
+    ];
+    for table in MODIFIED_TABLES {
+        statements.push(format!(
+            "UPDATE \"{table}\" SET \"modified\" = \
+             (SELECT \"updated\" FROM \"sites\" WHERE \"sites\".\"id\" = \"{table}\".\"site_id\")"
+        ));
+    }
+    statements
+}
+
+#[cfg(test)]
+pub fn downgrade_v12_to_v11() -> Vec<String> {
+    MODIFIED_TABLES
+        .iter()
+        .chain(UNDO_MODIFIED_TABLES.iter())
+        .map(|table| format!("ALTER TABLE \"{table}\" DROP COLUMN \"modified\""))
+        .collect()
+}
+
+fn add_column(table: impl IntoTableRef, mut column: ColumnDef) -> String {
+    Table::alter()
+        .table(table)
+        .add_column(&mut column)
+        .to_owned()
+        .to_string(SqliteQueryBuilder)
+}
+
+fn modified_column(iden: impl Iden) -> ColumnDef {
+    let mut column = ColumnDef::new(iden);
+    column.integer().not_null().default(0);
+    column
+}
+
+fn undo_modified_column(iden: impl Iden) -> ColumnDef {
+    let mut column = ColumnDef::new(iden);
+    column.integer();
+    column
 }
 
 #[cfg(test)]
@@ -1589,7 +1674,7 @@ const V11_REPAIR_TABLES: &[V11RepairTable] = &[
     },
     V11RepairTable {
         name: "files",
-        columns: &["site_id", "path", "kind", "hash", "size"],
+        columns: &["site_id", "path", "kind", "hash", "size", "modified"],
         restore: &[],
     },
     V11RepairTable {
@@ -1605,6 +1690,7 @@ const V11_REPAIR_TABLES: &[V11RepairTable] = &[
             "suffix",
             "extension",
             "media_type",
+            "modified",
         ],
         restore: &[],
     },
@@ -1618,6 +1704,7 @@ const V11_REPAIR_TABLES: &[V11RepairTable] = &[
             "resolved_kind",
             "resolved_hash",
             "resolved_size",
+            "modified",
         ],
         restore: &[],
     },
@@ -1860,16 +1947,21 @@ fn blobs_table_inner(binary_hashes: bool) -> TableCreateStatement {
 }
 
 fn files_table() -> TableCreateStatement {
-    files_table_inner(true)
+    files_table_inner(true, true)
+}
+
+fn files_table_v11() -> TableCreateStatement {
+    files_table_inner(true, false)
 }
 
 fn files_table_v10() -> TableCreateStatement {
-    files_table_inner(false)
+    files_table_inner(false, false)
 }
 
-fn files_table_inner(binary_hashes: bool) -> TableCreateStatement {
+fn files_table_inner(binary_hashes: bool, modified: bool) -> TableCreateStatement {
     let hash_col = hash_column_not_null(Files::Hash, binary_hashes);
-    Table::create()
+    let mut table = Table::create();
+    table
         .table(Files::Table)
         .if_not_exists()
         .col(ColumnDef::new(Files::SiteId).integer().not_null())
@@ -1882,7 +1974,11 @@ fn files_table_inner(binary_hashes: bool) -> TableCreateStatement {
                 .check(Expr::col(Files::Kind).eq(FILE_ENTRY_KIND)),
         )
         .col(hash_col)
-        .col(ColumnDef::new(Files::Size).integer().not_null())
+        .col(ColumnDef::new(Files::Size).integer().not_null());
+    if modified {
+        table.col(modified_column(Files::Modified));
+    }
+    table
         .primary_key(Index::create().col(Files::SiteId).col(Files::Path))
         .foreign_key(
             ForeignKey::create()
@@ -2092,22 +2188,31 @@ fn undo_sites_table() -> TableCreateStatement {
 }
 
 fn undo_files_table() -> TableCreateStatement {
-    undo_files_table_inner(true)
+    undo_files_table_inner(true, true)
+}
+
+fn undo_files_table_v11() -> TableCreateStatement {
+    undo_files_table_inner(true, false)
 }
 
 fn undo_files_table_v10() -> TableCreateStatement {
-    undo_files_table_inner(false)
+    undo_files_table_inner(false, false)
 }
 
-fn undo_files_table_inner(binary_hashes: bool) -> TableCreateStatement {
+fn undo_files_table_inner(binary_hashes: bool, modified: bool) -> TableCreateStatement {
     let hash_col = hash_column_not_null(UndoFiles::Hash, binary_hashes);
-    Table::create()
+    let mut table = Table::create();
+    table
         .table(UndoFiles::Table)
         .if_not_exists()
         .col(ColumnDef::new(UndoFiles::Token).text().not_null())
         .col(ColumnDef::new(UndoFiles::Path).text().not_null())
         .col(hash_col)
-        .col(ColumnDef::new(UndoFiles::Size).integer().not_null())
+        .col(ColumnDef::new(UndoFiles::Size).integer().not_null());
+    if modified {
+        table.col(undo_modified_column(UndoFiles::Modified));
+    }
+    table
         .primary_key(Index::create().col(UndoFiles::Token).col(UndoFiles::Path))
         .foreign_key(
             ForeignKey::create()
@@ -2308,16 +2413,21 @@ fn path_aggregates_table() -> TableCreateStatement {
 }
 
 fn undo_file_deltas_table() -> TableCreateStatement {
-    undo_file_deltas_table_inner(true)
+    undo_file_deltas_table_inner(true, true)
+}
+
+fn undo_file_deltas_table_v11() -> TableCreateStatement {
+    undo_file_deltas_table_inner(true, false)
 }
 
 fn undo_file_deltas_table_v10() -> TableCreateStatement {
-    undo_file_deltas_table_inner(false)
+    undo_file_deltas_table_inner(false, false)
 }
 
-fn undo_file_deltas_table_inner(binary_hashes: bool) -> TableCreateStatement {
+fn undo_file_deltas_table_inner(binary_hashes: bool, modified: bool) -> TableCreateStatement {
     let hash_col = hash_column(UndoFileDeltas::Hash, binary_hashes);
-    Table::create()
+    let mut table = Table::create();
+    table
         .table(UndoFileDeltas::Table)
         .if_not_exists()
         .col(ColumnDef::new(UndoFileDeltas::Token).text().not_null())
@@ -2325,7 +2435,11 @@ fn undo_file_deltas_table_inner(binary_hashes: bool) -> TableCreateStatement {
         .col(ColumnDef::new(UndoFileDeltas::Existed).integer().not_null())
         .col(ColumnDef::new(UndoFileDeltas::Kind).integer())
         .col(hash_col)
-        .col(ColumnDef::new(UndoFileDeltas::Size).integer())
+        .col(ColumnDef::new(UndoFileDeltas::Size).integer());
+    if modified {
+        table.col(undo_modified_column(UndoFileDeltas::Modified));
+    }
+    table
         .primary_key(
             Index::create()
                 .col(UndoFileDeltas::Token)
@@ -2341,16 +2455,21 @@ fn undo_file_deltas_table_inner(binary_hashes: bool) -> TableCreateStatement {
 }
 
 fn allocated_entries_table() -> TableCreateStatement {
-    allocated_entries_table_inner(true)
+    allocated_entries_table_inner(true, true)
+}
+
+fn allocated_entries_table_v11() -> TableCreateStatement {
+    allocated_entries_table_inner(true, false)
 }
 
 fn allocated_entries_table_v10() -> TableCreateStatement {
-    allocated_entries_table_inner(false)
+    allocated_entries_table_inner(false, false)
 }
 
-fn allocated_entries_table_inner(binary_hashes: bool) -> TableCreateStatement {
+fn allocated_entries_table_inner(binary_hashes: bool, modified: bool) -> TableCreateStatement {
     let hash_col = hash_column_not_null(AllocatedEntries::Hash, binary_hashes);
-    Table::create()
+    let mut table = Table::create();
+    table
         .table(AllocatedEntries::Table)
         .if_not_exists()
         .col(
@@ -2380,7 +2499,11 @@ fn allocated_entries_table_inner(binary_hashes: bool) -> TableCreateStatement {
             ColumnDef::new(AllocatedEntries::MediaType)
                 .text()
                 .not_null(),
-        )
+        );
+    if modified {
+        table.col(modified_column(AllocatedEntries::Modified));
+    }
+    table
         .primary_key(
             Index::create()
                 .col(AllocatedEntries::SiteId)
@@ -2471,16 +2594,21 @@ fn pending_allocations_table_inner(binary_hashes: bool) -> TableCreateStatement 
 }
 
 fn undo_allocated_deltas_table() -> TableCreateStatement {
-    undo_allocated_deltas_table_inner(true)
+    undo_allocated_deltas_table_inner(true, true)
+}
+
+fn undo_allocated_deltas_table_v11() -> TableCreateStatement {
+    undo_allocated_deltas_table_inner(true, false)
 }
 
 fn undo_allocated_deltas_table_v10() -> TableCreateStatement {
-    undo_allocated_deltas_table_inner(false)
+    undo_allocated_deltas_table_inner(false, false)
 }
 
-fn undo_allocated_deltas_table_inner(binary_hashes: bool) -> TableCreateStatement {
+fn undo_allocated_deltas_table_inner(binary_hashes: bool, modified: bool) -> TableCreateStatement {
     let hash_col = hash_column(UndoAllocatedDeltas::Hash, binary_hashes);
-    Table::create()
+    let mut table = Table::create();
+    table
         .table(UndoAllocatedDeltas::Table)
         .if_not_exists()
         .col(ColumnDef::new(UndoAllocatedDeltas::Token).text().not_null())
@@ -2496,7 +2624,11 @@ fn undo_allocated_deltas_table_inner(binary_hashes: bool) -> TableCreateStatemen
         .col(ColumnDef::new(UndoAllocatedDeltas::Prefix).text())
         .col(ColumnDef::new(UndoAllocatedDeltas::Suffix).text())
         .col(ColumnDef::new(UndoAllocatedDeltas::Extension).text())
-        .col(ColumnDef::new(UndoAllocatedDeltas::MediaType).text())
+        .col(ColumnDef::new(UndoAllocatedDeltas::MediaType).text());
+    if modified {
+        table.col(undo_modified_column(UndoAllocatedDeltas::Modified));
+    }
+    table
         .primary_key(
             Index::create()
                 .col(UndoAllocatedDeltas::Token)
@@ -2512,16 +2644,21 @@ fn undo_allocated_deltas_table_inner(binary_hashes: bool) -> TableCreateStatemen
 }
 
 fn aliases_table() -> TableCreateStatement {
-    aliases_table_inner(true)
+    aliases_table_inner(true, true)
+}
+
+fn aliases_table_v11() -> TableCreateStatement {
+    aliases_table_inner(true, false)
 }
 
 fn aliases_table_v10() -> TableCreateStatement {
-    aliases_table_inner(false)
+    aliases_table_inner(false, false)
 }
 
-fn aliases_table_inner(binary_hashes: bool) -> TableCreateStatement {
+fn aliases_table_inner(binary_hashes: bool, modified: bool) -> TableCreateStatement {
     let hash_col = hash_column(Aliases::ResolvedHash, binary_hashes);
-    Table::create()
+    let mut table = Table::create();
+    table
         .table(Aliases::Table)
         .if_not_exists()
         .col(ColumnDef::new(Aliases::SiteId).integer().not_null())
@@ -2536,7 +2673,11 @@ fn aliases_table_inner(binary_hashes: bool) -> TableCreateStatement {
         .col(ColumnDef::new(Aliases::CanonicalTarget).text().not_null())
         .col(ColumnDef::new(Aliases::ResolvedKind).integer())
         .col(hash_col)
-        .col(ColumnDef::new(Aliases::ResolvedSize).integer())
+        .col(ColumnDef::new(Aliases::ResolvedSize).integer());
+    if modified {
+        table.col(modified_column(Aliases::Modified));
+    }
+    table
         .primary_key(Index::create().col(Aliases::SiteId).col(Aliases::Path))
         .foreign_key(
             ForeignKey::create()
@@ -2554,16 +2695,21 @@ fn aliases_table_inner(binary_hashes: bool) -> TableCreateStatement {
 }
 
 fn undo_alias_deltas_table() -> TableCreateStatement {
-    undo_alias_deltas_table_inner(true)
+    undo_alias_deltas_table_inner(true, true)
+}
+
+fn undo_alias_deltas_table_v11() -> TableCreateStatement {
+    undo_alias_deltas_table_inner(true, false)
 }
 
 fn undo_alias_deltas_table_v10() -> TableCreateStatement {
-    undo_alias_deltas_table_inner(false)
+    undo_alias_deltas_table_inner(false, false)
 }
 
-fn undo_alias_deltas_table_inner(binary_hashes: bool) -> TableCreateStatement {
+fn undo_alias_deltas_table_inner(binary_hashes: bool, modified: bool) -> TableCreateStatement {
     let hash_col = hash_column(UndoAliasDeltas::ResolvedHash, binary_hashes);
-    Table::create()
+    let mut table = Table::create();
+    table
         .table(UndoAliasDeltas::Table)
         .if_not_exists()
         .col(ColumnDef::new(UndoAliasDeltas::Token).text().not_null())
@@ -2576,7 +2722,11 @@ fn undo_alias_deltas_table_inner(binary_hashes: bool) -> TableCreateStatement {
         .col(ColumnDef::new(UndoAliasDeltas::CanonicalTarget).text())
         .col(ColumnDef::new(UndoAliasDeltas::ResolvedKind).integer())
         .col(hash_col)
-        .col(ColumnDef::new(UndoAliasDeltas::ResolvedSize).integer())
+        .col(ColumnDef::new(UndoAliasDeltas::ResolvedSize).integer());
+    if modified {
+        table.col(undo_modified_column(UndoAliasDeltas::Modified));
+    }
+    table
         .primary_key(
             Index::create()
                 .col(UndoAliasDeltas::Token)

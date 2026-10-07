@@ -895,6 +895,8 @@ return a token once; release makes writes open again. `--json` writes the
 symbol ls [--json]
 symbol ls nlab
 symbol ls nlab -p 2
+symbol ls -m nlab
+symbol ls -S -r nlab pagefind
 symbol ls --limit 200 nlab pagefind
 symbol ls --all -l nlab
 symbol ls -R nlab
@@ -905,9 +907,13 @@ symbol api --json
 ```
 
 `ls` lists sites, or one directory of a site: `NAME` is its top directory and
-`NAME PATH` a subdirectory, with folders showing their file count and size.
-`-R` lists every file and alias in the site instead. In a terminal, `ls` shows
-50 entries a page and says how many there are; `-p PAGE` picks a page,
+`NAME PATH` a subdirectory, with folders showing their file count and size,
+and every entry the UTC time its content last changed (`2026-10-06 14:03Z`).
+Entries sort by name, folders first; `-m` sorts newest first, `-S` largest
+first, and `-r` reverses the order. The server sorts, so pages stay
+consistent. (`-t` is not `ls -t`: it is the global `--token`.) `-R` lists
+every file and alias in the site instead, in path order. In a terminal, `ls`
+shows 50 entries a page and says how many there are; `-p PAGE` picks a page,
 `--limit N` sets the page size, and `--all` shows everything. Piped output is
 never paged, so `symbol ls nlab | grep x` searches the whole directory. Flags
 may come before or after the names. `ls` reads the TSV listings, so names are
@@ -1468,7 +1474,10 @@ Canonical client: `symbol stats`.
 
 Lists all sites. HTML/plain negotiation follows `/`; exact
 `Accept: application/json` (parameters allowed) selects JSON, and
-`Accept: text/tab-separated-values` selects TSV:
+`Accept: text/tab-separated-values` selects TSV. The HTML view is a table of
+name, file count, size, and last change, each column heading a link that sorts
+by it; times show in the reader's time zone. The plain view prints the same
+columns, times in UTC. TSV:
 
 ```text
 kind	files	bytes	name	target
@@ -1490,7 +1499,7 @@ directory, or directory alias; `bytes` is its size; `target` is set for aliases
 only. A directory lists its subdirectories and files in name order, then its
 aliases.
 
-TSV responses take two query parameters:
+TSV responses take three query parameters:
 
 `limit`
 : The most entries to return, from 1 to 100000. Without it, every entry.
@@ -1499,10 +1508,44 @@ TSV responses take two query parameters:
 : Which page of `limit` entries, from 1. Requires `limit`. A page past the end
   is empty, not an error.
 
+`columns`
+: Optional columns to append, comma-separated. The only one is `modified`:
+  when the entry's content last changed, as UTC RFC 3339 whole seconds
+  (`2026-10-06T14:03:12Z`). A directory reports its newest file, a site its
+  last change; `builtin` leaves it empty. Without `columns` the header stays
+  `kind files bytes name target`, so readers that check it keep working.
+
+```text
+kind	files	bytes	name	target	modified
+builtin		0	API		
+site	3	1200	hello		2026-10-06T14:03:12Z
+```
+
 Every TSV response carries `Entry-Count`, the number of entries before paging.
 A paged response also carries `Link` with `rel="prev"` and `rel="next"` URLs
 for the neighbouring pages, keeping the other query parameters. Invalid
-paging parameters return `400`. JSON, HTML, and plain responses ignore them.
+paging parameters or an unknown column return `400`. JSON, HTML, and plain
+responses ignore them.
+
+#### Sorting
+
+Every listing representation -- HTML, plain, JSON, and TSV -- takes `sort` and
+`order`:
+
+`sort`
+: `name` (the default), `files`, `size`, or `modified`.
+
+`order`
+: `asc` or `desc`. Without it, `name` sorts A to Z and the others largest or
+  newest first.
+
+Subdirectories always come before files, and aliases after both; `sort` orders
+entries within each group, then by name. The site list keeps `API` first.
+Sorting happens before paging, so pages of a sorted TSV listing are
+consistent. An invalid `sort` or `order` returns `400`. Modification times
+change only when an entry's content does: re-uploading identical bytes keeps
+the old time, a copied site keeps its entries' times, and undo restores them.
+Entries stored before schema v12 carry their site's last update time.
 Generated `symbol.toml` contributes to these listing counts and logical bytes,
 unlike `/STATS`.
 
@@ -1741,7 +1784,9 @@ alias	14	index.html	home
 
 Files come first, then aliases, each sorted by path. `size` is bytes, empty for
 a dangling alias, and `value` is a file's content hash or an alias's target.
-`limit` and `page` page it too; `symbol sync` reads it whole.
+`limit` and `page` page it too; `symbol sync` reads it whole. `sort`, `order`,
+and `columns` apply to one-directory listings only, and `?recursive` ignores
+them.
 
 Without JSON or TSV Accept, this route returns a cached body listing with the
 listing schema below.
@@ -1767,9 +1812,9 @@ file redirects with `307` to its content URL. JSON listing schema:
 ```
 
 `kind` is `directory` or `file`. `files` is omitted on file entries. Success,
-caching, and content negotiation match `/FILES`, including the TSV listing with
-`limit`, `page`, `Entry-Count`, and `Link`. The trailing-slash redirect keeps
-the query string.
+caching, and content negotiation match `/FILES`, including sorting and the TSV
+listing with `limit`, `page`, `columns`, `Entry-Count`, and `Link`. The
+trailing-slash redirect keeps the query string.
 
 <!-- contract:site put -->
 ### `PUT /{name}` and `PUT /{name}/`
@@ -2320,7 +2365,7 @@ The current service does **not** implement:
 
 - a versioned `/api` namespace, OpenAPI endpoint, or JSON error envelope;
 - access-controlled reads or private sites;
-- listing pagination, search, quotas, or per-site upload limits;
+- listing search, quotas, or per-site upload limits;
 - WebDAV PROPFIND, multi-range responses, resumable multipart upload sessions,
   or server-side multipart upload;
 - automatic remote deletion from `symbol sync`;
