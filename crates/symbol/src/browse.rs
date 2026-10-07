@@ -177,27 +177,29 @@ fn render_sites_plain(list: &SiteList) -> String {
         size: SizeLayout::from_sizes(&sizes),
     };
     let mut out = String::new();
-    push_listing_row(&mut out, "API/", None, 0, None, layout, " built-in");
-    for entry in &list.entries {
-        push_listing_row(
-            &mut out,
-            &format!("{}/", entry.name),
-            Some(entry.files),
-            entry.bytes,
-            Some(entry.modified),
-            layout,
-            "",
-        );
+    PlainRow {
+        name: "API/",
+        suffix: " built-in",
+        ..PlainRow::default()
     }
-    push_listing_row(
-        &mut out,
-        "",
-        Some(list.files),
-        list.bytes,
-        None,
-        layout,
-        " total",
-    );
+    .push(&mut out, layout);
+    for entry in &list.entries {
+        PlainRow {
+            name: &format!("{}/", entry.name),
+            files: Some(entry.files),
+            bytes: entry.bytes,
+            modified: Some(entry.modified),
+            ..PlainRow::default()
+        }
+        .push(&mut out, layout);
+    }
+    PlainRow {
+        files: Some(list.files),
+        bytes: list.bytes,
+        suffix: " total",
+        ..PlainRow::default()
+    }
+    .push(&mut out, layout);
     out
 }
 
@@ -318,15 +320,13 @@ fn render_plain(site: &str, rel: &str, list: &DirList) -> String {
         size: SizeLayout::from_sizes(&sizes),
     };
     let mut out = String::new();
-    push_listing_row(
-        &mut out,
-        &display,
-        Some(list.files),
-        list.bytes,
-        None,
-        layout,
-        "",
-    );
+    PlainRow {
+        name: &display,
+        files: Some(list.files),
+        bytes: list.bytes,
+        ..PlainRow::default()
+    }
+    .push(&mut out, layout);
     if !rel.is_empty() {
         out.push_str("../\n");
     }
@@ -335,16 +335,14 @@ fn render_plain(site: &str, rel: &str, list: &DirList) -> String {
             EntryKind::Directory => format!("{}/", entry.name),
             EntryKind::File => entry.name.clone(),
         };
-        let files = (entry.kind == EntryKind::Directory).then_some(entry.files);
-        push_listing_row(
-            &mut out,
-            &name,
-            files,
-            entry.bytes,
-            Some(entry.modified),
-            layout,
-            "",
-        );
+        PlainRow {
+            name: &name,
+            files: (entry.kind == EntryKind::Directory).then_some(entry.files),
+            bytes: entry.bytes,
+            modified: Some(entry.modified),
+            ..PlainRow::default()
+        }
+        .push(&mut out, layout);
     }
     for alias in &list.aliases {
         if let Some(name) = direct_alias_name(rel, &alias.path) {
@@ -995,32 +993,39 @@ fn cached_response(
     http_cache::respond(headers, representation)
 }
 
-#[expect(clippy::too_many_arguments)]
-fn push_listing_row(
-    out: &mut String,
-    name: &str,
+/// One line of a plain-text listing. `files` is blank for a file, `modified`
+/// for a total, and `suffix` follows the size, as in `0 B built-in`.
+#[derive(Default)]
+struct PlainRow<'a> {
+    name: &'a str,
     files: Option<u64>,
     bytes: u64,
     modified: Option<i64>,
-    layout: ListingLayout,
-    suffix: &str,
-) {
-    let count = files.map_or_else(
-        || " ".repeat(layout.count + 6),
-        |files| format!("{files:>width$} files", width = layout.count),
-    );
-    let date = modified
-        .and_then(known_time)
-        .map_or_else(String::new, |modified| {
-            format!("   {:>DATE_WIDTH$}", date_label(modified))
-        });
-    writeln!(
-        out,
-        "{name:<width$} {count}   {}{date}{suffix}",
-        HumanSize::new(bytes).aligned(layout.size),
-        width = layout.name,
-    )
-    .unwrap();
+    suffix: &'a str,
+}
+
+impl PlainRow<'_> {
+    fn push(&self, out: &mut String, layout: ListingLayout) {
+        let count = self.files.map_or_else(
+            || " ".repeat(layout.count + 6),
+            |files| format!("{files:>width$} files", width = layout.count),
+        );
+        let date = self
+            .modified
+            .and_then(known_time)
+            .map_or_else(String::new, |modified| {
+                format!("   {:>DATE_WIDTH$}", date_label(modified))
+            });
+        writeln!(
+            out,
+            "{:<width$} {count}   {}{date}{}",
+            self.name,
+            HumanSize::new(self.bytes).aligned(layout.size),
+            self.suffix,
+            width = layout.name,
+        )
+        .unwrap();
+    }
 }
 
 fn parent_href(site: &str, rel: &str, files_view: bool) -> Option<String> {

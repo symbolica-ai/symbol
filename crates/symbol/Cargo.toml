@@ -7,6 +7,7 @@ description = "Tiny static-site hosting for the tailnet"
 
 [dependencies]
 axum = "0.8"
+bitflags = "2.13"
 blake3 = "1"
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
