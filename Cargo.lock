@@ -2482,6 +2482,7 @@ name = "symbol"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "bitflags",
  "blake3",
  "bytes",
  "clap",

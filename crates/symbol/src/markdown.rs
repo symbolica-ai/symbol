@@ -371,8 +371,30 @@ const KNOWN_KEYS: [&str; 19] = [
     "data",
 ];
 
+bitflags::bitflags! {
+    /// The on/off switches front matter can set, one bit each.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct Features: u8 {
+        /// KaTeX for `$...$`, `$$...$$` and ```` ```math ```` blocks.
+        const MATH = 1 << 0;
+        /// highlight.js for fenced code.
+        const HIGHLIGHT = 1 << 1;
+        /// A table of contents above the article.
+        const TOC = 1 << 2;
+        /// Curly quotes, dashes and ellipses.
+        const SMART_PUNCTUATION = 1 << 3;
+    }
+}
+
+/// Each switch's front matter key and its value when the key is absent.
+const FEATURE_KEYS: [(Features, &str, bool); 4] = [
+    (Features::MATH, "math", true),
+    (Features::HIGHLIGHT, "highlight", true),
+    (Features::TOC, "toc", false),
+    (Features::SMART_PUNCTUATION, "smart_punctuation", false),
+];
+
 /// The front matter keys the renderer understands.
-#[allow(clippy::struct_excessive_bools)]
 struct Settings {
     title: Option<String>,
     description: Option<String>,
@@ -386,10 +408,7 @@ struct Settings {
     head: Option<String>,
     body_class: Option<String>,
     controls: Vec<&'static str>,
-    math: bool,
-    highlight: bool,
-    toc: bool,
-    smart_punctuation: bool,
+    features: Features,
 }
 
 impl Settings {
@@ -415,10 +434,11 @@ impl Settings {
             head: reader.string("head"),
             body_class: reader.string("class"),
             controls: reader.controls(),
-            math: reader.flag("math", true),
-            highlight: reader.flag("highlight", true),
-            toc: reader.flag("toc", false),
-            smart_punctuation: reader.flag("smart_punctuation", false),
+            features: FEATURE_KEYS
+                .into_iter()
+                .filter(|(_, key, default)| reader.flag(key, *default))
+                .map(|(feature, _, _)| feature)
+                .collect(),
         }
     }
 }
@@ -628,14 +648,14 @@ fn render_body(markdown: &str, settings: &Settings) -> RenderedBody {
         | Options::ENABLE_DEFINITION_LIST
         | Options::ENABLE_SUPERSCRIPT
         | Options::ENABLE_SUBSCRIPT;
-    if settings.math {
-        options |= Options::ENABLE_MATH;
-    }
-    if settings.smart_punctuation {
-        options |= Options::ENABLE_SMART_PUNCTUATION;
-    }
+    let math = settings.features.contains(Features::MATH);
+    options.set(Options::ENABLE_MATH, math);
+    options.set(
+        Options::ENABLE_SMART_PUNCTUATION,
+        settings.features.contains(Features::SMART_PUNCTUATION),
+    );
 
-    let mut rewriter = Rewriter::new(settings.math);
+    let mut rewriter = Rewriter::new(math);
     let parser = Parser::new_ext(markdown, options).into_offset_iter();
     for event in intraword_scripts(markdown, parser) {
         rewriter.push(event);
@@ -1101,7 +1121,7 @@ fn document(
                 // dark-mode reader never sees a white flash.
                 script { (PreEscaped(EARLY_ERRORS)) ";" (PreEscaped(EARLY_PREFERENCES)) }
                 link rel="stylesheet" href={ (assets) "/markdown.css" };
-                @if settings.math {
+                @if settings.features.contains(Features::MATH) {
                     link rel="stylesheet" href={ (assets) "/katex/katex.min.css" };
                 }
                 @for stylesheet in &settings.stylesheets {
@@ -1135,7 +1155,9 @@ fn document(
                             " explains each check."
                         }
                     }
-                    @if settings.toc && body.headings.iter().any(|heading| heading.level > 1) {
+                    @if settings.features.contains(Features::TOC)
+                        && body.headings.iter().any(|heading| heading.level > 1)
+                    {
                         (table_of_contents(&body.headings))
                     }
                     article class="markdown-body" { (PreEscaped(&body.html)) }
@@ -1143,11 +1165,11 @@ fn document(
                 script type="application/json" id="symbol-front-matter" {
                     (PreEscaped(script_safe_json(data)))
                 }
-                @if settings.math {
+                @if settings.features.contains(Features::MATH) {
                     script src={ (assets) "/katex/katex.min.js" } defer {}
                     script src={ (assets) "/katex/copy-tex.min.js" } defer {}
                 }
-                @if settings.highlight {
+                @if settings.features.contains(Features::HIGHLIGHT) {
                     script src={ (assets) "/highlight/highlight.min.js" } defer {}
                 }
                 script src={ (assets) "/markdown.js" } defer {}
