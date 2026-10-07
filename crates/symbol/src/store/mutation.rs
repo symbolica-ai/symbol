@@ -27,6 +27,27 @@ pub fn validate_mutation_target(path: &str) -> Result<(), StoreError> {
     reject_reserved_path(&path)
 }
 
+/// The `modified` an upsert into `files` leaves behind: unchanged when the
+/// incoming content is identical, otherwise the incoming row's.
+///
+/// Re-uploading a whole site rewrites every row, and only the files whose
+/// bytes actually differ should look recently changed.
+pub(super) fn file_modified_on_upsert() -> diesel::expression::SqlLiteral<diesel::sql_types::BigInt>
+{
+    diesel::dsl::sql(
+        r#"CASE WHEN "files"."hash" = excluded."hash" THEN "files"."modified" ELSE excluded."modified" END"#,
+    )
+}
+
+/// [`file_modified_on_upsert`] for aliases: re-pointing an alias at the
+/// target it already has is not a change.
+pub(super) fn alias_modified_on_upsert() -> diesel::expression::SqlLiteral<diesel::sql_types::BigInt>
+{
+    diesel::dsl::sql(
+        r#"CASE WHEN "aliases"."canonical_target" = excluded."canonical_target" THEN "aliases"."modified" ELSE excluded."modified" END"#,
+    )
+}
+
 pub(super) fn ensure_blob_locked(
     tx: &mut SqliteConnection,
     staged: &StagedFile,
@@ -760,12 +781,14 @@ pub(super) fn regenerate_site(
             path: MANIFEST_PATH.to_string(),
             hash: staged.hash,
             size: staged.size,
+            modified: updated,
         })
         .on_conflict((files::site_id, files::path))
         .do_update()
         .set((
             files::hash.eq(excluded(files::hash)),
             files::size.eq(excluded(files::size)),
+            files::modified.eq(file_modified_on_upsert()),
         ))
         .execute(tx)?;
     diesel::update(sites::table.find(site_id))
@@ -1582,9 +1605,11 @@ impl Store {
         let copied_files = files::table
             .filter(files::site_id.eq(source_id))
             .filter(files::path.ne(MANIFEST_PATH))
-            .select((files::path, files::hash, files::size))
-            .load::<(String, ContentHash, i64)>(&mut *tx)?;
-        for (path, hash, size) in copied_files {
+            .select((files::path, files::hash, files::size, files::modified))
+            .load::<(String, ContentHash, i64, i64)>(&mut *tx)?;
+        // A copy keeps each entry's modification time: the content did not
+        // change, it only gained a second home.
+        for (path, hash, size, modified) in copied_files {
             ensure_file_entry(&mut tx, destination_id, &path)?;
             diesel::insert_into(files::table)
                 .values(NewFile {
@@ -1592,6 +1617,7 @@ impl Store {
                     path,
                     hash,
                     size,
+                    modified,
                 })
                 .execute(&mut *tx)?;
         }
@@ -1606,6 +1632,7 @@ impl Store {
                 allocated_entries::suffix,
                 allocated_entries::extension,
                 allocated_entries::media_type,
+                allocated_entries::modified,
             ))
             .load::<(
                 String,
@@ -1616,8 +1643,9 @@ impl Store {
                 String,
                 Option<String>,
                 String,
+                i64,
             )>(&mut *tx)?;
-        for (path, hash, size, naming_mode, prefix, suffix, extension, media_type) in
+        for (path, hash, size, naming_mode, prefix, suffix, extension, media_type, modified) in
             copied_allocated
         {
             diesel::insert_into(site_entries::table)
@@ -1639,6 +1667,7 @@ impl Store {
                     allocated_entries::suffix.eq(suffix),
                     allocated_entries::extension.eq(extension),
                     allocated_entries::media_type.eq(media_type),
+                    allocated_entries::modified.eq(modified),
                 ))
                 .execute(&mut *tx)?;
         }
@@ -1650,6 +1679,7 @@ impl Store {
                 aliases::resolved_kind,
                 aliases::resolved_hash,
                 aliases::resolved_size,
+                aliases::modified,
             ))
             .load::<(
                 String,
@@ -1657,8 +1687,10 @@ impl Store {
                 Option<i64>,
                 Option<ContentHash>,
                 Option<i64>,
+                i64,
             )>(&mut *tx)?;
-        for (path, target, resolved_kind, resolved_hash, resolved_size) in copied_aliases {
+        for (path, target, resolved_kind, resolved_hash, resolved_size, modified) in copied_aliases
+        {
             diesel::insert_into(site_entries::table)
                 .values((
                     site_entries::site_id.eq(destination_id),
@@ -1675,6 +1707,7 @@ impl Store {
                     aliases::resolved_kind.eq(resolved_kind),
                     aliases::resolved_hash.eq(resolved_hash),
                     aliases::resolved_size.eq(resolved_size),
+                    aliases::modified.eq(modified),
                 ))
                 .execute(&mut *tx)?;
         }
@@ -2321,12 +2354,14 @@ impl Store {
                     path: file.path.clone(),
                     hash: file.hash,
                     size: file.size,
+                    modified: now,
                 })
                 .on_conflict((files::site_id, files::path))
                 .do_update()
                 .set((
                     files::hash.eq(excluded(files::hash)),
                     files::size.eq(excluded(files::size)),
+                    files::modified.eq(file_modified_on_upsert()),
                 ))
                 .execute(tx)?;
             adjust_aggregates_locked(
@@ -2355,6 +2390,7 @@ impl Store {
                     aliases::resolved_kind.eq(Option::<i64>::None),
                     aliases::resolved_hash.eq(Option::<ContentHash>::None),
                     aliases::resolved_size.eq(Option::<i64>::None),
+                    aliases::modified.eq(now),
                 ))
                 .on_conflict((aliases::site_id, aliases::path))
                 .do_update()
@@ -2363,6 +2399,7 @@ impl Store {
                     aliases::resolved_kind.eq(Option::<i64>::None),
                     aliases::resolved_hash.eq(Option::<ContentHash>::None),
                     aliases::resolved_size.eq(Option::<i64>::None),
+                    aliases::modified.eq(alias_modified_on_upsert()),
                 ))
                 .execute(tx)?;
         }
@@ -2532,7 +2569,11 @@ impl Store {
         )?;
         ensure_blob_locked(&mut tx, staged)?;
         diesel::update(files::table.find((site_id, path)))
-            .set((files::hash.eq(staged.hash), files::size.eq(staged.size)))
+            .set((
+                files::hash.eq(staged.hash),
+                files::size.eq(staged.size),
+                files::modified.eq(now),
+            ))
             .execute(&mut *tx)?;
         adjust_aggregates_locked(&mut tx, site_id, path, staged.size - current_size, 0)?;
         finish_entry_mutation(&mut tx, &self.inner.blob_files, site_id, &[path], now)?;

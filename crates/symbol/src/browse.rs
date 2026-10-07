@@ -4,18 +4,29 @@ use std::fmt::Write as _;
 use axum::body::Bytes;
 use axum::http::{HeaderMap, HeaderValue, Uri, header};
 use axum::response::Response;
-use maud::{DOCTYPE, PreEscaped, html};
+use maud::{DOCTYPE, Markup, PreEscaped, html};
 use symbol_contract::{Listing, ListingEntry, ListingKind};
 
 use crate::http_cache::{self, Representation};
 use crate::page;
 use crate::pathutil::pretty_html_name;
-use crate::store::{AliasResolvedKind, DirList, EntryKind, SiteList};
+use crate::store::{AliasEntry, AliasResolvedKind, DirEnt, DirList, EntryKind, SiteList};
 
-pub fn sites(headers: &HeaderMap, uri: &Uri, query: &ListingQuery, list: &SiteList) -> Response {
+pub fn sites(headers: &HeaderMap, uri: &Uri, query: &ListingQuery, mut list: SiteList) -> Response {
+    let sort = match Sort::parse(query) {
+        Ok(sort) => sort,
+        Err(message) => return bad_query(message),
+    };
+    sort_sites(&mut list, sort);
+    let list = &list;
     if wants_tsv(headers) {
-        return match Paging::parse(query) {
-            Ok(paging) => tsv_response(headers, uri, sites_tsv(list, paging), paging),
+        return match TsvRequest::parse(uri, query) {
+            Ok(request) => tsv_response(
+                headers,
+                request.uri,
+                sites_tsv(list, request.paging, request.columns),
+                request.paging,
+            ),
             Err(message) => bad_query(message),
         };
     }
@@ -56,7 +67,7 @@ pub fn sites(headers: &HeaderMap, uri: &Uri, query: &ListingQuery, list: &SiteLi
             cached_response(headers, body, "text/plain; charset=utf-8")
         }
         page::Flavor::Html => {
-            let body = render_sites_html(list);
+            let body = render_sites_html(list, sort);
             cached_response(headers, body, "text/html; charset=utf-8")
         }
     }
@@ -66,12 +77,20 @@ pub fn listing(
     headers: &HeaderMap,
     site: &str,
     rel: &str,
-    list: &DirList,
+    mut list: DirList,
     files_view: bool,
-    tsv: Option<(&Uri, Paging)>,
+    view: ListingView<'_>,
 ) -> Response {
-    if let Some((uri, paging)) = tsv {
-        return tsv_response(headers, uri, listing_tsv(rel, list, paging), paging);
+    let sort = view.sort;
+    sort_listing(rel, &mut list, sort);
+    let list = &list;
+    if let Some(request) = view.tsv {
+        return tsv_response(
+            headers,
+            request.uri,
+            listing_tsv(rel, list, request.paging, request.columns),
+            request.paging,
+        );
     }
     if wants_json(headers) {
         let mut entries = list
@@ -122,7 +141,7 @@ pub fn listing(
             cached_response(headers, body, "text/plain; charset=utf-8")
         }
         page::Flavor::Html => {
-            let body = render_html(site, rel, list, files_view);
+            let body = render_html(site, rel, list, files_view, sort);
             cached_response(headers, body, "text/html; charset=utf-8")
         }
     }
@@ -158,22 +177,31 @@ fn render_sites_plain(list: &SiteList) -> String {
         size: SizeLayout::from_sizes(&sizes),
     };
     let mut out = String::new();
-    push_listing_row(&mut out, "API/", None, 0, layout, " built-in");
+    push_listing_row(&mut out, "API/", None, 0, None, layout, " built-in");
     for entry in &list.entries {
         push_listing_row(
             &mut out,
             &format!("{}/", entry.name),
             Some(entry.files),
             entry.bytes,
+            Some(entry.modified),
             layout,
             "",
         );
     }
-    push_listing_row(&mut out, "", Some(list.files), list.bytes, layout, " total");
+    push_listing_row(
+        &mut out,
+        "",
+        Some(list.files),
+        list.bytes,
+        None,
+        layout,
+        " total",
+    );
     out
 }
 
-fn render_sites_html(list: &SiteList) -> String {
+fn render_sites_html(list: &SiteList, sort: Sort) -> String {
     html! {
         (DOCTYPE)
         meta charset="utf-8";
@@ -193,22 +221,70 @@ fn render_sites_html(list: &SiteList) -> String {
                 (list.files) " files · " (size_label(list.bytes)) " logical"
             }
             .list {
+                (sort_header(sort))
                 a.row href="/API/" {
                     span.name { "API/" }
+                    span.meta.files {}
                     span.meta { "built-in" }
+                    span.meta {}
                 }
                 @for entry in &list.entries {
                     a.row href=(format!("/{}/FILES/", entry.name)) {
                         span.name { (&entry.name) "/" }
-                        span.meta {
-                            (entry.files) " files · " (size_label(entry.bytes))
-                        }
+                        span.meta.files { (entry.files) }
+                        span.meta { (size_label(entry.bytes)) }
+                        (date_cell(Some(entry.modified)))
                     }
                 }
             }
         }
+        (PreEscaped(LOCAL_TIME_SCRIPT))
     }
     .into_string()
+}
+
+/// The column headings, each a link that sorts by it. The active column shows
+/// its direction and, clicked again, reverses it.
+fn sort_header(sort: Sort) -> Markup {
+    let column = |key: SortKey, label: &str, class: &str| {
+        let active = sort.key == key;
+        let aria = match (active, sort.descending) {
+            (false, _) => "none",
+            (true, false) => "ascending",
+            (true, true) => "descending",
+        };
+        html! {
+            a.sort.(class).active[active] href=(sort.header_query(key)) aria-sort=(aria)
+                title=(format!("sort by {label}")) {
+                (label)
+                @if active {
+                    span.arrow { @if sort.descending { " ▼" } @else { " ▲" } }
+                }
+            }
+        }
+    };
+    html! {
+        .row.head role="row" {
+            (column(SortKey::Name, "name", "name-col"))
+            (column(SortKey::Files, "files", "files"))
+            (column(SortKey::Size, "size", "size-col"))
+            (column(SortKey::Modified, "modified", "date-col"))
+        }
+    }
+}
+
+fn date_cell(modified: Option<i64>) -> Markup {
+    html! {
+        @if let Some(modified) = modified.and_then(known_time) {
+            span.meta {
+                time datetime=(rfc3339(modified)) title=(rfc3339(modified)) {
+                    (date_label(modified))
+                }
+            }
+        } @else {
+            span.meta {}
+        }
+    }
 }
 
 fn render_plain(site: &str, rel: &str, list: &DirList) -> String {
@@ -242,7 +318,15 @@ fn render_plain(site: &str, rel: &str, list: &DirList) -> String {
         size: SizeLayout::from_sizes(&sizes),
     };
     let mut out = String::new();
-    push_listing_row(&mut out, &display, Some(list.files), list.bytes, layout, "");
+    push_listing_row(
+        &mut out,
+        &display,
+        Some(list.files),
+        list.bytes,
+        None,
+        layout,
+        "",
+    );
     if !rel.is_empty() {
         out.push_str("../\n");
     }
@@ -252,17 +336,29 @@ fn render_plain(site: &str, rel: &str, list: &DirList) -> String {
             EntryKind::File => entry.name.clone(),
         };
         let files = (entry.kind == EntryKind::Directory).then_some(entry.files);
-        push_listing_row(&mut out, &name, files, entry.bytes, layout, "");
+        push_listing_row(
+            &mut out,
+            &name,
+            files,
+            entry.bytes,
+            Some(entry.modified),
+            layout,
+            "",
+        );
     }
     for alias in &list.aliases {
         if let Some(name) = direct_alias_name(rel, &alias.path) {
-            writeln!(out, "{name} -> {}", alias.canonical_target).unwrap();
+            write!(out, "{name} -> {}", alias.canonical_target).unwrap();
+            if let Some(modified) = known_time(alias.modified) {
+                write!(out, "   {}", date_label(modified)).unwrap();
+            }
+            out.push('\n');
         }
     }
     out
 }
 
-fn render_html(site: &str, rel: &str, list: &DirList, files_view: bool) -> String {
+fn render_html(site: &str, rel: &str, list: &DirList, files_view: bool, sort: Sort) -> String {
     let display = display_path(site, rel);
     let parent = parent_href(site, rel, files_view);
     let files_href = format!("/{site}/FILES/");
@@ -299,10 +395,13 @@ fn render_html(site: &str, rel: &str, list: &DirList, files_view: bool) -> Strin
                 }
             }
             .list {
+                (sort_header(sort))
                 @if let Some(href) = parent {
                     a.row href=(href) {
                         span.name { ".." }
-                        span.meta { "dir" }
+                        span.meta.files {}
+                        span.meta {}
+                        span.meta {}
                     }
                 }
                 @for entry in &list.entries {
@@ -311,37 +410,51 @@ fn render_html(site: &str, rel: &str, list: &DirList, files_view: bool) -> Strin
                             (&entry.name)
                             @if entry.kind == EntryKind::Directory { "/" }
                         }
-                        span.meta {
-                            @match entry.kind {
-                                EntryKind::Directory => {
-                                    (entry.files) " files · " (size_label(entry.bytes))
-                                }
-                                EntryKind::File => (size_label(entry.bytes)),
-                            }
+                        span.meta.files {
+                            @if entry.kind == EntryKind::Directory { (entry.files) }
                         }
+                        span.meta { (size_label(entry.bytes)) }
+                        (date_cell(Some(entry.modified)))
                     }
                 }
                 @for alias in &list.aliases {
                     @if let Some(name) = direct_alias_name(rel, &alias.path) {
                         a.row href=(format!("/{site}/{}", alias.path)) {
                             span.name { (name) " -> " (&alias.canonical_target) }
+                            span.meta.files {
+                                @if let Some(files) = alias.resolved_files { (files) }
+                            }
                             span.meta {
                                 @if alias.resolved_kind.is_none() {
-                                    "dangling alias"
-                                } @else if let Some(files) = alias.resolved_files {
-                                    (files) " files · " (size_label(alias.resolved_size.unwrap_or(0)))
+                                    "dangling"
+                                } @else if let Some(size) = alias.resolved_size {
+                                    (size_label(size))
                                 } @else {
                                     "alias"
                                 }
                             }
+                            (date_cell(Some(alias.modified)))
                         }
                     }
                 }
             }
         }
+        (PreEscaped(LOCAL_TIME_SCRIPT))
     }
     .into_string()
 }
+
+/// Rewrites each `<time>` from the UTC the server rendered into the reader's
+/// own time zone. Without script the UTC text stays, and is still correct.
+const LOCAL_TIME_SCRIPT: &str = r"<script>
+for (const t of document.querySelectorAll('time[datetime]')) {
+  const d = new Date(t.dateTime);
+  if (isNaN(d)) continue;
+  const p = (n) => String(n).padStart(2, '0');
+  t.textContent = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  t.title = d.toString();
+}
+</script>";
 
 fn direct_alias_name<'a>(rel: &str, path: &'a str) -> Option<&'a str> {
     let suffix = if rel.is_empty() {
@@ -366,6 +479,8 @@ fn display_path(site: &str, rel: &str) -> String {
 pub const TSV_TYPE: &str = "text/tab-separated-values; charset=utf-8";
 
 const LISTING_HEADER: &str = "kind\tfiles\tbytes\tname\ttarget";
+/// Optional TSV listing columns, appended after the fixed ones in this order.
+const OPTIONAL_COLUMNS: [&str; 1] = ["modified"];
 const INVENTORY_HEADER: &str = "kind\tsize\tvalue\tpath";
 /// The most entries one page may ask for.
 pub const MAX_PAGE_LIMIT: usize = 100_000;
@@ -374,13 +489,263 @@ pub fn wants_tsv(headers: &HeaderMap) -> bool {
     accepts(headers, "text/tab-separated-values")
 }
 
-/// The query parameters of a TSV listing: `recursive`, `limit`, and `page`.
+/// The query parameters of a listing.
+///
+/// `sort` and `order` apply to every representation of one directory or of
+/// the site list. `recursive`, `limit`, `page`, and `columns` are read only
+/// for TSV.
 #[derive(Debug, Default, serde::Deserialize)]
 pub struct ListingQuery {
     recursive: Option<String>,
     limit: Option<String>,
     page: Option<String>,
+    sort: Option<String>,
+    order: Option<String>,
+    columns: Option<String>,
 }
+
+/// What a listing is ordered by. Folders always come before files, and
+/// aliases after both; the key orders entries within each group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortKey {
+    Name,
+    Files,
+    Size,
+    Modified,
+}
+
+impl SortKey {
+    const ALL: [Self; 4] = [Self::Name, Self::Files, Self::Size, Self::Modified];
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Name => "name",
+            Self::Files => "files",
+            Self::Size => "size",
+            Self::Modified => "modified",
+        }
+    }
+
+    /// Names read A to Z; counts, sizes and dates read largest or newest first.
+    const fn descending_by_default(self) -> bool {
+        !matches!(self, Self::Name)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sort {
+    pub key: SortKey,
+    pub descending: bool,
+}
+
+impl Default for Sort {
+    fn default() -> Self {
+        Self {
+            key: SortKey::Name,
+            descending: false,
+        }
+    }
+}
+
+impl Sort {
+    pub fn parse(query: &ListingQuery) -> Result<Self, String> {
+        let key = match query.sort.as_deref() {
+            None => SortKey::Name,
+            Some(value) => SortKey::ALL
+                .into_iter()
+                .find(|key| key.as_str() == value)
+                .ok_or_else(|| {
+                    "error: sort must be one of name, files, size, modified\n".to_string()
+                })?,
+        };
+        let descending = match query.order.as_deref() {
+            None => key.descending_by_default(),
+            Some("asc") => false,
+            Some("desc") => true,
+            Some(_) => return Err("error: order must be asc or desc\n".to_string()),
+        };
+        Ok(Self { key, descending })
+    }
+
+    fn order<T: Ord>(self, left: &T, right: &T) -> std::cmp::Ordering {
+        let ordering = left.cmp(right);
+        if self.descending {
+            ordering.reverse()
+        } else {
+            ordering
+        }
+    }
+
+    /// The query string of a column header: this column in its natural
+    /// direction, or the opposite direction when it is already the sort.
+    fn header_query(self, key: SortKey) -> String {
+        let descending = if self.key == key {
+            !self.descending
+        } else {
+            key.descending_by_default()
+        };
+        let order = if descending { "desc" } else { "asc" };
+        format!("?sort={}&order={order}", key.as_str())
+    }
+}
+
+/// The optional TSV columns a request asked for with `columns=`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Columns {
+    pub modified: bool,
+}
+
+impl Columns {
+    pub fn parse(query: &ListingQuery) -> Result<Self, String> {
+        let mut columns = Self::default();
+        for name in query
+            .columns
+            .as_deref()
+            .unwrap_or("")
+            .split(',')
+            .filter(|name| !name.is_empty())
+        {
+            match name {
+                "modified" => columns.modified = true,
+                _ => {
+                    return Err(format!(
+                        "error: unknown column {name:?}; optional columns: {}\n",
+                        OPTIONAL_COLUMNS.join(", ")
+                    ));
+                }
+            }
+        }
+        Ok(columns)
+    }
+
+    fn header(self, base: &str) -> String {
+        let mut header = base.to_string();
+        if self.modified {
+            header.push_str("\tmodified");
+        }
+        header
+    }
+
+    fn push(self, row: &mut String, modified: Option<i64>) {
+        if self.modified {
+            row.push('\t');
+            if let Some(modified) = modified.and_then(known_time) {
+                row.push_str(&rfc3339(modified));
+            }
+        }
+    }
+}
+
+/// How a listing was asked to be shown: its order and, for TSV, which page
+/// and optional columns.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ListingView<'a> {
+    pub sort: Sort,
+    pub tsv: Option<TsvRequest<'a>>,
+}
+
+/// How a TSV listing was asked for: where it lives, which page, which
+/// optional columns.
+#[derive(Debug, Clone, Copy)]
+pub struct TsvRequest<'a> {
+    pub uri: &'a Uri,
+    pub paging: Paging,
+    pub columns: Columns,
+}
+
+impl<'a> TsvRequest<'a> {
+    pub fn parse(uri: &'a Uri, query: &ListingQuery) -> Result<Self, String> {
+        Ok(Self {
+            uri,
+            paging: Paging::parse(query)?,
+            columns: Columns::parse(query)?,
+        })
+    }
+}
+
+/// Orders a directory listing in place: folders, then files, then aliases,
+/// each by `sort` and then by name.
+pub fn sort_listing(rel: &str, list: &mut DirList, sort: Sort) {
+    fn name<'a>(rel: &str, alias: &'a AliasEntry) -> &'a str {
+        direct_alias_name(rel, &alias.path).unwrap_or(&alias.path)
+    }
+    list.entries.sort_by(|left, right| {
+        let group = |entry: &DirEnt| u8::from(entry.kind == EntryKind::File);
+        group(left)
+            .cmp(&group(right))
+            .then_with(|| match sort.key {
+                SortKey::Name => sort.order(&left.name, &right.name),
+                SortKey::Files => sort.order(&left.files, &right.files),
+                SortKey::Size => sort.order(&left.bytes, &right.bytes),
+                SortKey::Modified => sort.order(&left.modified, &right.modified),
+            })
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    list.aliases.sort_by(|left, right| {
+        match sort.key {
+            SortKey::Name => sort.order(&name(rel, left), &name(rel, right)),
+            SortKey::Files => sort.order(&left.resolved_files, &right.resolved_files),
+            SortKey::Size => sort.order(&left.resolved_size, &right.resolved_size),
+            SortKey::Modified => sort.order(&left.modified, &right.modified),
+        }
+        .then_with(|| name(rel, left).cmp(name(rel, right)))
+    });
+}
+
+/// Orders the site list in place. Sites have no folders or aliases, so the key
+/// alone decides.
+pub fn sort_sites(list: &mut SiteList, sort: Sort) {
+    list.entries.sort_by(|left, right| {
+        match sort.key {
+            SortKey::Name => sort.order(&left.name, &right.name),
+            SortKey::Files => sort.order(&left.files, &right.files),
+            SortKey::Size => sort.order(&left.bytes, &right.bytes),
+            SortKey::Modified => sort.order(&left.modified, &right.modified),
+        }
+        .then_with(|| left.name.cmp(&right.name))
+    });
+}
+
+/// `None` for the zero an entry can only carry if it was never stamped.
+const fn known_time(millis: i64) -> Option<i64> {
+    if millis > 0 { Some(millis) } else { None }
+}
+
+fn utc(millis: i64) -> time::OffsetDateTime {
+    time::OffsetDateTime::from_unix_timestamp(millis.div_euclid(1000))
+        .unwrap_or(time::OffsetDateTime::UNIX_EPOCH)
+}
+
+/// `2026-10-06T14:03:12Z`: whole seconds, UTC.
+fn rfc3339(millis: i64) -> String {
+    let time = utc(millis);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        time.year(),
+        u8::from(time.month()),
+        time.day(),
+        time.hour(),
+        time.minute(),
+        time.second()
+    )
+}
+
+/// `2026-10-06 14:03Z`: what listings show a person. The `Z` marks UTC; the
+/// HTML view swaps in the reader's local time, without it.
+fn date_label(millis: i64) -> String {
+    let time = utc(millis);
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}Z",
+        time.year(),
+        u8::from(time.month()),
+        time.day(),
+        time.hour(),
+        time.minute()
+    )
+}
+
+/// The width of [`date_label`]'s output.
+const DATE_WIDTH: usize = "2026-10-06 14:03Z".len();
 
 impl ListingQuery {
     /// `?recursive` asks for the whole inventory rather than one directory.
@@ -480,18 +845,24 @@ pub fn inventory_tsv(inventory: &symbol_contract::SiteInventory, paging: Paging)
     tsv_page(INVENTORY_HEADER, &rows, paging)
 }
 
-/// One directory: subdirectories and files in name order, then aliases.
+/// One directory: subdirectories, then files, then aliases, in the order
+/// [`sort_listing`] left them.
 ///
 /// `files` is a directory's (or directory alias's) file count, `bytes` its
-/// size; `target` is set for aliases only.
-pub fn listing_tsv(rel: &str, list: &DirList, paging: Paging) -> TsvPage {
+/// size; `target` is set for aliases only. `columns=modified` appends when
+/// each entry's content last changed.
+pub fn listing_tsv(rel: &str, list: &DirList, paging: Paging, columns: Columns) -> TsvPage {
     let mut rows = Vec::with_capacity(list.entries.len() + list.aliases.len());
-    rows.extend(list.entries.iter().map(|entry| match entry.kind {
-        EntryKind::Directory => format!(
-            "directory\t{}\t{}\t{}\t",
-            entry.files, entry.bytes, entry.name
-        ),
-        EntryKind::File => format!("file\t\t{}\t{}\t", entry.bytes, entry.name),
+    rows.extend(list.entries.iter().map(|entry| {
+        let mut row = match entry.kind {
+            EntryKind::Directory => format!(
+                "directory\t{}\t{}\t{}\t",
+                entry.files, entry.bytes, entry.name
+            ),
+            EntryKind::File => format!("file\t\t{}\t{}\t", entry.bytes, entry.name),
+        };
+        columns.push(&mut row, Some(entry.modified));
+        row
     }));
     rows.extend(list.aliases.iter().filter_map(|alias| {
         direct_alias_name(rel, &alias.path).map(|name| {
@@ -503,24 +874,28 @@ pub fn listing_tsv(rel: &str, list: &DirList, paging: Paging) -> TsvPage {
                 .resolved_size
                 .map(|bytes| bytes.to_string())
                 .unwrap_or_default();
-            format!(
+            let mut row = format!(
                 "alias\t{files}\t{bytes}\t{name}\t{}",
                 alias.canonical_target
-            )
+            );
+            columns.push(&mut row, Some(alias.modified));
+            row
         })
     }));
-    tsv_page(LISTING_HEADER, &rows, paging)
+    tsv_page(&columns.header(LISTING_HEADER), &rows, paging)
 }
 
-fn sites_tsv(list: &SiteList, paging: Paging) -> TsvPage {
+fn sites_tsv(list: &SiteList, paging: Paging, columns: Columns) -> TsvPage {
     let mut rows = Vec::with_capacity(list.entries.len() + 1);
-    rows.push("builtin\t\t0\tAPI\t".to_string());
-    rows.extend(
-        list.entries
-            .iter()
-            .map(|entry| format!("site\t{}\t{}\t{}\t", entry.files, entry.bytes, entry.name)),
-    );
-    tsv_page(LISTING_HEADER, &rows, paging)
+    let mut builtin = "builtin\t\t0\tAPI\t".to_string();
+    columns.push(&mut builtin, None);
+    rows.push(builtin);
+    rows.extend(list.entries.iter().map(|entry| {
+        let mut row = format!("site\t{}\t{}\t{}\t", entry.files, entry.bytes, entry.name);
+        columns.push(&mut row, Some(entry.modified));
+        row
+    }));
+    tsv_page(&columns.header(LISTING_HEADER), &rows, paging)
 }
 
 /// Adds `Entry-Count` and, when paged, `Link` to the neighbouring pages.
@@ -620,11 +995,13 @@ fn cached_response(
     http_cache::respond(headers, representation)
 }
 
+#[expect(clippy::too_many_arguments)]
 fn push_listing_row(
     out: &mut String,
     name: &str,
     files: Option<u64>,
     bytes: u64,
+    modified: Option<i64>,
     layout: ListingLayout,
     suffix: &str,
 ) {
@@ -632,9 +1009,14 @@ fn push_listing_row(
         || " ".repeat(layout.count + 6),
         |files| format!("{files:>width$} files", width = layout.count),
     );
+    let date = modified
+        .and_then(known_time)
+        .map_or_else(String::new, |modified| {
+            format!("   {:>DATE_WIDTH$}", date_label(modified))
+        });
     writeln!(
         out,
-        "{name:<width$} {count}   {}{suffix}",
+        "{name:<width$} {count}   {}{date}{suffix}",
         HumanSize::new(bytes).aligned(layout.size),
         width = layout.name,
     )
@@ -838,8 +1220,9 @@ const STYLE: &str = static_asset!("browse.css");
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{AliasEntry, DirEnt, SiteEnt};
+    use crate::store::SiteEnt;
     use axum::body::to_bytes;
+    use axum::extract::Query;
     use axum::http::{HeaderValue, StatusCode};
 
     fn accept(value: &'static str) -> HeaderMap {
@@ -853,6 +1236,13 @@ mod tests {
         String::from_utf8(bytes.to_vec()).unwrap()
     }
 
+    /// 2026-10-06T14:03:12Z.
+    const OCT_6: i64 = 1_791_295_392_000;
+    /// 2026-09-30T08:15:00Z.
+    const SEP_30: i64 = 1_790_756_100_000;
+    /// 2025-01-02T03:04:05Z.
+    const JAN_2: i64 = 1_735_787_045_000;
+
     #[test]
     fn plain_site_sizes_align_ones_places_and_units() {
         let list = SiteList {
@@ -864,11 +1254,13 @@ mod tests {
                     name: "hello".to_string(),
                     files: 8,
                     bytes: 3_774_464,
+                    modified: OCT_6,
                 },
                 SiteEnt {
                     name: "notes".to_string(),
                     files: 3,
                     bytes: 419_840,
+                    modified: SEP_30,
                 },
             ],
         };
@@ -876,11 +1268,20 @@ mod tests {
             render_sites_plain(&list),
             concat!(
                 "API/                      0    B   built-in\n",
-                "hello/        8 files     3.60 MiB\n",
-                "notes/        3 files   410    KiB\n",
+                "hello/        8 files     3.60 MiB   2026-10-06 14:03Z\n",
+                "notes/        3 files   410    KiB   2026-09-30 08:15Z\n",
                 "             11 files     4.00 MiB total\n",
             )
         );
+    }
+
+    #[test]
+    fn timestamps_render_as_whole_utc_seconds_and_minutes() {
+        assert_eq!(rfc3339(OCT_6 + 999), "2026-10-06T14:03:12Z");
+        assert_eq!(date_label(OCT_6), "2026-10-06 14:03Z");
+        assert_eq!(date_label(OCT_6).len(), DATE_WIDTH);
+        assert_eq!(known_time(0), None);
+        assert_eq!(known_time(JAN_2), Some(JAN_2));
     }
 
     #[test]
@@ -896,27 +1297,205 @@ mod tests {
                     name: "assets".to_string(),
                     files: 5,
                     bytes: 3_565_158,
+                    modified: OCT_6,
                 },
                 DirEnt {
                     kind: EntryKind::Directory,
                     name: "css".to_string(),
                     files: 2,
                     bytes: 188_743,
+                    modified: SEP_30,
                 },
                 DirEnt {
                     kind: EntryKind::File,
                     name: "index.html".to_string(),
                     files: 1,
                     bytes: 20_563,
+                    modified: JAN_2,
                 },
             ],
         };
         assert_eq!(
             render_plain("hello", "", &list),
             "hello/        8 files     3.60 MiB\n\
-             assets/       5 files     3.40 MiB\n\
-             css/          2 files   184    KiB\n\
-             index.html               20.1  KiB\n"
+             assets/       5 files     3.40 MiB   2026-10-06 14:03Z\n\
+             css/          2 files   184    KiB   2026-09-30 08:15Z\n\
+             index.html               20.1  KiB   2025-01-02 03:04Z\n"
+        );
+    }
+
+    fn query(pairs: &str) -> ListingQuery {
+        Query::<ListingQuery>::try_from_uri(&format!("/x?{pairs}").parse::<Uri>().unwrap())
+            .unwrap()
+            .0
+    }
+
+    fn sample_list() -> DirList {
+        let mut list = dir_list(vec![
+            DirEnt {
+                modified: SEP_30,
+                bytes: 4096,
+                ..file_entry("b.txt")
+            },
+            DirEnt {
+                modified: OCT_6,
+                bytes: 10,
+                ..file_entry("a.txt")
+            },
+            DirEnt {
+                modified: JAN_2,
+                files: 7,
+                bytes: 1,
+                ..dir_entry("zeta")
+            },
+            DirEnt {
+                modified: OCT_6,
+                files: 2,
+                bytes: 9000,
+                ..dir_entry("alpha")
+            },
+        ]);
+        list.aliases = vec![
+            AliasEntry {
+                modified: JAN_2,
+                ..alias_entry("new", "a.txt")
+            },
+            AliasEntry {
+                modified: OCT_6,
+                ..alias_entry("latest", "b.txt")
+            },
+        ];
+        list
+    }
+
+    fn order(list: &DirList) -> Vec<&str> {
+        list.entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .chain(list.aliases.iter().map(|alias| alias.path.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn sorting_keeps_folders_first_and_aliases_last() {
+        let mut list = sample_list();
+        sort_listing("", &mut list, Sort::default());
+        assert_eq!(
+            order(&list),
+            ["alpha", "zeta", "a.txt", "b.txt", "latest", "new"]
+        );
+
+        let newest = Sort::parse(&query("sort=modified")).unwrap();
+        assert!(newest.descending, "dates read newest first by default");
+        sort_listing("", &mut list, newest);
+        assert_eq!(
+            order(&list),
+            ["alpha", "zeta", "a.txt", "b.txt", "latest", "new"]
+        );
+
+        sort_listing(
+            "",
+            &mut list,
+            Sort::parse(&query("sort=size&order=asc")).unwrap(),
+        );
+        assert_eq!(
+            order(&list),
+            ["zeta", "alpha", "a.txt", "b.txt", "latest", "new"]
+        );
+
+        sort_listing("", &mut list, Sort::parse(&query("sort=files")).unwrap());
+        assert_eq!(order(&list)[..2], ["zeta", "alpha"]);
+
+        sort_listing("", &mut list, Sort::parse(&query("order=desc")).unwrap());
+        assert_eq!(
+            order(&list),
+            ["zeta", "alpha", "b.txt", "a.txt", "new", "latest"]
+        );
+    }
+
+    #[test]
+    fn sort_parameters_are_validated() {
+        assert_eq!(Sort::parse(&query("")).unwrap(), Sort::default());
+        assert!(Sort::parse(&query("sort=date")).is_err());
+        assert!(Sort::parse(&query("order=up")).is_err());
+        assert_eq!(Columns::parse(&query("")).unwrap(), Columns::default());
+        assert!(Columns::parse(&query("columns=modified")).unwrap().modified);
+        assert!(Columns::parse(&query("columns=hash")).is_err());
+    }
+
+    #[test]
+    fn headers_link_to_their_sort_and_reverse_the_active_one() {
+        let sort = Sort::default();
+        assert_eq!(sort.header_query(SortKey::Name), "?sort=name&order=desc");
+        assert_eq!(sort.header_query(SortKey::Size), "?sort=size&order=desc");
+        let newest = Sort {
+            key: SortKey::Modified,
+            descending: true,
+        };
+        assert_eq!(
+            newest.header_query(SortKey::Modified),
+            "?sort=modified&order=asc"
+        );
+        assert_eq!(newest.header_query(SortKey::Name), "?sort=name&order=asc");
+
+        let body = render_html("hello", "", &sample_list(), true, newest);
+        assert!(
+            body.contains(r#"href="?sort=modified&amp;order=asc" aria-sort="descending""#),
+            "{body}"
+        );
+        assert!(
+            body.contains(r#"<time datetime="2026-10-06T14:03:12Z""#),
+            "{body}"
+        );
+        assert!(body.contains(">2026-10-06 14:03Z</time>"), "{body}");
+    }
+
+    #[test]
+    fn tsv_listings_append_modified_only_when_asked() {
+        let list = sample_list();
+        let plain = listing_tsv(
+            "",
+            &list,
+            Paging::parse(&query("")).unwrap(),
+            Columns::default(),
+        );
+        assert!(plain.body.starts_with("kind\tfiles\tbytes\tname\ttarget\n"));
+        assert!(!plain.body.contains("2026"));
+
+        let dated = listing_tsv(
+            "",
+            &list,
+            Paging::parse(&query("")).unwrap(),
+            Columns { modified: true },
+        );
+        let lines: Vec<&str> = dated.body.lines().collect();
+        assert_eq!(lines[0], "kind\tfiles\tbytes\tname\ttarget\tmodified");
+        assert!(lines.contains(&"file\t\t4096\tb.txt\t\t2026-09-30T08:15:00Z"));
+        assert!(lines.contains(&"directory\t7\t1\tzeta\t\t2025-01-02T03:04:05Z"));
+        assert!(lines.contains(&"alias\t\t\tlatest\tb.txt\t2026-10-06T14:03:12Z"));
+
+        let sites = SiteList {
+            files: 1,
+            alias_count: 0,
+            bytes: 1,
+            entries: vec![SiteEnt {
+                name: "hello".to_string(),
+                files: 1,
+                bytes: 1,
+                modified: OCT_6,
+            }],
+        };
+        let body = sites_tsv(
+            &sites,
+            Paging::parse(&query("")).unwrap(),
+            Columns { modified: true },
+        )
+        .body;
+        assert_eq!(
+            body,
+            "kind\tfiles\tbytes\tname\ttarget\tmodified\n\
+             builtin\t\t0\tAPI\t\t\n\
+             site\t1\t1\thello\t\t2026-10-06T14:03:12Z\n"
         );
     }
 
@@ -930,13 +1509,14 @@ mod tests {
                 name: "hello".to_string(),
                 files: 1,
                 bytes: 512,
+                modified: OCT_6,
             }],
         };
         let response = sites(
             &accept("application/json"),
             &Uri::from_static("/FILES"),
             &ListingQuery::default(),
-            &list,
+            list.clone(),
         );
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
@@ -949,11 +1529,13 @@ mod tests {
             &accept("text/html"),
             &Uri::from_static("/FILES"),
             &ListingQuery::default(),
-            &list,
+            list,
         );
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_text(response).await;
         assert!(body.contains("1 files · 512 B"));
+        assert!(body.contains(">512 B</span>"), "{body}");
+        assert!(body.contains(">2026-10-06 14:03Z</time>"), "{body}");
         assert!(body.contains(r#"href="/API/""#));
         assert!(body.contains(r#"href="/hello/FILES/""#));
         assert!(body.contains("font-variant-numeric: tabular-nums"));
@@ -969,13 +1551,14 @@ mod tests {
                 name: "hello".to_string(),
                 files: 1,
                 bytes: 5,
+                modified: OCT_6,
             }],
         };
         let response = sites(
             &HeaderMap::new(),
             &Uri::from_static("/FILES"),
             &ListingQuery::default(),
-            &list,
+            list.clone(),
         );
         let etag = response.headers()[header::ETAG].clone();
 
@@ -985,7 +1568,7 @@ mod tests {
             &conditional,
             &Uri::from_static("/FILES"),
             &ListingQuery::default(),
-            &list,
+            list.clone(),
         );
         assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
 
@@ -995,7 +1578,7 @@ mod tests {
             &conditional,
             &Uri::from_static("/FILES"),
             &ListingQuery::default(),
-            &list,
+            list,
         );
         assert_eq!(response.status(), StatusCode::OK);
         assert_ne!(response.headers()[header::ETAG], etag);
@@ -1013,6 +1596,7 @@ mod tests {
             name: name.to_string(),
             files: 1,
             bytes: 512,
+            modified: OCT_6,
         }
     }
 
@@ -1022,6 +1606,19 @@ mod tests {
             name: name.to_string(),
             files: 1,
             bytes: 512,
+            modified: OCT_6,
+        }
+    }
+
+    fn alias_entry(path: &str, target: &str) -> AliasEntry {
+        AliasEntry {
+            path: path.to_string(),
+            canonical_target: target.to_string(),
+            resolved_kind: None,
+            resolved_hash: None,
+            resolved_size: None,
+            resolved_files: None,
+            modified: OCT_6,
         }
     }
 
@@ -1060,7 +1657,7 @@ mod tests {
         let list = dir_list(vec![file_entry("about.html"), file_entry("style.css")]);
 
         for files_view in [true, false] {
-            let body = render_html("hello", "", &list, files_view);
+            let body = render_html("hello", "", &list, files_view, Sort::default());
             assert!(
                 body.contains(">about.html</span>"),
                 "label lost its extension in files_view={files_view}: {body}"
@@ -1075,7 +1672,7 @@ mod tests {
     #[test]
     fn an_occupied_stem_keeps_the_extension_in_both_label_and_link() {
         let list = dir_list(vec![file_entry("about.html"), dir_entry("about")]);
-        let body = render_html("hello", "", &list, true);
+        let body = render_html("hello", "", &list, true, Sort::default());
         assert!(body.contains(">about.html</span>"), "{body}");
         assert!(body.contains(r#"href="/hello/about.html""#), "{body}");
     }
@@ -1083,7 +1680,7 @@ mod tests {
     #[test]
     fn index_entries_link_to_the_directory_that_serves_them() {
         let list = dir_list(vec![file_entry("index.html")]);
-        let body = render_html("hello", "docs", &list, true);
+        let body = render_html("hello", "docs", &list, true, Sort::default());
         assert!(body.contains(r#"class="see-site" href="/hello/docs/""#));
         assert!(body.contains(">see site</a>"));
         assert!(body.contains(">index.html</span>"), "{body}");
@@ -1091,7 +1688,7 @@ mod tests {
         assert!(!body.contains(r#"href="/hello/docs/index""#), "{body}");
 
         let root = dir_list(vec![file_entry("index.html")]);
-        let body = render_html("hello", "", &root, true);
+        let body = render_html("hello", "", &root, true, Sort::default());
         assert!(body.contains(r#"href="/hello/""#), "{body}");
         assert!(!body.contains(r#"href="/hello/index""#), "{body}");
     }
@@ -1110,7 +1707,7 @@ mod tests {
         assert!(!serves_directory_index("about.html", &occupied));
 
         let list = dir_list(vec![file_entry("index.html"), file_entry("index.htm")]);
-        let body = render_html("hello", "docs", &list, true);
+        let body = render_html("hello", "docs", &list, true, Sort::default());
         assert!(body.contains(r#"href="/hello/docs/index.htm""#), "{body}");
         assert!(body.contains(">index.htm</span>"), "{body}");
     }
@@ -1121,20 +1718,26 @@ mod tests {
             files: 0,
             bytes: 0,
             alias_count: 1,
-            aliases: vec![AliasEntry {
-                path: "latest".to_string(),
-                canonical_target: "releases/current".to_string(),
-                resolved_kind: None,
-                resolved_hash: None,
-                resolved_size: None,
-                resolved_files: None,
-            }],
+            aliases: vec![alias_entry("latest", "releases/current")],
             entries: Vec::new(),
         };
-        assert!(render_plain("hello", "", &list).contains("latest -> releases/current"));
-        assert!(render_html("hello", "", &list, true).contains("latest -&gt; releases/current"));
+        assert!(
+            render_plain("hello", "", &list)
+                .contains("latest -> releases/current   2026-10-06 14:03Z")
+        );
+        assert!(
+            render_html("hello", "", &list, true, Sort::default())
+                .contains("latest -&gt; releases/current")
+        );
 
-        let response = listing(&accept("application/json"), "hello", "", &list, true, None);
+        let response = listing(
+            &accept("application/json"),
+            "hello",
+            "",
+            list,
+            true,
+            ListingView::default(),
+        );
         let value: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
         assert_eq!(value["aliases"], 1);
         assert_eq!(value["entries"][0]["kind"], "alias");

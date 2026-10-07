@@ -1053,7 +1053,7 @@ async fn list_sites(
     headers: HeaderMap,
 ) -> Response {
     match app.run_store(|store| store.list_sites()).await {
-        Ok(names) => browse::sites(&headers, &uri, &query, &names),
+        Ok(names) => browse::sites(&headers, &uri, &query, names),
         Err(err) => err.into_response(),
     }
 }
@@ -2329,13 +2329,22 @@ async fn browse_root(
             Err(err) => err.into_response(),
         };
     }
+    let sort = match browse::Sort::parse(&query) {
+        Ok(sort) => sort,
+        Err(message) => return browse::bad_query(message),
+    };
     if browse::wants_tsv(&headers) {
-        let paging = match browse::Paging::parse(&query) {
-            Ok(paging) => paging,
+        let request = match browse::TsvRequest::parse(&uri, &query) {
+            Ok(request) => request,
             Err(message) => return browse::bad_query(message),
         };
+        let paging = request.paging;
         if !query.recursive() {
-            return browse_dir(&app, &name, "", true, &headers, Some((&uri, paging))).await;
+            let view = browse::ListingView {
+                sort,
+                tsv: Some(request),
+            };
+            return browse_dir(&app, &name, "", true, &headers, view).await;
         }
         let result = app
             .run_store({
@@ -2375,7 +2384,8 @@ async fn browse_root(
             Err(err) => err.into_response(),
         };
     }
-    browse_dir(&app, &name, "", true, &headers, None).await
+    let view = browse::ListingView { sort, tsv: None };
+    browse_dir(&app, &name, "", true, &headers, view).await
 }
 
 async fn browse_path(
@@ -2403,15 +2413,27 @@ async fn browse_path(
                 return Redirect::temporary(&format!("/{name}/FILES/{path}/{query}"))
                     .into_response();
             }
+            let sort = match browse::Sort::parse(&query) {
+                Ok(sort) => sort,
+                Err(message) => return browse::bad_query(message),
+            };
             let tsv = if browse::wants_tsv(&headers) {
-                match browse::Paging::parse(&query) {
-                    Ok(paging) => Some((&uri, paging)),
+                match browse::TsvRequest::parse(&uri, &query) {
+                    Ok(request) => Some(request),
                     Err(message) => return browse::bad_query(message),
                 }
             } else {
                 None
             };
-            browse_dir(&app, &name, rel, true, &headers, tsv).await
+            browse_dir(
+                &app,
+                &name,
+                rel,
+                true,
+                &headers,
+                browse::ListingView { sort, tsv },
+            )
+            .await
         }
         Ok(store::Node::File { .. }) => {
             let target = app
@@ -2436,7 +2458,7 @@ async fn browse_dir(
     rel: &str,
     files_view: bool,
     headers: &HeaderMap,
-    tsv: Option<(&axum::http::Uri, browse::Paging)>,
+    view: browse::ListingView<'_>,
 ) -> Response {
     let result = app
         .run_store({
@@ -2446,7 +2468,7 @@ async fn browse_dir(
         })
         .await;
     match result {
-        Ok(entries) => browse::listing(headers, name, rel, &entries, files_view, tsv),
+        Ok(entries) => browse::listing(headers, name, rel, entries, files_view, view),
         Err(err) => err.into_response(),
     }
 }
@@ -2454,14 +2476,16 @@ async fn browse_dir(
 async fn serve_index(
     State(app): State<App>,
     Path(name): Path<String>,
+    Query(query): Query<browse::ListingQuery>,
     headers: HeaderMap,
 ) -> Response {
-    serve_from(&app, &name, "", &headers).await
+    serve_from(&app, &name, "", &query, &headers).await
 }
 
 async fn serve_path(
     State(app): State<App>,
     Path((name, path)): Path<(String, String)>,
+    Query(query): Query<browse::ListingQuery>,
     headers: HeaderMap,
 ) -> Response {
     let control_path = path.trim_end_matches('/');
@@ -2474,7 +2498,7 @@ async fn serve_path(
     if let Some(rel) = strip_raw_path(&path) {
         return send_raw(&app, &name, rel, &headers).await;
     }
-    serve_from(&app, &name, &path, &headers).await
+    serve_from(&app, &name, &path, &query, &headers).await
 }
 
 fn strip_raw_path(path: &str) -> Option<&str> {
@@ -2514,7 +2538,13 @@ async fn send_raw(app: &App, name: &str, rel: &str, headers: &HeaderMap) -> Resp
     }
 }
 
-async fn serve_from(app: &App, name: &str, rel: &str, headers: &HeaderMap) -> Response {
+async fn serve_from(
+    app: &App,
+    name: &str,
+    rel: &str,
+    query: &browse::ListingQuery,
+    headers: &HeaderMap,
+) -> Response {
     let node = app
         .run_store({
             let name = name.to_string();
@@ -2544,7 +2574,14 @@ async fn serve_from(app: &App, name: &str, rel: &str, headers: &HeaderMap) -> Re
                 Ok(None) => {}
                 Err(err) => return err.into_response(),
             }
-            let mut response = browse_dir(app, name, rel, false, headers, None).await;
+            // A directory without an index lists itself, and sorts like any
+            // other listing. A file ignores the query entirely.
+            let sort = match browse::Sort::parse(query) {
+                Ok(sort) => sort,
+                Err(message) => return browse::bad_query(message),
+            };
+            let view = browse::ListingView { sort, tsv: None };
+            let mut response = browse_dir(app, name, rel, false, headers, view).await;
             add_target_expiry_headers(app, name, rel, response.headers_mut()).await;
             response
         }
@@ -4595,20 +4632,43 @@ mod tests {
         let store = Store::new(root.path().to_path_buf()).unwrap();
         store.put_file("hello", "a.txt", b"a").unwrap();
         let app = test_app(store.clone());
-        let response = browse_dir(&app, "hello", "", true, &HeaderMap::new(), None).await;
+        let response = browse_dir(
+            &app,
+            "hello",
+            "",
+            true,
+            &HeaderMap::new(),
+            browse::ListingView::default(),
+        )
+        .await;
         let etag = response.headers()[header::ETAG].clone();
 
         let mut conditional = HeaderMap::new();
         conditional.insert(header::IF_NONE_MATCH, etag.clone());
         assert_eq!(
-            browse_dir(&app, "hello", "", true, &conditional, None)
-                .await
-                .status(),
+            browse_dir(
+                &app,
+                "hello",
+                "",
+                true,
+                &conditional,
+                browse::ListingView::default(),
+            )
+            .await
+            .status(),
             StatusCode::NOT_MODIFIED
         );
 
         store.put_file("hello", "b.txt", b"bb").unwrap();
-        let response = browse_dir(&app, "hello", "", true, &conditional, None).await;
+        let response = browse_dir(
+            &app,
+            "hello",
+            "",
+            true,
+            &conditional,
+            browse::ListingView::default(),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_ne!(response.headers()[header::ETAG], etag);
     }

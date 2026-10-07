@@ -72,6 +72,9 @@ pub struct DirEnt {
     pub name: String,
     pub files: u64,
     pub bytes: u64,
+    /// When the content last changed, in Unix milliseconds: a file's own
+    /// time, or the newest of everything under a directory.
+    pub modified: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -88,6 +91,8 @@ pub struct SiteEnt {
     pub name: String,
     pub files: u64,
     pub bytes: u64,
+    /// The site's last change, in Unix milliseconds.
+    pub modified: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -272,6 +277,10 @@ pub struct AliasEntry {
     pub resolved_hash: Option<String>,
     pub resolved_size: Option<u64>,
     pub resolved_files: Option<u64>,
+    /// When the alias was last pointed somewhere new, in Unix milliseconds.
+    /// Defaulted so that idempotency records written before it still load.
+    #[serde(default)]
+    pub modified: i64,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -507,6 +516,7 @@ pub(super) struct NewFile {
     pub(super) path: String,
     pub(super) hash: ContentHash,
     pub(super) size: i64,
+    pub(super) modified: i64,
 }
 
 #[derive(Debug, Clone, Queryable, Selectable)]
@@ -517,6 +527,7 @@ pub(super) struct AliasRow {
     pub(super) resolved_kind: Option<i64>,
     pub(super) resolved_hash: Option<ContentHash>,
     pub(super) resolved_size: Option<i64>,
+    pub(super) modified: i64,
 }
 
 #[derive(Debug, Clone, Queryable, Selectable)]
@@ -528,6 +539,7 @@ pub(super) struct UndoAliasRow {
     pub(super) resolved_kind: Option<i64>,
     pub(super) resolved_hash: Option<ContentHash>,
     pub(super) resolved_size: Option<i64>,
+    pub(super) modified: Option<i64>,
 }
 
 #[derive(Queryable, Selectable)]

@@ -1623,6 +1623,7 @@ fn migration_integrity_gate_rejects_foreign_key_violations() {
             path: "orphan.txt".to_string(),
             hash: test_content_hash("missing"),
             size: 1,
+            modified: 1,
         })
         .execute(&mut db)
         .unwrap();
@@ -1672,6 +1673,7 @@ fn production_shaped_v2_database_migrates_through_current_schema() {
             path: "index.html".to_string(),
             hash: test_content_hash("legacy-hash"),
             size: 4,
+            modified: 1,
         })
         .execute(&mut db)
         .unwrap();
@@ -1734,6 +1736,102 @@ fn path_aggregates_follow_incremental_put_delete_copy_and_undo() {
     store.undo("hello", Some(&token)).unwrap();
     assert_eq!(aggregate("hello", ""), (8, 3));
     assert_eq!(aggregate("hello", "assets/nested"), (2, 1));
+}
+
+#[test]
+fn modified_times_track_content_changes_through_copy_and_undo() {
+    const T0: i64 = 1_700_000_000_000;
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(TestClock::new(T0.cast_unsigned()));
+    let store = Store::with_clock(
+        dir.path().to_path_buf(),
+        "http://symbol".to_string(),
+        Arc::<TestClock>::clone(&clock),
+    )
+    .unwrap();
+    let modified = |site: &str, rel: &str, name: &str| {
+        store
+            .list_dir(site, rel)
+            .unwrap()
+            .entries
+            .into_iter()
+            .find(|entry| entry.name == name)
+            .unwrap_or_else(|| panic!("{site}/{rel} has no {name}"))
+            .modified
+    };
+
+    store.put_file("dates", "index.html", b"one").unwrap();
+    store.put_file("dates", "docs/a.md", b"a").unwrap();
+    clock.advance(1_000);
+    store.put_file("dates", "docs/b.md", b"b").unwrap();
+    assert_eq!(modified("dates", "", "index.html"), T0);
+    assert_eq!(modified("dates", "docs", "a.md"), T0);
+    assert_eq!(modified("dates", "docs", "b.md"), T0 + 1_000);
+    assert_eq!(
+        modified("dates", "", "docs"),
+        T0 + 1_000,
+        "a folder shows its newest file"
+    );
+
+    clock.advance(1_000);
+    store.put_file("dates", "index.html", b"one").unwrap();
+    assert_eq!(
+        modified("dates", "", "index.html"),
+        T0,
+        "identical bytes are not a change"
+    );
+    store.put_file("dates", "index.html", b"two").unwrap();
+    assert_eq!(modified("dates", "", "index.html"), T0 + 2_000);
+
+    clock.advance(1_000);
+    store
+        .put_aliases(
+            "dates",
+            &[AliasSpec {
+                path: "latest",
+                target: "docs/b.md",
+            }],
+            FileMutationOptions::default(),
+        )
+        .unwrap();
+    let alias_modified = |store: &Store| {
+        store
+            .list_dir("dates", "")
+            .unwrap()
+            .aliases
+            .into_iter()
+            .find(|alias| alias.path == "latest")
+            .unwrap()
+            .modified
+    };
+    assert_eq!(alias_modified(&store), T0 + 3_000);
+
+    clock.advance(1_000);
+    store.copy_site("dates", Some("dates-copy"), None).unwrap();
+    assert_eq!(
+        modified("dates-copy", "docs", "a.md"),
+        T0,
+        "a copy keeps the content's own dates"
+    );
+    let copy_site = store
+        .list_sites()
+        .unwrap()
+        .entries
+        .into_iter()
+        .find(|site| site.name == "dates-copy")
+        .unwrap();
+    assert_eq!(copy_site.modified, T0 + 4_000);
+
+    clock.advance(1_000);
+    store.put_file("dates", "docs/a.md", b"changed").unwrap();
+    assert_eq!(modified("dates", "docs", "a.md"), T0 + 5_000);
+    store.undo("dates", None).unwrap();
+    assert_eq!(
+        modified("dates", "docs", "a.md"),
+        T0,
+        "undo restores the date with the content"
+    );
+    assert_eq!(alias_modified(&store), T0 + 3_000);
 }
 
 #[test]
@@ -2428,6 +2526,7 @@ fn startup_migrates_sqlite_blob_payloads_to_files() {
                 path: "legacy.bin".to_string(),
                 hash: content_hash,
                 size: 6,
+                modified: 1,
             })
             .execute(&mut db)
             .unwrap();
@@ -2573,6 +2672,7 @@ fn startup_does_not_delete_preexisting_junk_content() {
                     path: path.to_string(),
                     hash,
                     size: apple_len,
+                    modified: 1,
                 })
                 .execute(&mut db)
                 .unwrap();

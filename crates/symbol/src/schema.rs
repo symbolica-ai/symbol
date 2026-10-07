@@ -30,6 +30,7 @@ diesel::table! {
         kind -> BigInt,
         hash -> Binary,
         size -> BigInt,
+        modified -> BigInt,
     }
 }
 
@@ -96,6 +97,7 @@ diesel::table! {
         path -> Text,
         hash -> Binary,
         size -> BigInt,
+        modified -> Nullable<BigInt>,
     }
 }
 
@@ -188,6 +190,7 @@ diesel::table! {
         kind -> Nullable<BigInt>,
         hash -> Nullable<Binary>,
         size -> Nullable<BigInt>,
+        modified -> Nullable<BigInt>,
     }
 }
 
@@ -203,6 +206,7 @@ diesel::table! {
         suffix -> Text,
         extension -> Nullable<Text>,
         media_type -> Text,
+        modified -> BigInt,
     }
 }
 
@@ -232,6 +236,7 @@ diesel::table! {
         suffix -> Nullable<Text>,
         extension -> Nullable<Text>,
         media_type -> Nullable<Text>,
+        modified -> Nullable<BigInt>,
     }
 }
 
@@ -244,6 +249,7 @@ diesel::table! {
         resolved_kind -> Nullable<BigInt>,
         resolved_hash -> Nullable<Binary>,
         resolved_size -> Nullable<BigInt>,
+        modified -> BigInt,
     }
 }
 
@@ -256,6 +262,7 @@ diesel::table! {
         resolved_kind -> Nullable<BigInt>,
         resolved_hash -> Nullable<Binary>,
         resolved_size -> Nullable<BigInt>,
+        modified -> Nullable<BigInt>,
     }
 }
 

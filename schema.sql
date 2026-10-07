@@ -9,7 +9,7 @@ CREATE TABLE IF NOT EXISTS "site_events" ( "id" integer PRIMARY KEY, "site_id" i
 
 CREATE TABLE IF NOT EXISTS "site_entries" ( "site_id" integer NOT NULL, "path" text NOT NULL, "kind" integer NOT NULL, PRIMARY KEY ("site_id", "path"), UNIQUE ("site_id", "path", "kind"), FOREIGN KEY ("site_id") REFERENCES "sites" ("id") ON DELETE CASCADE );
 
-CREATE TABLE IF NOT EXISTS "files" ( "site_id" integer NOT NULL, "path" text NOT NULL, "kind" integer NOT NULL DEFAULT 0 CHECK ("kind" = 0), "hash" blob NOT NULL, "size" integer NOT NULL, PRIMARY KEY ("site_id", "path"), FOREIGN KEY ("site_id", "path", "kind") REFERENCES "site_entries" ("site_id", "path", "kind") ON DELETE CASCADE, FOREIGN KEY ("hash") REFERENCES "blobs" ("hash") );
+CREATE TABLE IF NOT EXISTS "files" ( "site_id" integer NOT NULL, "path" text NOT NULL, "kind" integer NOT NULL DEFAULT 0 CHECK ("kind" = 0), "hash" blob NOT NULL, "size" integer NOT NULL, "modified" integer NOT NULL DEFAULT 0, PRIMARY KEY ("site_id", "path"), FOREIGN KEY ("site_id", "path", "kind") REFERENCES "site_entries" ("site_id", "path", "kind") ON DELETE CASCADE, FOREIGN KEY ("hash") REFERENCES "blobs" ("hash") );
 
 CREATE TABLE IF NOT EXISTS "metadata" ( "key" text PRIMARY KEY, "value" text NOT NULL );
 
@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS "undo_names" ( "token" text NOT NULL, "name" text NOT
 
 CREATE TABLE IF NOT EXISTS "undo_sites" ( "token" text PRIMARY KEY, "name" text NOT NULL, "existed" integer NOT NULL, "public_url" text NOT NULL, "created" integer, "updated" integer NOT NULL, "content_revision" integer NOT NULL, "tree_hash" blob NOT NULL, FOREIGN KEY ("token") REFERENCES "undo_operations" ("token") ON DELETE CASCADE );
 
-CREATE TABLE IF NOT EXISTS "undo_files" ( "token" text NOT NULL, "path" text NOT NULL, "hash" blob NOT NULL, "size" integer NOT NULL, PRIMARY KEY ("token", "path"), FOREIGN KEY ("token") REFERENCES "undo_operations" ("token") ON DELETE CASCADE, FOREIGN KEY ("hash") REFERENCES "blobs" ("hash") );
+CREATE TABLE IF NOT EXISTS "undo_files" ( "token" text NOT NULL, "path" text NOT NULL, "hash" blob NOT NULL, "size" integer NOT NULL, "modified" integer, PRIMARY KEY ("token", "path"), FOREIGN KEY ("token") REFERENCES "undo_operations" ("token") ON DELETE CASCADE, FOREIGN KEY ("hash") REFERENCES "blobs" ("hash") );
 
 CREATE TABLE IF NOT EXISTS "expiry_policies" ( "site_id" integer NOT NULL, "path" text NOT NULL, "target_kind" integer NOT NULL, "mode" integer NOT NULL, "duration_seconds" integer, "deadline" integer, "min_age_seconds" integer, "max_age_seconds" integer, "max_size_bytes" integer, "power" real, "refreshed" integer, "own_deadline" integer, "size_bytes" integer NOT NULL DEFAULT 0, PRIMARY KEY ("site_id", "path"), FOREIGN KEY ("site_id") REFERENCES "sites" ("id") ON DELETE CASCADE );
 
@@ -35,17 +35,17 @@ CREATE TABLE IF NOT EXISTS "management_idempotency" ( "key_hash" text PRIMARY KE
 
 CREATE TABLE IF NOT EXISTS "path_aggregates" ( "site_id" integer NOT NULL, "path" text NOT NULL, "logical_bytes" integer NOT NULL, "file_count" integer NOT NULL, PRIMARY KEY ("site_id", "path"), FOREIGN KEY ("site_id") REFERENCES "sites" ("id") ON DELETE CASCADE );
 
-CREATE TABLE IF NOT EXISTS "undo_file_deltas" ( "token" text NOT NULL, "path" text NOT NULL, "existed" integer NOT NULL, "kind" integer, "hash" blob, "size" integer, PRIMARY KEY ("token", "path"), FOREIGN KEY ("token") REFERENCES "undo_operations" ("token") ON DELETE CASCADE );
+CREATE TABLE IF NOT EXISTS "undo_file_deltas" ( "token" text NOT NULL, "path" text NOT NULL, "existed" integer NOT NULL, "kind" integer, "hash" blob, "size" integer, "modified" integer, PRIMARY KEY ("token", "path"), FOREIGN KEY ("token") REFERENCES "undo_operations" ("token") ON DELETE CASCADE );
 
-CREATE TABLE IF NOT EXISTS "allocated_entries" ( "site_id" integer NOT NULL, "path" text NOT NULL, "kind" integer NOT NULL DEFAULT 1 CHECK ("kind" = 1), "hash" blob NOT NULL, "size" integer NOT NULL, "naming_mode" integer NOT NULL, "prefix" text NOT NULL, "suffix" text NOT NULL, "extension" text, "media_type" text NOT NULL, PRIMARY KEY ("site_id", "path"), FOREIGN KEY ("site_id", "path", "kind") REFERENCES "site_entries" ("site_id", "path", "kind") ON DELETE CASCADE, FOREIGN KEY ("hash") REFERENCES "blobs" ("hash") );
+CREATE TABLE IF NOT EXISTS "allocated_entries" ( "site_id" integer NOT NULL, "path" text NOT NULL, "kind" integer NOT NULL DEFAULT 1 CHECK ("kind" = 1), "hash" blob NOT NULL, "size" integer NOT NULL, "naming_mode" integer NOT NULL, "prefix" text NOT NULL, "suffix" text NOT NULL, "extension" text, "media_type" text NOT NULL, "modified" integer NOT NULL DEFAULT 0, PRIMARY KEY ("site_id", "path"), FOREIGN KEY ("site_id", "path", "kind") REFERENCES "site_entries" ("site_id", "path", "kind") ON DELETE CASCADE, FOREIGN KEY ("hash") REFERENCES "blobs" ("hash") );
 
 CREATE TABLE IF NOT EXISTS "pending_allocations" ( "token" text PRIMARY KEY, "site_id" integer NOT NULL, "folder" text NOT NULL, "hash" blob NOT NULL, "size" integer NOT NULL, "media_type" text NOT NULL, "request_fingerprint" text NOT NULL, "created" integer NOT NULL, "expires" integer NOT NULL, FOREIGN KEY ("site_id") REFERENCES "sites" ("id") ON DELETE CASCADE, FOREIGN KEY ("hash") REFERENCES "blobs" ("hash") );
 
-CREATE TABLE IF NOT EXISTS "undo_allocated_deltas" ( "token" text NOT NULL, "path" text NOT NULL, "existed" integer NOT NULL, "hash" blob, "size" integer, "naming_mode" integer, "prefix" text, "suffix" text, "extension" text, "media_type" text, PRIMARY KEY ("token", "path"), FOREIGN KEY ("token") REFERENCES "undo_operations" ("token") ON DELETE CASCADE );
+CREATE TABLE IF NOT EXISTS "undo_allocated_deltas" ( "token" text NOT NULL, "path" text NOT NULL, "existed" integer NOT NULL, "hash" blob, "size" integer, "naming_mode" integer, "prefix" text, "suffix" text, "extension" text, "media_type" text, "modified" integer, PRIMARY KEY ("token", "path"), FOREIGN KEY ("token") REFERENCES "undo_operations" ("token") ON DELETE CASCADE );
 
-CREATE TABLE IF NOT EXISTS "aliases" ( "site_id" integer NOT NULL, "path" text NOT NULL, "kind" integer NOT NULL DEFAULT 2 CHECK ("kind" = 2), "canonical_target" text NOT NULL, "resolved_kind" integer, "resolved_hash" blob, "resolved_size" integer, PRIMARY KEY ("site_id", "path"), FOREIGN KEY ("site_id", "path", "kind") REFERENCES "site_entries" ("site_id", "path", "kind") ON DELETE CASCADE );
+CREATE TABLE IF NOT EXISTS "aliases" ( "site_id" integer NOT NULL, "path" text NOT NULL, "kind" integer NOT NULL DEFAULT 2 CHECK ("kind" = 2), "canonical_target" text NOT NULL, "resolved_kind" integer, "resolved_hash" blob, "resolved_size" integer, "modified" integer NOT NULL DEFAULT 0, PRIMARY KEY ("site_id", "path"), FOREIGN KEY ("site_id", "path", "kind") REFERENCES "site_entries" ("site_id", "path", "kind") ON DELETE CASCADE );
 
-CREATE TABLE IF NOT EXISTS "undo_alias_deltas" ( "token" text NOT NULL, "path" text NOT NULL, "existed" integer NOT NULL, "canonical_target" text, "resolved_kind" integer, "resolved_hash" blob, "resolved_size" integer, PRIMARY KEY ("token", "path"), FOREIGN KEY ("token") REFERENCES "undo_operations" ("token") ON DELETE CASCADE );
+CREATE TABLE IF NOT EXISTS "undo_alias_deltas" ( "token" text NOT NULL, "path" text NOT NULL, "existed" integer NOT NULL, "canonical_target" text, "resolved_kind" integer, "resolved_hash" blob, "resolved_size" integer, "modified" integer, PRIMARY KEY ("token", "path"), FOREIGN KEY ("token") REFERENCES "undo_operations" ("token") ON DELETE CASCADE );
 
 CREATE INDEX IF NOT EXISTS "files_hash" ON "files" ("hash");
 CREATE INDEX IF NOT EXISTS "files_site_prefix" ON "files" ("site_id", "path");
@@ -63,4 +63,4 @@ CREATE INDEX IF NOT EXISTS "aliases_dependency" ON "aliases" ("site_id", "canoni
 CREATE INDEX IF NOT EXISTS "site_events_site" ON "site_events" ("site_id", "occurred");
 CREATE INDEX IF NOT EXISTS "aliases_cache" ON "aliases" ("site_id", "resolved_kind", "resolved_hash", "resolved_size");
 
-PRAGMA user_version = 11;
+PRAGMA user_version = 12;

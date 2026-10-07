@@ -56,14 +56,15 @@ enum MigrationProgram {
     FreshV6,
     V2ToV6,
     BaselineV6,
-    FreshV11,
-    V2ToV11,
-    V6ToV11,
-    V7ToV11,
-    V8ToV11,
-    V9ToV11,
-    V10ToV11,
-    BaselineV11,
+    FreshV12,
+    V2ToV12,
+    V6ToV12,
+    V7ToV12,
+    V8ToV12,
+    V9ToV12,
+    V10ToV12,
+    V11ToV12,
+    BaselineV12,
 }
 
 pub fn migrate(db: &mut SqliteConnection) -> Result<MigrationOutcome, MigrationError> {
@@ -71,7 +72,7 @@ pub fn migrate(db: &mut SqliteConnection) -> Result<MigrationOutcome, MigrationE
     match version {
         0 => db.transaction::<_, MigrationError, _>(|connection| {
             execute(connection, &schema::schema_sql())?;
-            ensure_migration_record(connection, MigrationProgram::FreshV11)
+            ensure_migration_record(connection, MigrationProgram::FreshV12)
         }),
         2 => db.transaction::<_, MigrationError, _>(|connection| {
             execute(connection, "PRAGMA foreign_keys=OFF")?;
@@ -85,70 +86,64 @@ pub fn migrate(db: &mut SqliteConnection) -> Result<MigrationOutcome, MigrationE
             validate_v6_catalog(connection)?;
             migrate_v6_to_latest(connection)?;
             normalize_latest_catalog(connection)?;
-            ensure_migration_record(connection, MigrationProgram::V2ToV11)
+            ensure_migration_record(connection, MigrationProgram::V2ToV12)
         }),
         6 => db.transaction::<_, MigrationError, _>(|connection| {
             validate_v6_record(connection)?;
             validate_v6_catalog(connection)?;
             migrate_v6_to_latest(connection)?;
             normalize_latest_catalog(connection)?;
-            ensure_migration_record(connection, MigrationProgram::V6ToV11)
+            ensure_migration_record(connection, MigrationProgram::V6ToV12)
         }),
-        7 => db.transaction::<_, MigrationError, _>(|connection| {
-            for statement in schema::upgrade_v7_to_v8()
-                .into_iter()
-                .chain(schema::upgrade_v8_to_v9())
-                .chain(schema::upgrade_v9_to_v10())
-                .chain(schema::upgrade_v10_to_v11())
-            {
+        7..=11 => db.transaction::<_, MigrationError, _>(|connection| {
+            for statement in upgrade_from(version) {
                 execute(connection, &statement)?;
             }
             set_schema_version(connection, schema::LATEST_SCHEMA_VERSION)?;
             normalize_latest_catalog(connection)?;
-            ensure_migration_record(connection, MigrationProgram::V7ToV11)
-        }),
-        8 => db.transaction::<_, MigrationError, _>(|connection| {
-            for statement in schema::upgrade_v8_to_v9()
-                .into_iter()
-                .chain(schema::upgrade_v9_to_v10())
-                .chain(schema::upgrade_v10_to_v11())
-            {
-                execute(connection, &statement)?;
-            }
-            set_schema_version(connection, schema::LATEST_SCHEMA_VERSION)?;
-            normalize_latest_catalog(connection)?;
-            ensure_migration_record(connection, MigrationProgram::V8ToV11)
-        }),
-        9 => db.transaction::<_, MigrationError, _>(|connection| {
-            for statement in schema::upgrade_v9_to_v10()
-                .into_iter()
-                .chain(schema::upgrade_v10_to_v11())
-            {
-                execute(connection, &statement)?;
-            }
-            set_schema_version(connection, schema::LATEST_SCHEMA_VERSION)?;
-            normalize_latest_catalog(connection)?;
-            ensure_migration_record(connection, MigrationProgram::V9ToV11)
-        }),
-        10 => db.transaction::<_, MigrationError, _>(|connection| {
-            for statement in schema::upgrade_v10_to_v11() {
-                execute(connection, &statement)?;
-            }
-            set_schema_version(connection, schema::LATEST_SCHEMA_VERSION)?;
-            normalize_latest_catalog(connection)?;
-            ensure_migration_record(connection, MigrationProgram::V10ToV11)
+            ensure_migration_record(connection, upgrade_program(version))
         }),
         schema::LATEST_SCHEMA_VERSION => db.transaction::<_, MigrationError, _>(|connection| {
-            // Repairs a database that reached v11 before this normalisation
-            // existed, and is a no-op for one created fresh.
+            // Repairs a database that reached the latest version before this
+            // normalisation existed, and is a no-op for one created fresh.
             normalize_latest_catalog(connection)?;
-            ensure_migration_record(connection, MigrationProgram::BaselineV11)
+            ensure_migration_record(connection, MigrationProgram::BaselineV12)
         }),
         unsupported => return Err(MigrationError::UnsupportedVersion(unsupported)),
     }?;
     Ok(MigrationOutcome {
         upgraded_from_v2: version == 2,
     })
+}
+
+/// One schema step: the version it upgrades from, and its statements.
+type UpgradeStep = (i64, fn() -> Vec<String>);
+
+/// The statements that take a database from `version` (7 to 11) to the latest.
+fn upgrade_from(version: i64) -> Vec<String> {
+    let steps: [UpgradeStep; 5] = [
+        (7, schema::upgrade_v7_to_v8),
+        (8, schema::upgrade_v8_to_v9),
+        (9, schema::upgrade_v9_to_v10),
+        (10, schema::upgrade_v10_to_v11),
+        (11, schema::upgrade_v11_to_v12),
+    ];
+    steps
+        .into_iter()
+        .filter(|(from, _)| *from >= version)
+        .flat_map(|(_, step)| step())
+        .collect()
+}
+
+fn upgrade_program(version: i64) -> MigrationProgram {
+    match version {
+        7 => MigrationProgram::V7ToV12,
+        8 => MigrationProgram::V8ToV12,
+        9 => MigrationProgram::V9ToV12,
+        10 => MigrationProgram::V10ToV12,
+        11 => MigrationProgram::V11ToV12,
+        _ => unreachable!("no single upgrade program from version {version}"),
+    }
 }
 
 #[derive(Insertable)]
@@ -218,6 +213,7 @@ fn migrate_v6_to_latest(db: &mut SqliteConnection) -> Result<(), MigrationError>
         .chain(schema::upgrade_v8_to_v9())
         .chain(schema::upgrade_v9_to_v10())
         .chain(schema::upgrade_v10_to_v11())
+        .chain(schema::upgrade_v11_to_v12())
     {
         execute(db, &statement)?;
     }
@@ -236,8 +232,11 @@ pub fn downgrade_to_v2(db: &mut SqliteConnection) -> Result<(), MigrationError> 
     let files = files::table
         .select((files::site_id, files::path, files::hash, files::size))
         .load::<(i64, String, ContentHash, i64)>(db)?;
-    diesel::delete(metadata::table.find("schema.migration.v11")).execute(db)?;
-    for statement in schema::downgrade_v11_to_v10() {
+    diesel::delete(metadata::table.find("schema.migration.v12")).execute(db)?;
+    for statement in schema::downgrade_v12_to_v11()
+        .into_iter()
+        .chain(schema::downgrade_v11_to_v10())
+    {
         execute(db, &statement)?;
     }
     for statement in schema::downgrade_v9_to_v6_before_copy() {
@@ -274,19 +273,20 @@ fn execute(db: &mut SqliteConnection, statement: &str) -> Result<(), MigrationEr
 /// and that key is renamed on every schema bump, so each previous key is stale
 /// once a database reaches the current version. Removing them centrally keeps
 /// the list from being re-derived, and mis-derived, in each `migrate` arm.
-const SUPERSEDED_MIGRATION_RECORD_KEYS: [&str; 5] = [
+const SUPERSEDED_MIGRATION_RECORD_KEYS: [&str; 6] = [
     "schema.migration.v6",
     "schema.migration.v7",
     "schema.migration.v8",
     "schema.migration.v9",
     "schema.migration.v10",
+    "schema.migration.v11",
 ];
 
 fn ensure_migration_record(
     db: &mut SqliteConnection,
     executed_program: MigrationProgram,
 ) -> Result<(), MigrationError> {
-    const KEY: &str = "schema.migration.v11";
+    const KEY: &str = "schema.migration.v12";
     debug_assert!(
         !SUPERSEDED_MIGRATION_RECORD_KEYS.contains(&KEY),
         "the current record key must not be listed as superseded"
@@ -425,89 +425,44 @@ fn migration_program_hash(program: MigrationProgram) -> String {
         MigrationProgram::BaselineV6 => {
             format!("baseline-v6\n{}", schema::schema_v6_sql())
         }
-        MigrationProgram::FreshV11 => schema::schema_sql(),
-        MigrationProgram::V2ToV11 => {
+        MigrationProgram::FreshV12 => schema::schema_sql(),
+        MigrationProgram::V2ToV12 => {
             let mut source = schema::upgrade_v2_to_v6().join(";\n");
-            append_v7_to_v11_program(&mut source);
+            append_v7_to_latest_program(&mut source);
             source
         }
-        MigrationProgram::V6ToV11 => {
+        MigrationProgram::V6ToV12 => {
             let mut source = String::from("validated-v6");
-            append_v7_to_v11_program(&mut source);
+            append_v7_to_latest_program(&mut source);
             source
         }
-        MigrationProgram::V7ToV11 => {
-            let mut source = String::from("baseline-v7");
-            for statement in schema::upgrade_v7_to_v8()
-                .into_iter()
-                .chain(schema::upgrade_v8_to_v9())
-                .chain(schema::upgrade_v9_to_v10())
-                .chain(schema::upgrade_v10_to_v11())
-            {
-                write!(source, ";\n{statement}").expect("writing to String cannot fail");
-            }
-            write!(
-                source,
-                ";\nPRAGMA user_version = {}",
-                schema::LATEST_SCHEMA_VERSION
-            )
-            .expect("writing to String cannot fail");
-            source
-        }
-        MigrationProgram::V8ToV11 => {
-            let mut source = String::from("baseline-v8");
-            for statement in schema::upgrade_v8_to_v9()
-                .into_iter()
-                .chain(schema::upgrade_v9_to_v10())
-                .chain(schema::upgrade_v10_to_v11())
-            {
-                write!(source, ";\n{statement}").expect("writing to String cannot fail");
-            }
-            write!(
-                source,
-                ";\nPRAGMA user_version = {}",
-                schema::LATEST_SCHEMA_VERSION
-            )
-            .expect("writing to String cannot fail");
-            source
-        }
-        MigrationProgram::V9ToV11 => {
-            let mut source = String::from("baseline-v9");
-            for statement in schema::upgrade_v9_to_v10()
-                .into_iter()
-                .chain(schema::upgrade_v10_to_v11())
-            {
-                write!(source, ";\n{statement}").expect("writing to String cannot fail");
-            }
-            write!(
-                source,
-                ";\nPRAGMA user_version = {}",
-                schema::LATEST_SCHEMA_VERSION
-            )
-            .expect("writing to String cannot fail");
-            source
-        }
-        MigrationProgram::V10ToV11 => {
-            let mut source = String::from("baseline-v10");
-            for statement in schema::upgrade_v10_to_v11() {
-                write!(source, ";\n{statement}").expect("writing to String cannot fail");
-            }
-            write!(
-                source,
-                ";\nPRAGMA user_version = {}",
-                schema::LATEST_SCHEMA_VERSION
-            )
-            .expect("writing to String cannot fail");
-            source
-        }
-        MigrationProgram::BaselineV11 => {
-            format!("baseline-v11\n{}", schema::schema_sql())
+        MigrationProgram::V7ToV12 => upgrade_program_source(7),
+        MigrationProgram::V8ToV12 => upgrade_program_source(8),
+        MigrationProgram::V9ToV12 => upgrade_program_source(9),
+        MigrationProgram::V10ToV12 => upgrade_program_source(10),
+        MigrationProgram::V11ToV12 => upgrade_program_source(11),
+        MigrationProgram::BaselineV12 => {
+            format!("baseline-v12\n{}", schema::schema_sql())
         }
     };
     blake3::hash(source.as_bytes()).to_hex().to_string()
 }
 
-fn append_v7_to_v11_program(source: &mut String) {
+fn upgrade_program_source(version: i64) -> String {
+    let mut source = format!("baseline-v{version}");
+    for statement in upgrade_from(version) {
+        write!(source, ";\n{statement}").expect("writing to String cannot fail");
+    }
+    write!(
+        source,
+        ";\nPRAGMA user_version = {}",
+        schema::LATEST_SCHEMA_VERSION
+    )
+    .expect("writing to String cannot fail");
+    source
+}
+
+fn append_v7_to_latest_program(source: &mut String) {
     for statement in schema::upgrade_v6_to_v7_before_copy()
         .into_iter()
         .chain(schema::upgrade_v6_to_v7_after_backfill())
@@ -516,6 +471,7 @@ fn append_v7_to_v11_program(source: &mut String) {
         .chain(schema::upgrade_v8_to_v9())
         .chain(schema::upgrade_v9_to_v10())
         .chain(schema::upgrade_v10_to_v11())
+        .chain(schema::upgrade_v11_to_v12())
     {
         write!(source, ";\n{statement}").expect("writing to String cannot fail");
     }
@@ -977,6 +933,11 @@ mod tests {
                 execute(db, &statement).unwrap();
             }
         }
+        if version >= 11 {
+            for statement in schema::upgrade_v10_to_v11() {
+                execute(db, &statement).unwrap();
+            }
+        }
         set_schema_version(db, version).unwrap();
     }
 
@@ -1017,7 +978,7 @@ mod tests {
                 schema::LATEST_SCHEMA_VERSION
             );
             let record = metadata::table
-                .find("schema.migration.v11")
+                .find("schema.migration.v12")
                 .select(metadata::value)
                 .first::<String>(&mut db)
                 .unwrap();
@@ -1025,9 +986,9 @@ mod tests {
             assert_eq!(
                 record.program,
                 if version == 7 {
-                    MigrationProgram::V7ToV11
+                    MigrationProgram::V7ToV12
                 } else {
-                    MigrationProgram::V8ToV11
+                    MigrationProgram::V8ToV12
                 }
             );
             assert_eq!(
@@ -1173,6 +1134,7 @@ mod tests {
                 "suffix",
                 "extension",
                 "media_type",
+                "modified",
             ]
         );
         let pending_columns =
@@ -1374,20 +1336,20 @@ mod tests {
         let (_root, mut db) = connection();
         migrate(&mut db).unwrap();
         let value = metadata::table
-            .find("schema.migration.v11")
+            .find("schema.migration.v12")
             .select(metadata::value)
             .first::<String>(&mut db)
             .unwrap();
         let mut record: MigrationRecord = serde_json::from_str(&value).unwrap();
         record.schema_hash = "wrong".to_string();
-        diesel::update(metadata::table.find("schema.migration.v11"))
+        diesel::update(metadata::table.find("schema.migration.v12"))
             .set(metadata::value.eq(serde_json::to_string(&record).unwrap()))
             .execute(&mut db)
             .unwrap();
         assert!(matches!(
             migrate(&mut db),
             Err(MigrationError::Metadata(message))
-                if message == "schema checksum drift for version 11"
+                if message == "schema checksum drift for version 12"
         ));
     }
 
@@ -1419,7 +1381,7 @@ mod tests {
             "v6 upgrade diverged from a fresh catalog"
         );
 
-        for version in [7, 8, 9, 10] {
+        for version in [7, 8, 9, 10, 11] {
             let (_root, mut db) = connection();
             empty_catalog_at(&mut db, version);
             migrate(&mut db).unwrap();
@@ -1475,8 +1437,8 @@ mod tests {
              VALUES ('repair', 1, 2, 'https://symbol.example', 3, unhex('{tree}'), 0);
              INSERT INTO site_entries (site_id, path, kind)
              SELECT id, 'index.html', 0 FROM sites WHERE name = 'repair';
-             INSERT INTO files (site_id, path, kind, hash, size)
-             SELECT id, 'index.html', 0, unhex('{hash}'), 5
+             INSERT INTO files (site_id, path, kind, hash, size, modified)
+             SELECT id, 'index.html', 0, unhex('{hash}'), 5, 7
              FROM sites WHERE name = 'repair';
              INSERT INTO site_entries (site_id, path, kind)
              SELECT id, 'blob.bin', 1 FROM sites WHERE name = 'repair';
@@ -1538,7 +1500,10 @@ mod tests {
         let (_root, mut db) = connection();
         empty_catalog_at(&mut db, 10);
         db.transaction::<_, MigrationError, _>(|connection| {
-            for statement in schema::upgrade_v10_to_v11() {
+            for statement in schema::upgrade_v10_to_v11()
+                .into_iter()
+                .chain(schema::upgrade_v11_to_v12())
+            {
                 execute(connection, &statement)?;
             }
             set_schema_version(connection, schema::LATEST_SCHEMA_VERSION)
@@ -1554,6 +1519,90 @@ mod tests {
 
         normalize_latest_catalog(&mut db).unwrap();
         assert_eq!(SchemaCatalog::load(&mut db).unwrap(), expected);
+    }
+
+    #[test]
+    fn v11_entries_are_stamped_with_their_site_update_time() {
+        let (_root, mut db) = connection();
+        empty_catalog_at(&mut db, 11);
+        let hash = label_hex("v11-hash");
+        let tree = label_hex("v11-tree");
+        db.batch_execute(&format!(
+            "INSERT INTO blobs (hash, bytes, size) VALUES (unhex('{hash}'), X'', 5);
+             INSERT INTO sites
+                (name, updated, public_url, content_revision, tree_hash, management_status)
+             VALUES ('old', 1700000000000, '', 1, unhex('{tree}'), 0),
+                    ('new', 1790000000000, '', 1, unhex('{tree}'), 0);
+             INSERT INTO site_entries (site_id, path, kind)
+             SELECT id, 'index.html', 0 FROM sites;
+             INSERT INTO files (site_id, path, kind, hash, size)
+             SELECT id, 'index.html', 0, unhex('{hash}'), 5 FROM sites;
+             INSERT INTO site_entries (site_id, path, kind)
+             SELECT id, 'blob.bin', 1 FROM sites WHERE name = 'old';
+             INSERT INTO allocated_entries
+                (site_id, path, kind, hash, size, naming_mode, prefix, suffix, media_type)
+             SELECT id, 'blob.bin', 1, unhex('{hash}'), 5, 0, '', '', 'text/plain'
+             FROM sites WHERE name = 'old';
+             INSERT INTO site_entries (site_id, path, kind)
+             SELECT id, 'latest', 2 FROM sites WHERE name = 'new';
+             INSERT INTO aliases (site_id, path, kind, canonical_target)
+             SELECT id, 'latest', 2, 'index.html' FROM sites WHERE name = 'new';
+             INSERT INTO undo_operations
+                (token, kind, description, created, expires, consumed)
+             VALUES ('undo', 0, 'old', 1, 2, 0);
+             INSERT INTO undo_files (token, path, hash, size)
+             VALUES ('undo', 'index.html', unhex('{hash}'), 5);"
+        ))
+        .unwrap();
+
+        migrate(&mut db).unwrap();
+
+        let mut stamped = |sql: &str| {
+            diesel::sql_query(sql)
+                .load::<ModifiedRow>(&mut db)
+                .unwrap()
+                .into_iter()
+                .map(|row| (row.name, row.modified))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            stamped(
+                "SELECT sites.name AS name, files.modified AS modified FROM files
+                 JOIN sites ON sites.id = files.site_id ORDER BY sites.name"
+            ),
+            [
+                ("new".to_string(), Some(1_790_000_000_000)),
+                ("old".to_string(), Some(1_700_000_000_000)),
+            ]
+        );
+        assert_eq!(
+            stamped("SELECT path AS name, modified FROM allocated_entries"),
+            [("blob.bin".to_string(), Some(1_700_000_000_000))]
+        );
+        assert_eq!(
+            stamped("SELECT path AS name, modified FROM aliases"),
+            [("latest".to_string(), Some(1_790_000_000_000))]
+        );
+        assert_eq!(
+            stamped("SELECT path AS name, modified FROM undo_files"),
+            [("index.html".to_string(), None)],
+            "snapshots from before the column stay unknown"
+        );
+        let record = metadata::table
+            .find("schema.migration.v12")
+            .select(metadata::value)
+            .first::<String>(&mut db)
+            .unwrap();
+        let record: MigrationRecord = serde_json::from_str(&record).unwrap();
+        assert_eq!(record.program, MigrationProgram::V11ToV12);
+    }
+
+    #[derive(QueryableByName)]
+    struct ModifiedRow {
+        #[diesel(sql_type = Text)]
+        name: String,
+        #[diesel(sql_type = diesel::sql_types::Nullable<BigInt>)]
+        modified: Option<i64>,
     }
 
     #[test]
@@ -1586,6 +1635,14 @@ mod tests {
                 .first::<TreeHash>(&mut db)
                 .unwrap(),
             tree_before
+        );
+        assert_eq!(
+            files::table
+                .select(files::modified)
+                .first::<i64>(&mut db)
+                .unwrap(),
+            7,
+            "repair dropped modification times"
         );
         assert_eq!(
             diesel::sql_query("SELECT COUNT(*) AS count FROM pragma_foreign_key_check")
@@ -1629,7 +1686,7 @@ mod tests {
             );
             assert!(
                 metadata::table
-                    .find("schema.migration.v11")
+                    .find("schema.migration.v12")
                     .select(metadata::value)
                     .first::<String>(&mut db)
                     .is_ok(),
@@ -1643,13 +1700,13 @@ mod tests {
         let (_root, mut db) = connection();
         migrate(&mut db).unwrap();
         let value = metadata::table
-            .find("schema.migration.v11")
+            .find("schema.migration.v12")
             .select(metadata::value)
             .first::<String>(&mut db)
             .unwrap();
         let mut record: MigrationRecord = serde_json::from_str(&value).unwrap();
-        record.program = MigrationProgram::V10ToV11;
-        diesel::update(metadata::table.find("schema.migration.v11"))
+        record.program = MigrationProgram::V10ToV12;
+        diesel::update(metadata::table.find("schema.migration.v12"))
             .set(metadata::value.eq(serde_json::to_string(&record).unwrap()))
             .execute(&mut db)
             .unwrap();
@@ -1678,24 +1735,24 @@ mod tests {
         let (_fresh_root, mut fresh) = connection();
         migrate(&mut fresh).unwrap();
         let fresh_value = metadata::table
-            .find("schema.migration.v11")
+            .find("schema.migration.v12")
             .select(metadata::value)
             .first::<String>(&mut fresh)
             .unwrap();
         let fresh_record: MigrationRecord = serde_json::from_str(&fresh_value).unwrap();
-        assert_eq!(fresh_record.program, MigrationProgram::FreshV11);
+        assert_eq!(fresh_record.program, MigrationProgram::FreshV12);
 
         let (_upgrade_root, mut upgrade) = connection();
         migrate(&mut upgrade).unwrap();
         downgrade_to_v2(&mut upgrade).unwrap();
         migrate(&mut upgrade).unwrap();
         let upgrade_value = metadata::table
-            .find("schema.migration.v11")
+            .find("schema.migration.v12")
             .select(metadata::value)
             .first::<String>(&mut upgrade)
             .unwrap();
         let upgrade_record: MigrationRecord = serde_json::from_str(&upgrade_value).unwrap();
-        assert_eq!(upgrade_record.program, MigrationProgram::V2ToV11);
+        assert_eq!(upgrade_record.program, MigrationProgram::V2ToV12);
         assert_ne!(fresh_record.program_hash, upgrade_record.program_hash);
     }
 
@@ -1703,22 +1760,24 @@ mod tests {
     fn v7_and_v8_program_hashes_include_user_version_transition() {
         for (program, baseline, statements) in [
             (
-                MigrationProgram::V7ToV11,
+                MigrationProgram::V7ToV12,
                 "baseline-v7",
                 schema::upgrade_v7_to_v8()
                     .into_iter()
                     .chain(schema::upgrade_v8_to_v9())
                     .chain(schema::upgrade_v9_to_v10())
                     .chain(schema::upgrade_v10_to_v11())
+                    .chain(schema::upgrade_v11_to_v12())
                     .collect::<Vec<_>>(),
             ),
             (
-                MigrationProgram::V8ToV11,
+                MigrationProgram::V8ToV12,
                 "baseline-v8",
                 schema::upgrade_v8_to_v9()
                     .into_iter()
                     .chain(schema::upgrade_v9_to_v10())
                     .chain(schema::upgrade_v10_to_v11())
+                    .chain(schema::upgrade_v11_to_v12())
                     .collect::<Vec<_>>(),
             ),
         ] {

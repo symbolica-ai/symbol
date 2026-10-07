@@ -189,7 +189,7 @@ case "$method:$url_path" in
   GET:*/FILES|GET:*/FILES/|GET:*/FILES/*)
     if printf '%s\n' "$headers" | grep -q '^Accept: text/tab-separated-values'; then
       files_out=$(printf '%s' "$body" | python3 -c '
-import json, sys, urllib.parse
+import json, os, sys, urllib.parse
 url = sys.argv[1]
 d = json.load(sys.stdin)
 split = urllib.parse.urlsplit(url)
@@ -226,6 +226,12 @@ else:
     for a in d.get("aliases", []):
         if a["path"].startswith(prefix) and "/" not in a["path"][len(prefix):]:
             rows.append(row("alias", None, a.get("size"), a["path"][len(prefix):], a["target"]))
+# columns=modified appends when each entry last changed, unless the mock is
+# playing a server from before that column existed.
+columns = query.get("columns", [""])[0].split(",")
+if "modified" in columns and header.startswith("kind\tfiles") and not os.environ.get("MOCK_NO_DATES"):
+    header += "\tmodified"
+    rows = [r + ("\t" if r.startswith("builtin") else "\t2026-10-06T14:03:12Z") for r in rows]
 total = len(rows)
 limit = int(query["limit"][0]) if "limit" in query else None
 page = int(query["page"][0]) if "page" in query else 1
@@ -507,6 +513,41 @@ out=$(MOCK_LARGE_INVENTORY=20000 "${CLIENT}" ls hello 2>"${ROOT}/ls-err")
 [ ! -s "${ROOT}/ls-err" ] &&
   ok 'piped ls is never paged' ||
   not_ok 'piped ls is never paged'
+
+: > "${LOG}"
+out=$("${CLIENT}" ls hello)
+contains "${out}" 'index.html  10 B   2026-10-06 14:03Z' &&
+  contains "$(cat "${LOG}")" 'URL=http://mock/hello/FILES?columns=modified&sort=name' &&
+  ok 'ls asks for and prints when each entry last changed' ||
+  not_ok 'ls asks for and prints when each entry last changed'
+
+out=$(MOCK_NO_DATES=1 "${CLIENT}" ls hello)
+[ "${out}" = 'index.html  10 B' ] &&
+  ok 'ls reads a listing without dates from an older server' ||
+  not_ok 'ls reads a listing without dates from an older server'
+
+out=$("${CLIENT}" ls)
+[ "${out}" = 'hello/  2 files   10 B   2026-10-06 14:03Z
+        2 files   10 B total' ] &&
+  ok 'ls aligns site counts, sizes, dates and the total' ||
+  not_ok 'ls aligns site counts, sizes, dates and the total'
+
+: > "${LOG}"
+"${CLIENT}" ls -m hello >/dev/null
+"${CLIENT}" ls hello -S -r >/dev/null
+"${CLIENT}" ls -r hello >/dev/null
+log=$(cat "${LOG}")
+contains "${log}" 'URL=http://mock/hello/FILES?columns=modified&sort=modified' &&
+  contains "${log}" 'URL=http://mock/hello/FILES?columns=modified&sort=size&order=asc' &&
+  contains "${log}" 'URL=http://mock/hello/FILES?columns=modified&sort=name&order=desc' &&
+  ok 'ls -m, -S and -r ask the server to sort' ||
+  not_ok 'ls -m, -S and -r ask the server to sort'
+
+if "${CLIENT}" ls -R -m hello >/dev/null 2>&1; then
+  not_ok 'ls -R refuses to sort'
+else
+  ok 'ls -R refuses to sort'
+fi
 
 if "${CLIENT}" ls hello -p 2 >/dev/null 2>&1; then
   not_ok 'piped ls -p without --limit is a usage error'

@@ -167,6 +167,7 @@ pub(super) fn alias_entry(row: AliasRow) -> Result<AliasEntry, StoreError> {
         resolved_hash: row.resolved_hash.map(ContentHash::to_wire),
         resolved_size: row.resolved_size.map(i64::cast_unsigned),
         resolved_files: None,
+        modified: row.modified,
     })
 }
 
@@ -890,32 +891,35 @@ pub(super) fn load_alias_directory_files(
     name: &str,
     logical: &str,
     target: &str,
-) -> Result<Vec<(String, u64)>, StoreError> {
+) -> Result<Vec<ListedFile>, StoreError> {
     let site_id = site_id_locked(db, name)?;
     let (start, end) = descendant_bounds(target);
     let mut rows = files::table
         .filter(files::site_id.eq(site_id))
         .filter(files::path.ge(&start))
         .filter(files::path.lt(&end))
-        .select((files::path, files::size))
-        .load::<(String, i64)>(db)?;
+        .select((files::path, files::size, files::modified))
+        .load::<(String, i64, i64)>(db)?;
     record_alias_listed_file_rows(rows.len());
     let allocated_rows = allocated_entries::table
         .filter(allocated_entries::site_id.eq(site_id))
         .filter(allocated_entries::path.ge(&start))
         .filter(allocated_entries::path.lt(&end))
-        .select((allocated_entries::path, allocated_entries::size))
-        .load::<(String, i64)>(db)?;
+        .select((
+            allocated_entries::path,
+            allocated_entries::size,
+            allocated_entries::modified,
+        ))
+        .load::<(String, i64, i64)>(db)?;
     record_alias_listed_allocated_rows(allocated_rows.len());
     rows.extend(allocated_rows);
     rows.sort_unstable_by(|left, right| left.0.cmp(&right.0));
     Ok(rows
         .into_iter()
-        .map(|(path, size)| {
-            (
-                format!("{logical}{}", &path[target.len()..]),
-                size.cast_unsigned(),
-            )
+        .map(|(path, size, modified)| ListedFile {
+            path: format!("{logical}{}", &path[target.len()..]),
+            size: size.cast_unsigned(),
+            modified,
         })
         .collect())
 }
@@ -1214,6 +1218,7 @@ impl Store {
                     aliases::resolved_kind.eq(Option::<i64>::None),
                     aliases::resolved_hash.eq(Option::<ContentHash>::None),
                     aliases::resolved_size.eq(Option::<i64>::None),
+                    aliases::modified.eq(now),
                 ))
                 .on_conflict((aliases::site_id, aliases::path))
                 .do_update()
@@ -1222,6 +1227,7 @@ impl Store {
                     aliases::resolved_kind.eq(Option::<i64>::None),
                     aliases::resolved_hash.eq(Option::<ContentHash>::None),
                     aliases::resolved_size.eq(Option::<i64>::None),
+                    aliases::modified.eq(now),
                 ))
                 .execute(&mut *tx)?;
         }

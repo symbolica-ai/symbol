@@ -237,6 +237,7 @@ struct UndoAllocatedMetadata {
     suffix: Option<String>,
     extension: Option<String>,
     media_type: Option<String>,
+    modified: Option<i64>,
 }
 
 #[derive(Clone, Copy)]
@@ -899,11 +900,11 @@ impl Store {
     pub fn list_sites(&self) -> Result<SiteList, StoreError> {
         let mut db = self.inner.readers.get();
         let site_rows = sites::table
-            .select((sites::id, sites::name))
+            .select((sites::id, sites::name, sites::updated))
             .order(sites::name)
-            .load::<(i64, String)>(&mut *db)?;
+            .load::<(i64, String, i64)>(&mut *db)?;
         let mut entries = Vec::with_capacity(site_rows.len());
-        for (site_id, name) in site_rows {
+        for (site_id, name, updated) in site_rows {
             let mut sizes = files::table
                 .filter(files::site_id.eq(site_id))
                 .filter(files::path.ne(MANIFEST_PATH))
@@ -919,6 +920,7 @@ impl Store {
                 name,
                 files: u64::try_from(sizes.len()).expect("file count fits in u64"),
                 bytes: sizes.into_iter().map(i64::cast_unsigned).sum(),
+                modified: updated,
             });
         }
         let files = entries.iter().map(|entry| entry.files).sum();
@@ -2049,56 +2051,72 @@ fn node_locked(db: &mut SqliteConnection, name: &str, rel: &str) -> Result<NodeK
     )
 }
 
-fn load_root_files(
-    db: &mut SqliteConnection,
-    name: &str,
-) -> Result<Vec<(String, u64)>, StoreError> {
+/// One stored file under a listed directory.
+struct ListedFile {
+    path: String,
+    size: u64,
+    /// Unix milliseconds.
+    modified: i64,
+}
+
+fn listed_files(mut rows: Vec<(String, i64, i64)>) -> Vec<ListedFile> {
+    rows.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    rows.into_iter()
+        .map(|(path, size, modified)| ListedFile {
+            path,
+            size: size.cast_unsigned(),
+            modified,
+        })
+        .collect()
+}
+
+fn load_root_files(db: &mut SqliteConnection, name: &str) -> Result<Vec<ListedFile>, StoreError> {
     let site_id = site_id_locked(db, name)?;
     let mut rows = files::table
         .filter(files::site_id.eq(site_id))
-        .select((files::path, files::size))
+        .select((files::path, files::size, files::modified))
         .order(files::path)
-        .load::<(String, i64)>(db)?;
+        .load::<(String, i64, i64)>(db)?;
     rows.extend(
         allocated_entries::table
             .filter(allocated_entries::site_id.eq(site_id))
-            .select((allocated_entries::path, allocated_entries::size))
-            .load::<(String, i64)>(db)?,
+            .select((
+                allocated_entries::path,
+                allocated_entries::size,
+                allocated_entries::modified,
+            ))
+            .load::<(String, i64, i64)>(db)?,
     );
-    rows.sort_unstable_by(|left, right| left.0.cmp(&right.0));
-    Ok(rows
-        .into_iter()
-        .map(|(path, size)| (path, size.cast_unsigned()))
-        .collect())
+    Ok(listed_files(rows))
 }
 
 fn load_descendant_files(
     db: &mut SqliteConnection,
     name: &str,
     rel: &str,
-) -> Result<Vec<(String, u64)>, StoreError> {
+) -> Result<Vec<ListedFile>, StoreError> {
     let site_id = site_id_locked(db, name)?;
     let (prefix_start, prefix_end) = descendant_bounds(rel);
     let mut rows = files::table
         .filter(files::site_id.eq(site_id))
         .filter(files::path.ge(&prefix_start))
         .filter(files::path.lt(&prefix_end))
-        .select((files::path, files::size))
+        .select((files::path, files::size, files::modified))
         .order(files::path)
-        .load::<(String, i64)>(db)?;
+        .load::<(String, i64, i64)>(db)?;
     rows.extend(
         allocated_entries::table
             .filter(allocated_entries::site_id.eq(site_id))
             .filter(allocated_entries::path.ge(&prefix_start))
             .filter(allocated_entries::path.lt(&prefix_end))
-            .select((allocated_entries::path, allocated_entries::size))
-            .load::<(String, i64)>(db)?,
+            .select((
+                allocated_entries::path,
+                allocated_entries::size,
+                allocated_entries::modified,
+            ))
+            .load::<(String, i64, i64)>(db)?,
     );
-    rows.sort_unstable_by(|left, right| left.0.cmp(&right.0));
-    Ok(rows
-        .into_iter()
-        .map(|(path, size)| (path, size.cast_unsigned()))
-        .collect())
+    Ok(listed_files(rows))
 }
 
 fn descendant_bounds(rel: &str) -> (String, String) {
@@ -2163,7 +2181,7 @@ fn distribution(sorted: &[u64]) -> SizeDistribution {
     }
 }
 
-fn dirents(files: &[(String, u64)], rel: &str) -> DirList {
+fn dirents(files: &[ListedFile], rel: &str) -> DirList {
     let prefix = if rel.is_empty() {
         String::new()
     } else {
@@ -2173,7 +2191,12 @@ fn dirents(files: &[(String, u64)], rel: &str) -> DirList {
     let mut direct: Vec<DirEnt> = Vec::new();
     let mut total_files = 0;
     let mut total_bytes = 0;
-    for (path, size) in files {
+    for ListedFile {
+        path,
+        size,
+        modified,
+    } in files
+    {
         if is_noise_path(Path::new(path)) {
             continue;
         }
@@ -2193,17 +2216,20 @@ fn dirents(files: &[(String, u64)], rel: &str) -> DirList {
                     name: dir.to_string(),
                     files: 0,
                     bytes: 0,
+                    modified: i64::MIN,
                 });
             }
             let entry = dirs.last_mut().unwrap();
             entry.files += 1;
             entry.bytes += size;
+            entry.modified = entry.modified.max(*modified);
         } else {
             direct.push(DirEnt {
                 kind: EntryKind::File,
                 name: rest.to_string(),
                 files: 1,
                 bytes: *size,
+                modified: *modified,
             });
         }
     }
