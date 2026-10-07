@@ -170,6 +170,9 @@ await fetch("/report", { method: "POST", body: result.textContent });
                 XDG_CACHE_HOME: cache,
                 XDG_CONFIG_HOME: config,
             },
+            // Its own process group, so that stopping it reaches the renderer
+            // and GPU helpers too, not only the browser process.
+            detached: true,
             stdio: ["ignore", "ignore", "pipe"],
         });
         let browserLog = "";
@@ -180,6 +183,16 @@ await fetch("/report", { method: "POST", body: result.textContent });
             browser.once("exit", (code) => resolve(`Chromium exited ${code}`));
             browser.once("error", (error) => resolve(`Chromium failed to start: ${error.message}`));
         });
+        const stopBrowser = async () => {
+            if (browser.pid !== undefined) {
+                try {
+                    process.kill(-browser.pid, "SIGKILL");
+                } catch (error) {
+                    if (error.code !== "ESRCH") throw error;
+                }
+            }
+            await exited;
+        };
         let timer;
         const timedOut = new Promise((resolve) => {
             timer = setTimeout(() => resolve("timeout"), 60_000);
@@ -189,12 +202,14 @@ await fetch("/report", { method: "POST", body: result.textContent });
             outcome = await Promise.race([reported, exited, timedOut]);
         } finally {
             clearTimeout(timer);
-            browser.kill("SIGKILL");
+            await stopBrowser();
         }
         assert.equal(outcome, "pass", `browser page reported: ${outcome}\n${browserLog}`);
         console.log("browser SDK smoke (headless Chromium): ok");
     } finally {
-        await rm(profile, { recursive: true, force: true });
+        // A helper can still be closing files for a moment after the group
+        // is killed; retrying covers that instead of failing a passed test.
+        await rm(profile, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
         await new Promise((resolveStop, rejectStop) => {
             server.close((error) => error === undefined ? resolveStop() : rejectStop(error));
             server.closeAllConnections();
