@@ -141,12 +141,7 @@ pub(super) fn finish_entry_mutation(
     paths: &[&str],
     now: i64,
 ) -> Result<(), StoreError> {
-    diesel::update(sites::table.find(site_id))
-        .set((
-            sites::updated.eq(now),
-            sites::content_revision.eq(sites::content_revision + 1),
-        ))
-        .execute(tx)?;
+    bump_revision_and_touch_locked(tx, site_id, now)?;
     record_site_event(tx, site_id, StoredSiteEventKind::Publish, paths.len(), now)?;
     let alias_changes = paths
         .iter()
@@ -229,34 +224,26 @@ pub(super) fn splice_request_fingerprint(
     splices: &[PreparedSplice],
     expected_tree_hash: Option<&str>,
 ) -> String {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"symbol-splice-request-v1\0");
-    for value in [site, path, base_hash] {
-        hasher.update(&(value.len() as u64).to_le_bytes());
-        hasher.update(value.as_bytes());
-    }
-    hasher.update(expected_tree_hash.unwrap_or("").as_bytes());
+    let mut fingerprint = Fingerprint::new("symbol-splice-request-v1")
+        .len_prefixed(site)
+        .len_prefixed(path)
+        .len_prefixed(base_hash)
+        .raw(expected_tree_hash.unwrap_or(""));
     for splice in splices {
-        hasher.update(&splice.offset.to_le_bytes());
-        hasher.update(&splice.delete.to_le_bytes());
-        match &splice.insert {
-            PreparedSpliceSource::Empty => {
-                hasher.update(&[0]);
-            }
+        fingerprint = fingerprint.u64_le(splice.offset).u64_le(splice.delete);
+        fingerprint = match &splice.insert {
+            PreparedSpliceSource::Empty => fingerprint.tag(0),
             #[cfg(test)]
-            PreparedSpliceSource::Bytes(bytes) => {
-                hasher.update(&[1]);
-                hasher.update(&(bytes.len() as u64).to_le_bytes());
-                hasher.update(blake3::hash(bytes).as_bytes());
-            }
+            PreparedSpliceSource::Bytes(bytes) => fingerprint
+                .tag(1)
+                .u64_le(bytes.len() as u64)
+                .raw(blake3::hash(bytes).as_bytes()),
             PreparedSpliceSource::File { size, hash, .. } => {
-                hasher.update(&[2]);
-                hasher.update(&size.to_le_bytes());
-                hasher.update(hash.to_hex().as_bytes());
+                fingerprint.tag(2).u64_le(*size).raw(hash.to_hex())
             }
-        }
+        };
     }
-    hasher.finalize().to_hex().to_string()
+    fingerprint.finish()
 }
 
 pub(super) fn splice_blob_to_path(
@@ -405,21 +392,17 @@ pub(super) fn staged_entries_fingerprint(
 ) -> String {
     let mut files = files.to_vec();
     files.sort_unstable_by(|left, right| left.path.cmp(&right.path));
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"symbol-unnamed-put-v1\0");
+    let mut fingerprint = Fingerprint::new("symbol-unnamed-put-v1");
     for file in files {
-        hasher.update(&(file.path.len() as u64).to_le_bytes());
-        hasher.update(file.path.as_bytes());
-        hasher.update(file.hash.as_ref());
+        fingerprint = fingerprint.len_prefixed(&file.path).raw(file.hash);
     }
     for alias in archive_aliases {
-        hasher.update(b"\0alias\0");
-        hasher.update(&(alias.path.len() as u64).to_le_bytes());
-        hasher.update(alias.path.as_bytes());
-        hasher.update(&(alias.target.len() as u64).to_le_bytes());
-        hasher.update(alias.target.as_bytes());
+        fingerprint = fingerprint
+            .raw("\0alias\0")
+            .len_prefixed(alias.path)
+            .len_prefixed(alias.target);
     }
-    hasher.finalize().to_hex().to_string()
+    fingerprint.finish()
 }
 
 pub(super) fn sanitized_counts(files: &[&StagedFile]) -> TokenCounts {
@@ -438,26 +421,11 @@ pub(super) fn idempotency_replay(
     fingerprint: &str,
     kind: IdempotencyKind,
 ) -> Result<Option<PublishedMutation>, StoreError> {
-    let key_hash = idempotency_key_hash(key);
-    let record = idempotency_records::table
-        .find(key_hash)
-        .select((
-            idempotency_records::fingerprint,
-            idempotency_records::operation_kind,
-            idempotency_records::result_metadata,
-        ))
-        .first::<(String, i64, String)>(tx)
-        .optional()?;
-    let Some((stored_fingerprint, stored_kind, metadata)) = record else {
-        return Ok(None);
-    };
-    if stored_fingerprint != fingerprint || stored_kind != kind as i64 {
-        return Err(StoreError::IdempotencyConflict);
+    let mut replay = replay_record::<PublishedMutation>(tx, key, kind, Some(fingerprint))?;
+    if let Some(replay) = &mut replay {
+        replay.mutation.replayed = true;
     }
-    let mut replay: PublishedMutation = serde_json::from_str(&metadata)
-        .map_err(|err| StoreError::Io(io::Error::new(io::ErrorKind::InvalidData, err)))?;
-    replay.mutation.replayed = true;
-    Ok(Some(replay))
+    Ok(replay)
 }
 
 pub(super) fn store_idempotency(
@@ -468,18 +436,7 @@ pub(super) fn store_idempotency(
     result: &PublishedMutation,
     now: i64,
 ) -> Result<(), StoreError> {
-    let metadata = serde_json::to_string(result)
-        .map_err(|err| StoreError::Io(io::Error::new(io::ErrorKind::InvalidData, err)))?;
-    diesel::insert_into(idempotency_records::table)
-        .values((
-            idempotency_records::key_hash.eq(idempotency_key_hash(key)),
-            idempotency_records::fingerprint.eq(fingerprint),
-            idempotency_records::operation_kind.eq(kind as i64),
-            idempotency_records::result_metadata.eq(metadata),
-            idempotency_records::expires.eq(now + IDEMPOTENCY_RETENTION_MILLIS),
-        ))
-        .execute(tx)?;
-    Ok(())
+    store_record(tx, key, kind, fingerprint, result, now)
 }
 
 pub(super) fn entry_mutation_fingerprint(
@@ -490,19 +447,14 @@ pub(super) fn entry_mutation_fingerprint(
     kind: UndoKind,
     expected_tree_hash: Option<&str>,
 ) -> String {
-    let hash_hex = hash.to_hex();
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"symbol-entry-mutation-v1\0");
-    hasher.update(name.as_bytes());
-    hasher.update(&[0]);
-    hasher.update(current_path.unwrap_or("").as_bytes());
-    hasher.update(&[0]);
-    hasher.update(destination.as_bytes());
-    hasher.update(&[0]);
-    hasher.update(hash_hex.as_bytes());
-    hasher.update(expected_tree_hash.unwrap_or("").as_bytes());
-    hasher.update(&(kind as i64).to_le_bytes());
-    hasher.finalize().to_hex().to_string()
+    Fingerprint::new("symbol-entry-mutation-v1")
+        .separated(name)
+        .separated(current_path.unwrap_or(""))
+        .separated(destination)
+        .raw(hash.to_hex())
+        .raw(expected_tree_hash.unwrap_or(""))
+        .i64_le(kind as i64)
+        .finish()
 }
 
 pub(super) fn content_mutation_request_fingerprint(
@@ -513,21 +465,14 @@ pub(super) fn content_mutation_request_fingerprint(
     expected_tree_hash: Option<&str>,
     kind: UndoKind,
 ) -> String {
-    let hash_hex = hash.to_hex();
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"symbol-content-mutation-request-v1\0");
-    for value in [
-        name,
-        current_path,
-        hash_hex.as_str(),
-        expected_content_hash.unwrap_or(""),
-        expected_tree_hash.unwrap_or(""),
-    ] {
-        hasher.update(&(value.len() as u64).to_le_bytes());
-        hasher.update(value.as_bytes());
-    }
-    hasher.update(&(kind as i64).to_le_bytes());
-    hasher.finalize().to_hex().to_string()
+    Fingerprint::new("symbol-content-mutation-request-v1")
+        .len_prefixed(name)
+        .len_prefixed(current_path)
+        .len_prefixed(&hash.to_hex())
+        .len_prefixed(expected_content_hash.unwrap_or(""))
+        .len_prefixed(expected_tree_hash.unwrap_or(""))
+        .i64_le(kind as i64)
+        .finish()
 }
 
 pub(super) fn entry_mutation_replay(
@@ -535,32 +480,25 @@ pub(super) fn entry_mutation_replay(
     idempotency: Option<&Idempotency>,
     fingerprint: &str,
 ) -> Result<Option<AllocatedFile>, StoreError> {
-    let Some(idempotency) = idempotency else {
+    let Some(key) = validated_key(idempotency)? else {
         return Ok(None);
     };
-    validate_idempotency_key(&idempotency.key)?;
-    let record = idempotency_records::table
-        .find(idempotency_key_hash(&idempotency.key))
-        .select((
-            idempotency_records::fingerprint,
-            idempotency_records::operation_kind,
-            idempotency_records::result_metadata,
-        ))
-        .first::<(String, i64, String)>(tx)
-        .optional()?;
-    let Some((stored_fingerprint, stored_kind, metadata)) = record else {
-        return Ok(None);
-    };
-    if stored_fingerprint != fingerprint || stored_kind != IdempotencyKind::EntryMutation as i64 {
-        return Err(StoreError::IdempotencyConflict);
-    }
-    let mut record: EntryMutationRecord = serde_json::from_str(&metadata)
-        .map_err(|error| StoreError::Io(io::Error::new(io::ErrorKind::InvalidData, error)))?;
-    record.result.replayed = true;
-    if let Some(mutation) = &mut record.result.mutation {
+    let record = replay_record::<EntryMutationRecord>(
+        tx,
+        key,
+        IdempotencyKind::EntryMutation,
+        Some(fingerprint),
+    )?;
+    Ok(record.map(mark_entry_mutation_replayed))
+}
+
+fn mark_entry_mutation_replayed(record: EntryMutationRecord) -> AllocatedFile {
+    let mut result = record.result;
+    result.replayed = true;
+    if let Some(mutation) = &mut result.mutation {
         mutation.replayed = true;
     }
-    Ok(Some(record.result))
+    result
 }
 
 pub(super) fn entry_mutation_request_replay(
@@ -568,34 +506,18 @@ pub(super) fn entry_mutation_request_replay(
     idempotency: Option<&Idempotency>,
     request_fingerprint: &str,
 ) -> Result<Option<AllocatedFile>, StoreError> {
-    let Some(idempotency) = idempotency else {
+    let Some(key) = validated_key(idempotency)? else {
         return Ok(None);
     };
-    validate_idempotency_key(&idempotency.key)?;
-    let record = idempotency_records::table
-        .find(idempotency_key_hash(&idempotency.key))
-        .select((
-            idempotency_records::operation_kind,
-            idempotency_records::result_metadata,
-        ))
-        .first::<(i64, String)>(tx)
-        .optional()?;
-    let Some((stored_kind, metadata)) = record else {
+    let Some(record) =
+        replay_record::<EntryMutationRecord>(tx, key, IdempotencyKind::EntryMutation, None)?
+    else {
         return Ok(None);
     };
-    if stored_kind != IdempotencyKind::EntryMutation as i64 {
-        return Err(StoreError::IdempotencyConflict);
-    }
-    let mut record: EntryMutationRecord = serde_json::from_str(&metadata)
-        .map_err(|error| StoreError::Io(io::Error::new(io::ErrorKind::InvalidData, error)))?;
     if record.request_fingerprint != request_fingerprint {
         return Err(StoreError::IdempotencyConflict);
     }
-    record.result.replayed = true;
-    if let Some(mutation) = &mut record.result.mutation {
-        mutation.replayed = true;
-    }
-    Ok(Some(record.result))
+    Ok(Some(mark_entry_mutation_replayed(record)))
 }
 
 pub(super) fn store_entry_mutation(
@@ -619,21 +541,18 @@ pub(super) fn store_entry_mutation_with_request(
     let Some(idempotency) = idempotency else {
         return Ok(());
     };
-    let metadata = serde_json::to_string(&EntryMutationRecord {
+    let record = EntryMutationRecord {
         result: result.clone(),
         request_fingerprint: request_fingerprint.to_string(),
-    })
-    .map_err(|error| StoreError::Io(io::Error::new(io::ErrorKind::InvalidData, error)))?;
-    diesel::insert_into(idempotency_records::table)
-        .values((
-            idempotency_records::key_hash.eq(idempotency_key_hash(&idempotency.key)),
-            idempotency_records::fingerprint.eq(fingerprint),
-            idempotency_records::operation_kind.eq(IdempotencyKind::EntryMutation as i64),
-            idempotency_records::result_metadata.eq(metadata),
-            idempotency_records::expires.eq(now + IDEMPOTENCY_RETENTION_MILLIS),
-        ))
-        .execute(tx)?;
-    Ok(())
+    };
+    store_record(
+        tx,
+        &idempotency.key,
+        IdempotencyKind::EntryMutation,
+        fingerprint,
+        &record,
+        now,
+    )
 }
 
 pub(super) fn prune_idempotency_locked(
@@ -766,14 +685,7 @@ pub(super) fn regenerate_site(
     }
     let staged = stage_bytes(MANIFEST_PATH, manifest.as_bytes());
     blobs.put_bytes(staged.hash, manifest.as_bytes())?;
-    diesel::insert_into(blobs::table)
-        .values((
-            blobs::hash.eq(staged.hash),
-            blobs::bytes.eq(Vec::<u8>::new()),
-            blobs::size.eq(staged.size),
-        ))
-        .on_conflict_do_nothing()
-        .execute(tx)?;
+    ensure_blob_locked(tx, &staged)?;
     ensure_file_entry(tx, site_id, MANIFEST_PATH)?;
     diesel::insert_into(files::table)
         .values(NewFile {
@@ -1174,83 +1086,11 @@ impl Store {
         source: PathBuf,
         options: PublishOptions<'_>,
     ) -> Result<(String, MutationResult), StoreError> {
-        let rel = safe_rel_path(filename)?
-            .to_string_lossy()
-            .replace('\\', "/");
+        let rel = normalize_nonempty_rel(filename)?;
         let Some(staged) = stage_file(&rel, source)? else {
             return Err(UploadError::Junk.into());
         };
         self.publish_staged(wanted, std::slice::from_ref(&staged), options)
-    }
-
-    #[cfg(test)]
-    pub fn replace_site(
-        &self,
-        name: &str,
-        bytes: &[u8],
-        kind: Kind,
-        filename: Option<&str>,
-        unpack: bool,
-    ) -> Result<usize, StoreError> {
-        let name = parse_site_name(name)?.to_string();
-        let tmp = self.tmp_dir(&name);
-        if tmp.exists() {
-            fs::remove_dir_all(&tmp)?;
-        }
-        fs::create_dir_all(&tmp)?;
-        match write_payload(&tmp, bytes, kind, filename, unpack) {
-            Ok(_) => {}
-            Err(err) => {
-                let _ = fs::remove_dir_all(&tmp);
-                return Err(err.into());
-            }
-        }
-        let staged = match stage_dir(&tmp) {
-            Ok(files) if !files.is_empty() => files,
-            Ok(_) => {
-                let _ = fs::remove_dir_all(&tmp);
-                return Err(UploadError::EmptyArchive.into());
-            }
-            Err(err) => {
-                let _ = fs::remove_dir_all(&tmp);
-                return Err(err.into());
-            }
-        };
-        let n = staged.len();
-        let result = self.merge_staged(&name, &staged, UndoKind::Put);
-        let _ = fs::remove_dir_all(&tmp);
-        result?;
-        Ok(n)
-    }
-
-    #[cfg(test)]
-    pub fn put_file(&self, name: &str, rel: &str, bytes: &[u8]) -> Result<(), StoreError> {
-        let name = parse_site_name(name)?.to_string();
-        let rel = safe_rel_path(rel)?.to_string_lossy().replace('\\', "/");
-        if is_junk(Path::new(&rel), Some(bytes)) {
-            return Err(UploadError::Junk.into());
-        }
-        let staged = stage_bytes(&rel, bytes);
-        self.upsert_file(&name, &staged).map(|_| ())
-    }
-
-    #[cfg(test)]
-    pub fn put_uploaded_file(
-        &self,
-        name: &str,
-        rel: &str,
-        source: PathBuf,
-        expected_tree_hash: Option<&str>,
-    ) -> Result<MutationResult, StoreError> {
-        self.put_uploaded_file_secured(
-            name,
-            rel,
-            source,
-            PublishOptions {
-                expected_tree_hash,
-                ..PublishOptions::default()
-            },
-        )
     }
 
     #[expect(clippy::large_types_passed_by_value)]
@@ -1262,7 +1102,7 @@ impl Store {
         options: PublishOptions<'_>,
     ) -> Result<MutationResult, StoreError> {
         let name = parse_site_name(name)?.to_string();
-        let rel = safe_rel_path(rel)?.to_string_lossy().replace('\\', "/");
+        let rel = normalize_nonempty_rel(rel)?;
         let Some(staged) = stage_file(&rel, source)? else {
             return Err(UploadError::Junk.into());
         };
@@ -1339,25 +1179,6 @@ impl Store {
                 UndoKind::Replace,
             )
         }
-    }
-
-    #[cfg(test)]
-    pub fn splice_file(
-        &self,
-        name: &str,
-        path: &str,
-        base_hash: &str,
-        splices: &[Splice<'_>],
-        options: FileMutationOptions<'_>,
-    ) -> Result<AllocatedFile, StoreError> {
-        self.splice_file_with_limit(
-            name,
-            path,
-            base_hash,
-            splices,
-            options,
-            MAX_SPLICE_RESULT_SIZE,
-        )
     }
 
     #[expect(clippy::too_many_arguments)]
@@ -1441,37 +1262,6 @@ impl Store {
         }
     }
 
-    #[cfg(test)]
-    pub fn pop_site(&self, name: &str) -> Result<Vec<u8>, StoreError> {
-        let name = parse_site_name(name)?;
-        let mut db = self.inner.writer.lock().unwrap();
-        let mut tx = DbTransaction::begin(&mut db)?;
-        let archive = site_files(&mut tx, &self.inner.blob_files, name)?;
-        let packed = pack_tar_gz(&archive.files)?;
-        snapshot_site(&mut tx, name, UndoKind::DeleteSite, self.now_millis())?;
-        retain_management_tombstone(&mut tx, name, self.now_millis())?;
-        diesel::delete(sites::table.filter(sites::name.eq(name))).execute(&mut *tx)?;
-        let removed = gc_blobs(&mut tx, self.now_millis())?;
-        tx.commit()?;
-        drop(db);
-        self.remove_blob_files(&removed);
-        Ok(packed)
-    }
-
-    #[cfg(test)]
-    pub fn pack_site(&self, name: &str, format: ArchiveFormat) -> Result<Vec<u8>, StoreError> {
-        let name = parse_site_name(name)?;
-        let mut db = self.inner.readers.get();
-        let archive = site_files(&mut db, &self.inner.blob_files, name)?;
-        drop(db);
-        match format {
-            ArchiveFormat::Tar => pack_tar(&archive.files),
-            ArchiveFormat::TarGz => pack_tar_gz(&archive.files),
-            ArchiveFormat::Zip => pack_zip(&archive.files),
-        }
-        .map_err(StoreError::Io)
-    }
-
     pub fn pack_site_to_path(
         &self,
         name: &str,
@@ -1494,41 +1284,23 @@ impl Store {
         authorization: Option<&ManagementToken>,
     ) -> Result<PopResult, StoreError> {
         let name = parse_site_name(name)?;
-        let mut db = self.inner.writer.lock().unwrap();
-        let entries = site_manifest(&mut db, name)?;
-        write_site_archive(&self.inner.blob_files, &entries, format, output)?;
-        let mut tx = DbTransaction::begin(&mut db)?;
-        authorize_locked(&mut tx, name, authorization)?;
-        let undo = snapshot_site(&mut tx, name, UndoKind::DeleteSite, self.now_millis())?;
-        retain_management_tombstone(&mut tx, name, self.now_millis())?;
-        diesel::delete(sites::table.filter(sites::name.eq(name))).execute(&mut *tx)?;
-        prune_undo_locked(&mut tx, self.now_millis())?;
-        let removed = gc_blobs(&mut tx, self.now_millis())?;
-        tx.commit()?;
-        drop(db);
-        self.remove_blob_files(&removed);
+        let undo = self.write(|tx| {
+            let entries = site_manifest(tx, name)?;
+            write_site_archive(&self.inner.blob_files, &entries, format, output)?;
+            authorize_locked(tx, name, authorization)?;
+            let undo = snapshot_site(tx, name, UndoKind::DeleteSite, self.now_millis())?;
+            retain_management_tombstone(tx, name, self.now_millis())?;
+            diesel::delete(sites::table.filter(sites::name.eq(name))).execute(&mut *tx)?;
+            prune_undo_locked(tx, self.now_millis())?;
+            let removed = gc_blobs(tx, self.now_millis())?;
+            Ok((undo, removed))
+        })?;
         Ok(PopResult {
             size: fs::metadata(output)?.len(),
             undo,
         })
     }
 
-    #[cfg(test)]
-    pub fn copy_site(
-        &self,
-        source: &str,
-        destination: Option<&str>,
-        idempotency: Option<&Idempotency>,
-    ) -> Result<(String, MutationResult), StoreError> {
-        self.copy_site_secured(
-            source,
-            destination,
-            idempotency,
-            CreationSecurity::default(),
-        )
-    }
-
-    #[expect(clippy::too_many_lines)]
     pub fn copy_site_secured(
         &self,
         source: &str,
@@ -1543,239 +1315,89 @@ impl Store {
             .map(str::to_string);
         let now = self.now_millis();
         let fingerprint = format!("copy:{source}");
-        let mut db = self.inner.writer.lock().unwrap();
-        let mut tx = DbTransaction::begin(&mut db)?;
-        prune_idempotency_locked(&mut tx, now)?;
-        if !site_exists_locked(&mut tx, source)? {
-            return Err(StoreError::NotFound);
-        }
-        if destination.is_none()
-            && let Some(idempotency) = idempotency
-        {
-            validate_idempotency_key(&idempotency.key)?;
-            if let Some(replay) = idempotency_replay(
-                &mut tx,
-                &idempotency.key,
-                &fingerprint,
-                IdempotencyKind::AutoCopy,
-            )? {
-                return Ok((replay.name, replay.mutation));
+        self.write_outcome(|tx| {
+            prune_idempotency_locked(tx, now)?;
+            require_site_locked(tx, source)?;
+            if destination.is_none()
+                && let Some(idempotency) = idempotency
+            {
+                validate_idempotency_key(&idempotency.key)?;
+                if let Some(replay) = idempotency_replay(
+                    tx,
+                    &idempotency.key,
+                    &fingerprint,
+                    IdempotencyKind::AutoCopy,
+                )? {
+                    return Ok(TxOutcome::Rollback((replay.name, replay.mutation)));
+                }
             }
-        }
-        let generated = destination.is_none();
-        let existing_names = sites::table
-            .select(sites::name)
-            .load::<String>(&mut *tx)?
-            .into_iter()
-            .collect::<HashSet<_>>();
-        let destination = destination
-            .unwrap_or_else(|| generate_id(|candidate| existing_names.contains(candidate)));
-        if site_exists_locked(&mut tx, &destination)? {
-            return Err(StoreError::DestinationConflict);
-        }
-        let (source_id, public_url, revision) = sites::table
-            .filter(sites::name.eq(source))
-            .select((sites::id, sites::public_url, sites::content_revision))
-            .first::<(i64, String, i64)>(&mut *tx)?;
-        let undo = snapshot_site_with_description(
-            &mut tx,
-            &destination,
-            UndoKind::Copy,
-            &format!("remove copied site {destination}"),
-            now,
-        )?;
-        let destination_id = diesel::insert_into(sites::table)
-            .values(NewSite {
-                name: &destination,
-                created: Some(now),
-                updated: now,
-                public_url: &public_url,
-                content_revision: revision,
-                tree_hash: TreeHash::EMPTY,
-                creator_kind: creation.creator.map(|creator| creator.kind as i64),
-                creator_hash: creation.creator.map(|creator| creator.hash.to_vec()),
-                claim_hash: creation.claim_hash.map(|hash| hash.as_bytes().to_vec()),
-                management_hash: creation
-                    .management_hash
-                    .map(|hash| hash.as_bytes().to_vec()),
-                management_status: i64::from(creation.management_hash.is_some()),
-            })
-            .returning(sites::id)
-            .get_result::<i64>(&mut *tx)?;
-        let copied_files = files::table
-            .filter(files::site_id.eq(source_id))
-            .filter(files::path.ne(MANIFEST_PATH))
-            .select((files::path, files::hash, files::size, files::modified))
-            .load::<(String, ContentHash, i64, i64)>(&mut *tx)?;
-        // A copy keeps each entry's modification time: the content did not
-        // change, it only gained a second home.
-        for (path, hash, size, modified) in copied_files {
-            ensure_file_entry(&mut tx, destination_id, &path)?;
-            diesel::insert_into(files::table)
-                .values(NewFile {
-                    site_id: destination_id,
-                    path,
-                    hash,
-                    size,
-                    modified,
-                })
-                .execute(&mut *tx)?;
-        }
-        let copied_allocated = allocated_entries::table
-            .filter(allocated_entries::site_id.eq(source_id))
-            .select((
-                allocated_entries::path,
-                allocated_entries::hash,
-                allocated_entries::size,
-                allocated_entries::naming_mode,
-                allocated_entries::prefix,
-                allocated_entries::suffix,
-                allocated_entries::extension,
-                allocated_entries::media_type,
-                allocated_entries::modified,
-            ))
-            .load::<(
-                String,
-                ContentHash,
-                i64,
-                i64,
-                String,
-                String,
-                Option<String>,
-                String,
-                i64,
-            )>(&mut *tx)?;
-        for (path, hash, size, naming_mode, prefix, suffix, extension, media_type, modified) in
-            copied_allocated
-        {
-            diesel::insert_into(site_entries::table)
-                .values((
-                    site_entries::site_id.eq(destination_id),
-                    site_entries::path.eq(&path),
-                    site_entries::kind.eq(database::schema::ALLOCATED_ENTRY_KIND),
-                ))
-                .execute(&mut *tx)?;
-            diesel::insert_into(allocated_entries::table)
-                .values((
-                    allocated_entries::site_id.eq(destination_id),
-                    allocated_entries::path.eq(path),
-                    allocated_entries::kind.eq(database::schema::ALLOCATED_ENTRY_KIND),
-                    allocated_entries::hash.eq(hash),
-                    allocated_entries::size.eq(size),
-                    allocated_entries::naming_mode.eq(naming_mode),
-                    allocated_entries::prefix.eq(prefix),
-                    allocated_entries::suffix.eq(suffix),
-                    allocated_entries::extension.eq(extension),
-                    allocated_entries::media_type.eq(media_type),
-                    allocated_entries::modified.eq(modified),
-                ))
-                .execute(&mut *tx)?;
-        }
-        let copied_aliases = aliases::table
-            .filter(aliases::site_id.eq(source_id))
-            .select((
-                aliases::path,
-                aliases::canonical_target,
-                aliases::resolved_kind,
-                aliases::resolved_hash,
-                aliases::resolved_size,
-                aliases::modified,
-            ))
-            .load::<(
-                String,
-                String,
-                Option<i64>,
-                Option<ContentHash>,
-                Option<i64>,
-                i64,
-            )>(&mut *tx)?;
-        for (path, target, resolved_kind, resolved_hash, resolved_size, modified) in copied_aliases
-        {
-            diesel::insert_into(site_entries::table)
-                .values((
-                    site_entries::site_id.eq(destination_id),
-                    site_entries::path.eq(&path),
-                    site_entries::kind.eq(database::schema::ALIAS_ENTRY_KIND),
-                ))
-                .execute(&mut *tx)?;
-            diesel::insert_into(aliases::table)
-                .values((
-                    aliases::site_id.eq(destination_id),
-                    aliases::path.eq(path),
-                    aliases::kind.eq(database::schema::ALIAS_ENTRY_KIND),
-                    aliases::canonical_target.eq(target),
-                    aliases::resolved_kind.eq(resolved_kind),
-                    aliases::resolved_hash.eq(resolved_hash),
-                    aliases::resolved_size.eq(resolved_size),
-                    aliases::modified.eq(modified),
-                ))
-                .execute(&mut *tx)?;
-        }
-        let aggregates = path_aggregates::table
-            .filter(path_aggregates::site_id.eq(source_id))
-            .select((
-                path_aggregates::path,
-                path_aggregates::logical_bytes,
-                path_aggregates::file_count,
-            ))
-            .load::<(String, i64, i64)>(&mut *tx)?;
-        for (path, logical_bytes, file_count) in aggregates {
-            diesel::insert_into(path_aggregates::table)
-                .values((
-                    path_aggregates::site_id.eq(destination_id),
-                    path_aggregates::path.eq(path),
-                    path_aggregates::logical_bytes.eq(logical_bytes),
-                    path_aggregates::file_count.eq(file_count),
-                ))
-                .execute(&mut *tx)?;
-        }
-        copy_expiry_policies_locked(&mut tx, source_id, destination_id, now)?;
-        let files = site_entries::table
-            .filter(site_entries::site_id.eq(destination_id))
-            .filter(site_entries::path.ne(MANIFEST_PATH))
-            .filter(site_entries::kind.ne(database::schema::ALIAS_ENTRY_KIND))
-            .select(count_star())
-            .first::<i64>(&mut *tx)?;
-        let tree_hash = regenerate_site(&mut tx, &self.inner.blob_files, destination_id, now)?;
-        prune_undo_locked(&mut tx, now)?;
-        let mutation = MutationResult {
-            created: true,
-            changed: true,
-            replayed: false,
-            files: usize::try_from(files).expect("file count fits in usize"),
-            revision: revision.cast_unsigned(),
-            tree_hash: tree_hash.to_wire(),
-            undo: Some(undo),
-            sanitized: TokenCounts::default(),
-        };
-        if generated && let Some(idempotency) = idempotency {
-            let published = PublishedMutation {
-                name: destination.clone(),
-                mutation: mutation.clone(),
-            };
-            store_idempotency(
-                &mut tx,
-                &idempotency.key,
-                &fingerprint,
-                IdempotencyKind::AutoCopy,
-                &published,
+            let generated = destination.is_none();
+            let existing_names = sites::table
+                .select(sites::name)
+                .load::<String>(&mut *tx)?
+                .into_iter()
+                .collect::<HashSet<_>>();
+            let destination = destination
+                .unwrap_or_else(|| generate_id(|candidate| existing_names.contains(candidate)));
+            if site_exists_locked(tx, &destination)? {
+                return Err(StoreError::DestinationConflict);
+            }
+            let (source_id, public_url, revision) = sites::table
+                .filter(sites::name.eq(source))
+                .select((sites::id, sites::public_url, sites::content_revision))
+                .first::<(i64, String, i64)>(&mut *tx)?;
+            let undo = snapshot_site_with_description(
+                tx,
+                &destination,
+                UndoKind::Copy,
+                &format!("remove copied site {destination}"),
                 now,
             )?;
-        }
-        let removed = gc_blobs(&mut tx, now)?;
-        tx.commit()?;
-        drop(db);
-        self.remove_blob_files(&removed);
-        Ok((destination, mutation))
-    }
-
-    #[cfg(test)]
-    pub fn move_site(
-        &self,
-        source: &str,
-        destination: &str,
-    ) -> Result<(String, MutationResult), StoreError> {
-        self.move_site_secured(source, destination, None)
+            let destination_id = diesel::insert_into(sites::table)
+                .values(NewSite {
+                    name: &destination,
+                    created: Some(now),
+                    updated: now,
+                    public_url: &public_url,
+                    content_revision: revision,
+                    tree_hash: TreeHash::EMPTY,
+                    creator_kind: creation.creator.map(|creator| creator.kind as i64),
+                    creator_hash: creation.creator.map(|creator| creator.hash.to_vec()),
+                    claim_hash: creation.claim_hash.map(|hash| hash.as_bytes().to_vec()),
+                    management_hash: creation
+                        .management_hash
+                        .map(|hash| hash.as_bytes().to_vec()),
+                    management_status: i64::from(creation.management_hash.is_some()),
+                })
+                .returning(sites::id)
+                .get_result::<i64>(&mut *tx)?;
+            // A copy keeps each entry's modification time: the content did not
+            // change, it only gained a second home. The manifest is left out and
+            // regenerated for the destination below.
+            rows::copy_site_entries(tx, source_id, destination_id)?;
+            copy_expiry_policies_locked(tx, source_id, destination_id, now)?;
+            let files = count_files_locked(tx, destination_id)?;
+            let tree_hash = regenerate_site(tx, &self.inner.blob_files, destination_id, now)?;
+            let mutation =
+                MutationResult::applied(files, revision.cast_unsigned(), tree_hash, undo)
+                    .with_created(true);
+            if generated && let Some(idempotency) = idempotency {
+                let published = PublishedMutation {
+                    name: destination.clone(),
+                    mutation: mutation.clone(),
+                };
+                store_idempotency(
+                    tx,
+                    &idempotency.key,
+                    &fingerprint,
+                    IdempotencyKind::AutoCopy,
+                    &published,
+                    now,
+                )?;
+            }
+            let removed = finish_mutation(tx, now)?;
+            Ok(TxOutcome::Commit((destination, mutation), removed))
+        })
     }
 
     pub fn move_site_secured(
@@ -1787,66 +1409,44 @@ impl Store {
         let source = parse_site_name(source)?;
         let destination = parse_site_name(destination)?;
         let now = self.now_millis();
-        let mut db = self.inner.writer.lock().unwrap();
-        let mut tx = DbTransaction::begin(&mut db)?;
-        authorize_locked(&mut tx, source, authorization)?;
-        if !site_exists_locked(&mut tx, source)? {
-            return Err(StoreError::NotFound);
-        }
-        if site_exists_locked(&mut tx, destination)? {
-            return Err(StoreError::DestinationConflict);
-        }
-        let undo = snapshot_site_with_description(
-            &mut tx,
-            source,
-            UndoKind::Move,
-            &format!("move {destination} back to {source}"),
-            now,
-        )?;
-        diesel::insert_into(undo_names::table)
-            .values((
-                undo_names::token.eq(&undo.token),
-                undo_names::name.eq(destination),
+        self.write(|tx| {
+            authorize_locked(tx, source, authorization)?;
+            require_site_locked(tx, source)?;
+            if site_exists_locked(tx, destination)? {
+                return Err(StoreError::DestinationConflict);
+            }
+            let undo = snapshot_site_with_description(
+                tx,
+                source,
+                UndoKind::Move,
+                &format!("move {destination} back to {source}"),
+                now,
+            )?;
+            diesel::insert_into(undo_names::table)
+                .values((
+                    undo_names::token.eq(&undo.token),
+                    undo_names::name.eq(destination),
+                ))
+                .execute(&mut *tx)?;
+            diesel::update(sites::table.filter(sites::name.eq(source)))
+                .set((sites::name.eq(destination), sites::updated.eq(now)))
+                .execute(&mut *tx)?;
+            let (site_id, revision) = sites::table
+                .filter(sites::name.eq(destination))
+                .select((sites::id, sites::content_revision))
+                .first::<(i64, i64)>(&mut *tx)?;
+            record_site_event(tx, site_id, StoredSiteEventKind::Rename, 0, now)?;
+            let files = count_files_locked(tx, site_id)?;
+            let tree_hash = regenerate_site(tx, &self.inner.blob_files, site_id, now)?;
+            let removed = finish_mutation(tx, now)?;
+            Ok((
+                (
+                    destination.to_string(),
+                    MutationResult::applied(files, revision.cast_unsigned(), tree_hash, undo),
+                ),
+                removed,
             ))
-            .execute(&mut *tx)?;
-        diesel::update(sites::table.filter(sites::name.eq(source)))
-            .set((sites::name.eq(destination), sites::updated.eq(now)))
-            .execute(&mut *tx)?;
-        let (site_id, revision) = sites::table
-            .filter(sites::name.eq(destination))
-            .select((sites::id, sites::content_revision))
-            .first::<(i64, i64)>(&mut *tx)?;
-        record_site_event(&mut tx, site_id, StoredSiteEventKind::Rename, 0, now)?;
-        let files = site_entries::table
-            .filter(site_entries::site_id.eq(site_id))
-            .filter(site_entries::path.ne(MANIFEST_PATH))
-            .filter(site_entries::kind.ne(database::schema::ALIAS_ENTRY_KIND))
-            .select(count_star())
-            .first::<i64>(&mut *tx)?;
-        let tree_hash = regenerate_site(&mut tx, &self.inner.blob_files, site_id, now)?;
-        prune_undo_locked(&mut tx, now)?;
-        let removed = gc_blobs(&mut tx, now)?;
-        tx.commit()?;
-        drop(db);
-        self.remove_blob_files(&removed);
-        Ok((
-            destination.to_string(),
-            MutationResult {
-                created: false,
-                changed: true,
-                replayed: false,
-                files: usize::try_from(files).expect("file count fits in usize"),
-                revision: revision.cast_unsigned(),
-                tree_hash: tree_hash.to_wire(),
-                undo: Some(undo),
-                sanitized: TokenCounts::default(),
-            },
-        ))
-    }
-
-    #[cfg(test)]
-    pub fn delete_file(&self, name: &str, rel: &str) -> Result<MutationResult, StoreError> {
-        self.delete_file_secured(name, rel, None)
+        })
     }
 
     pub fn delete_file_secured(
@@ -1856,110 +1456,89 @@ impl Store {
         authorization: Option<&ManagementToken>,
     ) -> Result<MutationResult, StoreError> {
         let name = parse_site_name(name)?;
-        let rel = safe_rel_path(rel)?.to_string_lossy().replace('\\', "/");
+        let rel = normalize_nonempty_rel(rel)?;
         let (prefix_start, prefix_end) = descendant_bounds(&rel);
-        let mut db = self.inner.writer.lock().unwrap();
-        let mut tx = DbTransaction::begin(&mut db)?;
-        authorize_locked(&mut tx, name, authorization)?;
-        reject_reserved_path(&rel)?;
-        let site_id = site_id_locked(&mut tx, name)?;
-        reject_alias_write_locked(&mut tx, site_id, &rel, true)?;
-        let mut paths = site_entries::table
-            .filter(site_entries::site_id.eq(site_id))
-            .filter(
-                site_entries::path.eq(&rel).or(site_entries::path
-                    .ge(&prefix_start)
-                    .and(site_entries::path.lt(&prefix_end))),
-            )
-            .select(site_entries::path)
-            .load::<String>(&mut *tx)?;
-        let exact_kind = site_entries::table
-            .find((site_id, rel.as_str()))
-            .select(site_entries::kind)
-            .first::<i64>(&mut *tx)
-            .optional()?;
-        if exact_kind == Some(database::schema::ALIAS_ENTRY_KIND) {
-            paths.clear();
-            paths.push(rel.clone());
-        }
-        if paths.is_empty() {
-            return Err(StoreError::NotFound);
-        }
-        let path_refs = paths.iter().map(String::as_str).collect::<Vec<_>>();
-        let undo = snapshot_entry_deltas(
-            &mut tx,
-            name,
-            UndoKind::DeletePath,
-            &format!("restore deleted {rel}"),
-            &path_refs,
-            self.now_millis(),
-        )?;
-        let removed_files = files::table
-            .filter(files::site_id.eq(site_id))
-            .filter(files::path.eq_any(&paths))
-            .select((files::path, files::size))
-            .load::<(String, i64)>(&mut *tx)?;
-        let removed_allocated = allocated_entries::table
-            .filter(allocated_entries::site_id.eq(site_id))
-            .filter(allocated_entries::path.eq_any(&paths))
-            .select((allocated_entries::path, allocated_entries::size))
-            .load::<(String, i64)>(&mut *tx)?;
-        for (path, size) in removed_files.iter().chain(&removed_allocated) {
-            adjust_aggregates_locked(&mut tx, site_id, path, -*size, -1)?;
-        }
-        let deleted = diesel::delete(
-            site_entries::table
+        self.write(|tx| {
+            authorize_locked(tx, name, authorization)?;
+            reject_reserved_path(&rel)?;
+            let site_id = site_id_locked(tx, name)?;
+            reject_alias_write_locked(tx, site_id, &rel, true)?;
+            let mut paths = site_entries::table
                 .filter(site_entries::site_id.eq(site_id))
-                .filter(site_entries::path.eq_any(&paths)),
-        )
-        .execute(&mut *tx)?;
-        diesel::delete(
-            expiry_policies::table
-                .filter(expiry_policies::site_id.eq(site_id))
                 .filter(
-                    expiry_policies::path.eq(&rel).or(expiry_policies::path
+                    site_entries::path.eq(&rel).or(site_entries::path
                         .ge(&prefix_start)
-                        .and(expiry_policies::path.lt(&prefix_end))),
-                ),
-        )
-        .execute(&mut *tx)?;
-        diesel::update(sites::table.find(site_id))
-            .set(sites::content_revision.eq(sites::content_revision + 1))
+                        .and(site_entries::path.lt(&prefix_end))),
+                )
+                .select(site_entries::path)
+                .load::<String>(&mut *tx)?;
+            let exact_kind = site_entries::table
+                .find((site_id, rel.as_str()))
+                .select(site_entries::kind)
+                .first::<i64>(&mut *tx)
+                .optional()?;
+            if exact_kind == Some(database::schema::ALIAS_ENTRY_KIND) {
+                paths.clear();
+                paths.push(rel.clone());
+            }
+            if paths.is_empty() {
+                return Err(StoreError::NotFound);
+            }
+            let path_refs = paths.iter().map(String::as_str).collect::<Vec<_>>();
+            let undo = snapshot_entry_deltas(
+                tx,
+                name,
+                UndoKind::DeletePath,
+                &format!("restore deleted {rel}"),
+                &path_refs,
+                self.now_millis(),
+            )?;
+            let removed_files = files::table
+                .filter(files::site_id.eq(site_id))
+                .filter(files::path.eq_any(&paths))
+                .select((files::path, files::size))
+                .load::<(String, i64)>(&mut *tx)?;
+            let removed_allocated = allocated_entries::table
+                .filter(allocated_entries::site_id.eq(site_id))
+                .filter(allocated_entries::path.eq_any(&paths))
+                .select((allocated_entries::path, allocated_entries::size))
+                .load::<(String, i64)>(&mut *tx)?;
+            for (path, size) in removed_files.iter().chain(&removed_allocated) {
+                adjust_aggregates_locked(tx, site_id, path, -*size, -1)?;
+            }
+            let deleted = diesel::delete(
+                site_entries::table
+                    .filter(site_entries::site_id.eq(site_id))
+                    .filter(site_entries::path.eq_any(&paths)),
+            )
             .execute(&mut *tx)?;
-        refresh_aliases_locked(&mut tx, site_id, &[AliasChange::Subtree(&rel)])?;
-        refresh_expiry_for_changes_locked(&mut tx, site_id, &[&rel], self.now_millis())?;
-        regenerate_site(&mut tx, &self.inner.blob_files, site_id, self.now_millis())?;
-        prune_undo_locked(&mut tx, self.now_millis())?;
-        let removed = gc_blobs(&mut tx, self.now_millis())?;
-        let (revision, tree_hash) =
-            site_revision_locked(&mut tx, name).unwrap_or((0, TreeHash::EMPTY));
-        tx.commit()?;
-        drop(db);
-        self.remove_blob_files(&removed);
-        Ok(MutationResult {
-            created: false,
-            changed: true,
-            replayed: false,
-            files: deleted,
-            revision,
-            tree_hash: tree_hash.to_wire(),
-            undo: Some(undo),
-            sanitized: TokenCounts::default(),
+            diesel::delete(
+                expiry_policies::table
+                    .filter(expiry_policies::site_id.eq(site_id))
+                    .filter(
+                        expiry_policies::path.eq(&rel).or(expiry_policies::path
+                            .ge(&prefix_start)
+                            .and(expiry_policies::path.lt(&prefix_end))),
+                    ),
+            )
+            .execute(&mut *tx)?;
+            bump_revision_locked(tx, site_id)?;
+            refresh_aliases_locked(tx, site_id, &[AliasChange::Subtree(&rel)])?;
+            refresh_expiry_for_changes_locked(tx, site_id, &[&rel], self.now_millis())?;
+            regenerate_site(tx, &self.inner.blob_files, site_id, self.now_millis())?;
+            prune_undo_locked(tx, self.now_millis())?;
+            let removed = gc_blobs(tx, self.now_millis())?;
+            let (revision, tree_hash) =
+                site_revision_locked(tx, name).unwrap_or((0, TreeHash::EMPTY));
+            Ok((
+                MutationResult::applied(deleted, revision, tree_hash, undo),
+                removed,
+            ))
         })
     }
 
     pub(super) fn commit_site(&self, name: &str, files: &[StagedFile]) -> Result<(), StoreError> {
         self.merge_staged(name, files, UndoKind::Put).map(|_| ())
-    }
-
-    #[cfg(test)]
-    pub(super) fn upsert_file(
-        &self,
-        name: &str,
-        file: &StagedFile,
-    ) -> Result<MutationResult, StoreError> {
-        reject_reserved_path(&file.path)?;
-        self.merge_staged(name, std::slice::from_ref(file), UndoKind::Put)
     }
 
     #[expect(clippy::large_types_passed_by_value)]
@@ -2038,59 +1617,56 @@ impl Store {
         }
         let fingerprint = staged_entries_fingerprint(&files, archive_aliases);
         let now = self.now_millis();
-        let mut db = self.inner.writer.lock().unwrap();
-        let mut tx = DbTransaction::begin(&mut db)?;
-        prune_idempotency_locked(&mut tx, now)?;
-        if let Some(idempotency) = options.idempotency {
-            validate_idempotency_key(&idempotency.key)?;
-            if let Some(replay) = idempotency_replay(
-                &mut tx,
-                &idempotency.key,
-                &fingerprint,
-                IdempotencyKind::UnnamedPut,
-            )? {
-                return Ok((replay.name, replay.mutation));
+        self.write_outcome(|tx| {
+            prune_idempotency_locked(tx, now)?;
+            if let Some(idempotency) = options.idempotency {
+                validate_idempotency_key(&idempotency.key)?;
+                if let Some(replay) = idempotency_replay(
+                    tx,
+                    &idempotency.key,
+                    &fingerprint,
+                    IdempotencyKind::UnnamedPut,
+                )? {
+                    return Ok(TxOutcome::Rollback((replay.name, replay.mutation)));
+                }
             }
-        }
-        let existing_names = sites::table
-            .select(sites::name)
-            .load::<String>(&mut *tx)?
-            .into_iter()
-            .collect::<HashSet<_>>();
-        let name = generate_id(|candidate| existing_names.contains(candidate));
-        let mutation = self.merge_staged_locked(
-            &mut tx,
-            &files,
-            MergeContext {
-                name: &name,
-                kind: UndoKind::Put,
-                expected_tree_hash: None,
-                now,
-                creation: options.creation,
-                authorization: None,
-                archive_aliases,
-                replace: false,
-            },
-        )?;
-        let published = PublishedMutation {
-            name: name.clone(),
-            mutation: mutation.clone(),
-        };
-        if let Some(idempotency) = options.idempotency {
-            store_idempotency(
-                &mut tx,
-                &idempotency.key,
-                &fingerprint,
-                IdempotencyKind::UnnamedPut,
-                &published,
-                now,
+            let existing_names = sites::table
+                .select(sites::name)
+                .load::<String>(&mut *tx)?
+                .into_iter()
+                .collect::<HashSet<_>>();
+            let name = generate_id(|candidate| existing_names.contains(candidate));
+            let mutation = self.merge_staged_locked(
+                tx,
+                &files,
+                MergeContext {
+                    name: &name,
+                    kind: UndoKind::Put,
+                    expected_tree_hash: None,
+                    now,
+                    creation: options.creation,
+                    authorization: None,
+                    archive_aliases,
+                    replace: false,
+                },
             )?;
-        }
-        let removed = gc_blobs(&mut tx, now)?;
-        tx.commit()?;
-        drop(db);
-        self.remove_blob_files(&removed);
-        Ok((name, mutation))
+            let published = PublishedMutation {
+                name: name.clone(),
+                mutation: mutation.clone(),
+            };
+            if let Some(idempotency) = options.idempotency {
+                store_idempotency(
+                    tx,
+                    &idempotency.key,
+                    &fingerprint,
+                    IdempotencyKind::UnnamedPut,
+                    &published,
+                    now,
+                )?;
+            }
+            let removed = gc_blobs(tx, now)?;
+            Ok(TxOutcome::Commit((name, mutation), removed))
+        })
     }
 
     pub(super) fn merge_staged(
@@ -2147,27 +1723,24 @@ impl Store {
             reject_reserved_path(&file.path)?;
         }
         let now = self.now_millis();
-        let mut db = self.inner.writer.lock().unwrap();
-        let mut tx = DbTransaction::begin(&mut db)?;
-        let mutation = self.merge_staged_locked(
-            &mut tx,
-            &files,
-            MergeContext {
-                name,
-                kind,
-                expected_tree_hash,
-                now,
-                creation,
-                authorization,
-                archive_aliases,
-                replace,
-            },
-        )?;
-        let removed = gc_blobs(&mut tx, now)?;
-        tx.commit()?;
-        drop(db);
-        self.remove_blob_files(&removed);
-        Ok(mutation)
+        self.write(|tx| {
+            let mutation = self.merge_staged_locked(
+                tx,
+                &files,
+                MergeContext {
+                    name,
+                    kind,
+                    expected_tree_hash,
+                    now,
+                    creation,
+                    authorization,
+                    archive_aliases,
+                    replace,
+                },
+            )?;
+            let removed = gc_blobs(tx, now)?;
+            Ok((mutation, removed))
+        })
     }
 
     #[expect(
@@ -2274,16 +1847,12 @@ impl Store {
         }
         if !changed {
             let (revision, tree_hash) = site_revision_locked(tx, name)?;
-            return Ok(MutationResult {
-                created: false,
-                changed: false,
-                replayed: false,
-                files: files.len() + archive_aliases.len(),
+            return Ok(MutationResult::unchanged(
+                files.len() + archive_aliases.len(),
                 revision,
-                tree_hash: tree_hash.to_wire(),
-                undo: None,
-                sanitized: sanitized_counts(files),
-            });
+                tree_hash,
+            )
+            .with_sanitized(sanitized_counts(files)));
         }
         if let Some(site_id) = existing_site_id
             && !archive_aliases.is_empty()
@@ -2310,14 +1879,7 @@ impl Store {
             snapshot_site_with_description(tx, name, kind, &description, now)?
         };
         for file in files {
-            diesel::insert_into(blobs::table)
-                .values((
-                    blobs::hash.eq(file.hash),
-                    blobs::bytes.eq(Vec::<u8>::new()),
-                    blobs::size.eq(file.size),
-                ))
-                .on_conflict_do_nothing()
-                .execute(tx)?;
+            ensure_blob_locked(tx, file)?;
         }
         diesel::insert_into(sites::table)
             .values(NewSite {
@@ -2373,14 +1935,7 @@ impl Store {
             )?;
         }
         for alias in archive_aliases {
-            diesel::insert_into(site_entries::table)
-                .values((
-                    site_entries::site_id.eq(site_id),
-                    site_entries::path.eq(alias.path),
-                    site_entries::kind.eq(database::schema::ALIAS_ENTRY_KIND),
-                ))
-                .on_conflict_do_nothing()
-                .execute(tx)?;
+            ensure_entry(tx, site_id, alias.path, database::schema::ALIAS_ENTRY_KIND)?;
             diesel::insert_into(aliases::table)
                 .values((
                     aliases::site_id.eq(site_id),
@@ -2441,16 +1996,14 @@ impl Store {
         refresh_expiry_for_changes_locked(tx, site_id, &changed_paths, now)?;
         let tree_hash = regenerate_site(tx, &self.inner.blob_files, site_id, now)?;
         prune_undo_locked(tx, now)?;
-        Ok(MutationResult {
-            created: !existed,
-            changed: true,
-            replayed: false,
-            files: files.len() + archive_aliases.len(),
-            revision: revision.cast_unsigned(),
-            tree_hash: tree_hash.to_wire(),
-            undo: Some(undo),
-            sanitized: sanitized_counts(files),
-        })
+        Ok(MutationResult::applied(
+            files.len() + archive_aliases.len(),
+            revision.cast_unsigned(),
+            tree_hash,
+            undo,
+        )
+        .with_created(!existed)
+        .with_sanitized(sanitized_counts(files)))
     }
 
     pub(super) fn replay_content_request(
@@ -2505,110 +2058,92 @@ impl Store {
             );
             &computed_request_fingerprint
         };
-        let mut db = self.inner.writer.lock().unwrap();
-        let mut tx = DbTransaction::begin(&mut db)?;
-        authorize_locked(&mut tx, name, options.authorization)?;
-        prune_idempotency_locked(&mut tx, now)?;
-        if let Some(replay) = entry_mutation_replay(&mut tx, options.idempotency, &fingerprint)? {
-            return Ok(replay);
-        }
-        check_tree_precondition(&mut tx, name, options.expected_tree_hash)?;
-        let site_id = site_id_locked(&mut tx, name)?;
-        reject_alias_write_locked(&mut tx, site_id, path, false)?;
-        let current = files::table
-            .find((site_id, path))
-            .select((files::hash, files::size))
-            .first::<(ContentHash, i64)>(&mut *tx)
-            .optional()?;
-        let Some((current_hash, current_size)) = current else {
-            return Err(StoreError::NotFound);
-        };
-        if expected_content_hash
-            .is_some_and(|expected| ContentHash::try_from(expected).ok() != Some(current_hash))
-        {
-            return Err(stale_content_hash_error(current_hash));
-        }
-        if current_hash == staged.hash {
-            let (revision, tree_hash) = site_revision_locked(&mut tx, name)?;
-            let result = AllocatedFile {
-                path: path.to_string(),
-                hash: format!("blake3:{}", current_hash.to_hex()),
-                size: current_size.cast_unsigned(),
-                changed: false,
-                replayed: false,
-                mutation: Some(MutationResult {
-                    created: false,
+        self.write_outcome(|tx| {
+            authorize_locked(tx, name, options.authorization)?;
+            prune_idempotency_locked(tx, now)?;
+            if let Some(replay) = entry_mutation_replay(tx, options.idempotency, &fingerprint)? {
+                return Ok(TxOutcome::Rollback(replay));
+            }
+            check_tree_precondition(tx, name, options.expected_tree_hash)?;
+            let site_id = site_id_locked(tx, name)?;
+            reject_alias_write_locked(tx, site_id, path, false)?;
+            let current = files::table
+                .find((site_id, path))
+                .select((files::hash, files::size))
+                .first::<(ContentHash, i64)>(&mut *tx)
+                .optional()?;
+            let Some((current_hash, current_size)) = current else {
+                return Err(StoreError::NotFound);
+            };
+            if expected_content_hash
+                .is_some_and(|expected| ContentHash::try_from(expected).ok() != Some(current_hash))
+            {
+                return Err(stale_content_hash_error(current_hash));
+            }
+            if current_hash == staged.hash {
+                let (revision, tree_hash) = site_revision_locked(tx, name)?;
+                let result = AllocatedFile {
+                    path: path.to_string(),
+                    hash: format!("blake3:{}", current_hash.to_hex()),
+                    size: current_size.cast_unsigned(),
                     changed: false,
                     replayed: false,
-                    files: 1,
-                    revision,
-                    tree_hash: tree_hash.to_wire(),
-                    undo: None,
-                    sanitized: staged.sanitized,
-                }),
+                    mutation: Some(
+                        MutationResult::unchanged(1, revision, tree_hash)
+                            .with_sanitized(staged.sanitized),
+                    ),
+                };
+                store_entry_mutation_with_request(
+                    tx,
+                    options.idempotency,
+                    &fingerprint,
+                    request_fingerprint,
+                    &result,
+                    now,
+                )?;
+                return Ok(TxOutcome::Commit(result, Vec::new()));
+            }
+            self.materialize(staged)?;
+            let undo = snapshot_entry_deltas(
+                tx,
+                name,
+                kind,
+                &format!("restore previous {path}"),
+                &[path],
+                now,
+            )?;
+            ensure_blob_locked(tx, staged)?;
+            diesel::update(files::table.find((site_id, path)))
+                .set((
+                    files::hash.eq(staged.hash),
+                    files::size.eq(staged.size),
+                    files::modified.eq(now),
+                ))
+                .execute(&mut *tx)?;
+            adjust_aggregates_locked(tx, site_id, path, staged.size - current_size, 0)?;
+            finish_entry_mutation(tx, &self.inner.blob_files, site_id, &[path], now)?;
+            let (revision, tree_hash) = site_revision_locked(tx, name)?;
+            let mutation = MutationResult::applied(1, revision, tree_hash, undo)
+                .with_sanitized(staged.sanitized);
+            let result = AllocatedFile {
+                path: path.to_string(),
+                hash: format!("blake3:{}", staged.hash.to_hex()),
+                size: staged.size.cast_unsigned(),
+                changed: true,
+                replayed: false,
+                mutation: Some(mutation),
             };
             store_entry_mutation_with_request(
-                &mut tx,
+                tx,
                 options.idempotency,
                 &fingerprint,
                 request_fingerprint,
                 &result,
                 now,
             )?;
-            tx.commit()?;
-            return Ok(result);
-        }
-        self.materialize(staged)?;
-        let undo = snapshot_entry_deltas(
-            &mut tx,
-            name,
-            kind,
-            &format!("restore previous {path}"),
-            &[path],
-            now,
-        )?;
-        ensure_blob_locked(&mut tx, staged)?;
-        diesel::update(files::table.find((site_id, path)))
-            .set((
-                files::hash.eq(staged.hash),
-                files::size.eq(staged.size),
-                files::modified.eq(now),
-            ))
-            .execute(&mut *tx)?;
-        adjust_aggregates_locked(&mut tx, site_id, path, staged.size - current_size, 0)?;
-        finish_entry_mutation(&mut tx, &self.inner.blob_files, site_id, &[path], now)?;
-        let (revision, tree_hash) = site_revision_locked(&mut tx, name)?;
-        let mutation = MutationResult {
-            created: false,
-            changed: true,
-            replayed: false,
-            files: 1,
-            revision,
-            tree_hash: tree_hash.to_wire(),
-            undo: Some(undo),
-            sanitized: staged.sanitized,
-        };
-        let result = AllocatedFile {
-            path: path.to_string(),
-            hash: format!("blake3:{}", staged.hash.to_hex()),
-            size: staged.size.cast_unsigned(),
-            changed: true,
-            replayed: false,
-            mutation: Some(mutation),
-        };
-        store_entry_mutation_with_request(
-            &mut tx,
-            options.idempotency,
-            &fingerprint,
-            request_fingerprint,
-            &result,
-            now,
-        )?;
-        let removed = gc_blobs(&mut tx, now)?;
-        tx.commit()?;
-        drop(db);
-        self.remove_blob_files(&removed);
-        Ok(result)
+            let removed = gc_blobs(tx, now)?;
+            Ok(TxOutcome::Commit(result, removed))
+        })
     }
 
     pub(super) fn materialize(&self, file: &StagedFile) -> Result<(), StoreError> {
@@ -2619,5 +2154,104 @@ impl Store {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_kat {
+    //! Known-answer test: `splice_request_fingerprint` bytes are persisted in
+    //! idempotency records and must never change. The rest live in
+    //! `store/fingerprint.rs`; this one needs `PreparedSplice`'s private fields.
+
+    use super::*;
+
+    const SPLICE_REQUEST: &[&str] = &[
+        "630e4418f13c5097f50069a2614eff0c940def26e9094484d78389944f3f7255",
+        "630e4418f13c5097f50069a2614eff0c940def26e9094484d78389944f3f7255",
+        "d209b9f74900affc88e49cf4d2625ae7e657640108651c565d979810b1b664ea",
+        "17554b6720820c9b4c1076f6a1533969b1d608a28737f21ce984cf3b8e91574e",
+        "6c51b43119afb60f350a3d1ac144d0a3c0c5ebe0020dae547c00a7ffbf243d9b",
+        "1bfe6a74f6ceea5de4a6ce125481e5da198d7d423bd23130874b7634989afae6",
+        "b105c75a57fe38119539cd4f5529382eabb90e9d80b1122cc529622f4f015635",
+        "9031f9ba6ca9542dc223605ccfd3c1135fdcf3b99f949c52d446312218c76ef9",
+        "d1dd36d7afcaba342bd7b45bf6642eebf3bfb0dc8aecc09a503a446c61cf2ae6",
+        "98412bf0499c0c9e70361948029bb53c9f5819247ad306cd565f346b41752c10",
+        "007c4003796749a157c0fde94cf6c28dec08e2bfe45387708fe0e8b9f93d3cde",
+        "da9a5c67fd19667250c6900714c691df34a5e9454efd274d095561db0b2f1d09",
+        "1602ef3a09b4afbd32d34c0b0977b7e99fff0e1502ee3003e9d402a2614c2454",
+        "3f42f9b68a951c8cd5b7e60e076e4180595088370e74363a8358d3ca6cdcd44c",
+    ];
+
+    fn splice(offset: u64, delete: u64, insert: PreparedSpliceSource) -> PreparedSplice {
+        PreparedSplice {
+            offset,
+            delete,
+            insert,
+            sanitized: TokenCounts::default(),
+        }
+    }
+
+    fn file(offset: u64, delete: u64, size: u64, label: &[u8]) -> PreparedSplice {
+        splice(
+            offset,
+            delete,
+            PreparedSpliceSource::File {
+                path: PathBuf::from("ignored"),
+                size,
+                hash: ContentHash::from(blake3::hash(label)),
+            },
+        )
+    }
+
+    #[test]
+    fn splice_request_fingerprint_known_answers() {
+        let unicode = "h\u{e9}llo/\u{65e5}\u{672c}\u{8a9e}/\u{1f980}";
+        let empty = |offset, delete| splice(offset, delete, PreparedSpliceSource::Empty);
+        let bytes = |offset, delete, data: &[u8]| {
+            splice(offset, delete, PreparedSpliceSource::Bytes(data.to_vec()))
+        };
+        let actual = vec![
+            splice_request_fingerprint("", "", "", &[], None),
+            splice_request_fingerprint("", "", "", &[], Some("")),
+            splice_request_fingerprint("site", "a/b.txt", "basehash", &[], Some("tree")),
+            splice_request_fingerprint("site", "a/b.txt", "basehash", &[empty(0, 0)], None),
+            splice_request_fingerprint(
+                "site",
+                "a/b.txt",
+                "basehash",
+                &[empty(3, 4), empty(u64::MAX, u64::MAX)],
+                None,
+            ),
+            splice_request_fingerprint("site", "p", "b", &[bytes(1, 2, b"")], None),
+            splice_request_fingerprint("site", "p", "b", &[bytes(1, 2, b"x\0y")], Some("t")),
+            splice_request_fingerprint("site", "p", "b", &[file(0, 0, 0, b"")], None),
+            splice_request_fingerprint("site", "p", "b", &[file(2, 3, 10, b"f1")], Some("t")),
+            splice_request_fingerprint(
+                "site",
+                "p",
+                "b",
+                &[
+                    bytes(0, 1, b"abc"),
+                    empty(5, 0),
+                    file(7, 1, u64::MAX, b"f2"),
+                    bytes(9, 9, unicode.as_bytes()),
+                ],
+                Some("tree"),
+            ),
+            splice_request_fingerprint("a\0b", "\0", "c\0", &[empty(1, 1)], Some("\0")),
+            splice_request_fingerprint(
+                unicode,
+                unicode,
+                unicode,
+                &[bytes(1, 0, unicode.as_bytes())],
+                Some(unicode),
+            ),
+            splice_request_fingerprint("ab", "c", "d", &[], None),
+            splice_request_fingerprint("a", "bc", "d", &[], None),
+        ];
+        assert_eq!(
+            actual, SPLICE_REQUEST,
+            "splice_request fingerprints changed"
+        );
     }
 }

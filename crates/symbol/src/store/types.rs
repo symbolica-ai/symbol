@@ -129,6 +129,48 @@ pub struct MutationResult {
     pub sanitized: TokenCounts,
 }
 
+impl MutationResult {
+    /// A mutation that found nothing to change.
+    pub(super) fn unchanged(files: usize, revision: u64, tree_hash: TreeHash) -> Self {
+        Self {
+            created: false,
+            changed: false,
+            replayed: false,
+            files,
+            revision,
+            tree_hash: tree_hash.to_wire(),
+            undo: None,
+            sanitized: TokenCounts::default(),
+        }
+    }
+
+    /// A mutation that changed the site and can be undone.
+    pub(super) fn applied(
+        files: usize,
+        revision: u64,
+        tree_hash: TreeHash,
+        undo: UndoInfo,
+    ) -> Self {
+        Self {
+            changed: true,
+            undo: Some(undo),
+            ..Self::unchanged(files, revision, tree_hash)
+        }
+    }
+
+    #[must_use]
+    pub(super) const fn with_created(mut self, created: bool) -> Self {
+        self.created = created;
+        self
+    }
+
+    #[must_use]
+    pub(super) const fn with_sanitized(mut self, sanitized: TokenCounts) -> Self {
+        self.sanitized = sanitized;
+        self
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ExpiryMutation {
     pub report: ExpiryReport,
@@ -464,6 +506,12 @@ pub enum StoreError {
 }
 
 impl StoreError {
+    /// Stored or encoded data that is not what this build wrote: an `Io`
+    /// error of kind `InvalidData` carrying `error`.
+    pub(super) fn invalid_data(error: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
+        Self::Io(io::Error::new(io::ErrorKind::InvalidData, error))
+    }
+
     pub(super) fn startup(phase: &'static str, source: Self) -> Self {
         Self::Startup {
             phase,

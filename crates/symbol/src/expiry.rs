@@ -467,12 +467,12 @@ pub fn parse_rfc3339_timestamp(input: &str) -> Result<OffsetDateTime, ExpiryErro
         return Err(ExpiryError::InvalidTimestamp);
     }
 
-    let year = parse_fixed_i32(bytes, 0, 4)?;
-    let month = parse_fixed_u8(bytes, 5, 2)?;
-    let day = parse_fixed_u8(bytes, 8, 2)?;
-    let hour = parse_fixed_u8(bytes, 11, 2)?;
-    let minute = parse_fixed_u8(bytes, 14, 2)?;
-    let second = parse_fixed_u8(bytes, 17, 2)?;
+    let year = parse_fixed::<i32>(bytes, 0, 4)?;
+    let month = parse_fixed::<u8>(bytes, 5, 2)?;
+    let day = parse_fixed::<u8>(bytes, 8, 2)?;
+    let hour = parse_fixed::<u8>(bytes, 11, 2)?;
+    let minute = parse_fixed::<u8>(bytes, 14, 2)?;
+    let second = parse_fixed::<u8>(bytes, 17, 2)?;
 
     let mut position = 19;
     let nanosecond = if bytes.get(position) == Some(&b'.') {
@@ -485,7 +485,7 @@ pub fn parse_rfc3339_timestamp(input: &str) -> Result<OffsetDateTime, ExpiryErro
         if fraction_len == 0 || fraction_len > 9 {
             return Err(ExpiryError::InvalidTimestamp);
         }
-        let fraction = parse_fixed_u32(bytes, fraction_start, fraction_len)?;
+        let fraction = parse_fixed::<u32>(bytes, fraction_start, fraction_len)?;
         fraction
             * 10_u32
                 .pow(u32::try_from(9 - fraction_len).map_err(|_| ExpiryError::InvalidTimestamp)?)
@@ -499,8 +499,8 @@ pub fn parse_rfc3339_timestamp(input: &str) -> Result<OffsetDateTime, ExpiryErro
             if bytes.get(position + 3) != Some(&b':') {
                 return Err(ExpiryError::InvalidTimestamp);
             }
-            let offset_hour = parse_fixed_u8(bytes, position + 1, 2)?;
-            let offset_minute = parse_fixed_u8(bytes, position + 4, 2)?;
+            let offset_hour = parse_fixed::<u8>(bytes, position + 1, 2)?;
+            let offset_minute = parse_fixed::<u8>(bytes, position + 4, 2)?;
             if offset_hour > 23 || offset_minute > 59 {
                 return Err(ExpiryError::InvalidTimestamp);
             }
@@ -551,31 +551,23 @@ pub fn earliest_deadline(
         })
 }
 
-fn parse_fixed_u8(bytes: &[u8], start: usize, len: usize) -> Result<u8, ExpiryError> {
-    parse_fixed_u32(bytes, start, len)?
-        .try_into()
-        .map_err(|_| ExpiryError::InvalidTimestamp)
-}
-
-fn parse_fixed_i32(bytes: &[u8], start: usize, len: usize) -> Result<i32, ExpiryError> {
-    parse_fixed_u32(bytes, start, len)?
-        .try_into()
-        .map_err(|_| ExpiryError::InvalidTimestamp)
-}
-
-fn parse_fixed_u32(bytes: &[u8], start: usize, len: usize) -> Result<u32, ExpiryError> {
+fn parse_fixed<T: TryFrom<u32>>(bytes: &[u8], start: usize, len: usize) -> Result<T, ExpiryError> {
     let digits = bytes
         .get(start..start + len)
         .ok_or(ExpiryError::InvalidTimestamp)?;
     if !digits.iter().all(u8::is_ascii_digit) {
         return Err(ExpiryError::InvalidTimestamp);
     }
-    digits.iter().try_fold(0_u32, |value, digit| {
-        value
-            .checked_mul(10)
-            .and_then(|value| value.checked_add(u32::from(*digit - b'0')))
-            .ok_or(ExpiryError::InvalidTimestamp)
-    })
+    digits
+        .iter()
+        .try_fold(0_u32, |value, digit| {
+            value
+                .checked_mul(10)
+                .and_then(|value| value.checked_add(u32::from(*digit - b'0')))
+                .ok_or(ExpiryError::InvalidTimestamp)
+        })?
+        .try_into()
+        .map_err(|_| ExpiryError::InvalidTimestamp)
 }
 
 #[cfg(test)]
