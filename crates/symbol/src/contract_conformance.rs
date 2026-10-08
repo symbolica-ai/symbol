@@ -3,6 +3,8 @@ use axum::body::{Body, to_bytes};
 use axum::http::{HeaderMap, Request};
 use tower::ServiceExt as _;
 
+use Fixture::{Empty, Managed, Site, Undo};
+
 #[derive(Clone, Copy)]
 enum Fixture {
     Empty,
@@ -36,6 +38,56 @@ struct Probe {
     body: &'static [u8],
     status: u16,
     response_headers: &'static [HeaderExpectation],
+}
+
+impl Probe {
+    /// A body-less probe with no request headers; add them with
+    /// [`Probe::headers`] and [`Probe::body`].
+    const fn new(
+        endpoint: &'static str,
+        fixture: Fixture,
+        method: &'static str,
+        target: Target,
+        status: u16,
+        response_headers: &'static [HeaderExpectation],
+    ) -> Self {
+        Self {
+            endpoint,
+            fixture,
+            method,
+            target,
+            request_headers: NO_REQUEST_HEADERS,
+            body: b"",
+            status,
+            response_headers,
+        }
+    }
+
+    const fn headers(self, request_headers: &'static [(&'static str, &'static str)]) -> Self {
+        Self {
+            request_headers,
+            ..self
+        }
+    }
+
+    const fn body(self, body: &'static [u8]) -> Self {
+        Self { body, ..self }
+    }
+}
+
+const fn at(path: &'static str) -> Target {
+    Target::Literal(path)
+}
+
+/// A `GET` probe of a literal path.
+const fn get(
+    endpoint: &'static str,
+    fixture: Fixture,
+    path: &'static str,
+    status: u16,
+    response_headers: &'static [HeaderExpectation],
+) -> Probe {
+    Probe::new(endpoint, fixture, "GET", at(path), status, response_headers)
 }
 
 const fn header(name: &'static str) -> HeaderExpectation {
@@ -75,284 +127,165 @@ const CACHE_JSON_HEADERS: &[HeaderExpectation] = &[
     header_value("content-type", "application/json"),
     header_value("cache-control", "no-cache"),
 ];
+/// A well-formed tree hash that no fixture site ever has.
+const UNRELATED_TREE_HASH: &str =
+    "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const NO_REQUEST_HEADERS: &[(&str, &str)] = &[];
+const ETAG_NO_CACHE_HEADERS: &[HeaderExpectation] = &[
+    header("content-type"),
+    header("etag"),
+    header_value("cache-control", "no-cache"),
+];
+const POP_HEADERS: &[HeaderExpectation] = &[
+    header("content-type"),
+    header("content-length"),
+    header("content-disposition"),
+    header("undo-token"),
+    header("undo-expires"),
+];
+const EXPIRE_HEADERS: &[HeaderExpectation] = &[
+    header("content-type"),
+    header_value("cache-control", "no-cache"),
+    header("expires"),
+    header_value("expiry-mode", "relative"),
+    header("undo-token"),
+    header("undo-expires"),
+];
+const UNAUTHORIZED_HEADER: &[HeaderExpectation] =
+    &[header_value("www-authenticate", "Bearer realm=\"symbol\"")];
+const UNSATISFIABLE_RANGE_HEADERS: &[HeaderExpectation] = &[
+    header("content-range"),
+    header("accept-ranges"),
+    header("etag"),
+    header("cache-control"),
+];
 
 const SUCCESS_PROBES: &[Probe] = &[
-    Probe {
-        endpoint: "docs",
-        fixture: Fixture::Empty,
-        method: "GET",
-        target: Target::Literal("/"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"",
-        status: 200,
-        response_headers: &[
-            header("content-type"),
-            header("etag"),
-            header_value("cache-control", "no-cache"),
-        ],
-    },
-    Probe {
-        endpoint: "unnamed put",
-        fixture: Fixture::Empty,
-        method: "PUT",
-        target: Target::Literal("/"),
-        request_headers: &[("content-type", "text/html")],
-        body: b"<h1>unnamed</h1>",
-        status: 201,
-        response_headers: MUTATION_HEADERS,
-    },
-    Probe {
-        endpoint: "docs hash",
-        fixture: Fixture::Empty,
-        method: "GET",
-        target: Target::Literal("/HASH"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"",
-        status: 200,
-        response_headers: PLAIN_HEADER,
-    },
-    Probe {
-        endpoint: "stats",
-        fixture: Fixture::Empty,
-        method: "GET",
-        target: Target::Literal("/STATS"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"",
-        status: 200,
-        response_headers: JSON_HEADER,
-    },
-    Probe {
-        endpoint: "installer",
-        fixture: Fixture::Empty,
-        method: "GET",
-        target: Target::Literal("/install.sh"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"",
-        status: 200,
-        response_headers: &[
-            header("content-type"),
-            header("etag"),
-            header_value("cache-control", "no-cache"),
-        ],
-    },
-    Probe {
-        endpoint: "installer hash",
-        fixture: Fixture::Empty,
-        method: "GET",
-        target: Target::Literal("/install.sh/HASH"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"",
-        status: 200,
-        response_headers: PLAIN_HEADER,
-    },
-    Probe {
-        endpoint: "client",
-        fixture: Fixture::Empty,
-        method: "GET",
-        target: Target::Literal("/symbol.sh"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"",
-        status: 200,
-        response_headers: &[
-            header("content-type"),
-            header("etag"),
-            header_value("cache-control", "no-cache"),
-        ],
-    },
-    Probe {
-        endpoint: "client hash",
-        fixture: Fixture::Empty,
-        method: "GET",
-        target: Target::Literal("/symbol.sh/HASH"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"",
-        status: 200,
-        response_headers: PLAIN_HEADER,
-    },
-    Probe {
-        endpoint: "api documentation",
-        fixture: Fixture::Empty,
-        method: "GET",
-        target: Target::Literal("/API/JS"),
-        request_headers: &[("accept", "text/markdown")],
-        body: b"",
-        status: 200,
-        response_headers: &[
+    get("docs", Empty, "/", 200, ETAG_NO_CACHE_HEADERS),
+    Probe::new("unnamed put", Empty, "PUT", at("/"), 201, MUTATION_HEADERS)
+        .headers(&[("content-type", "text/html")])
+        .body(b"<h1>unnamed</h1>"),
+    get("docs hash", Empty, "/HASH", 200, PLAIN_HEADER),
+    get("stats", Empty, "/STATS", 200, JSON_HEADER),
+    get(
+        "installer",
+        Empty,
+        "/install.sh",
+        200,
+        ETAG_NO_CACHE_HEADERS,
+    ),
+    get(
+        "installer hash",
+        Empty,
+        "/install.sh/HASH",
+        200,
+        PLAIN_HEADER,
+    ),
+    get("client", Empty, "/symbol.sh", 200, ETAG_NO_CACHE_HEADERS),
+    get("client hash", Empty, "/symbol.sh/HASH", 200, PLAIN_HEADER),
+    get(
+        "api documentation",
+        Empty,
+        "/API/JS",
+        200,
+        &[
             header_value("content-type", "text/markdown; charset=utf-8"),
             header("etag"),
             header_value("cache-control", "no-cache"),
             header_value("vary", "Accept, User-Agent"),
             header_value("link", "</API/JS>; rel=\"canonical\""),
         ],
-    },
-    Probe {
-        endpoint: "api client asset",
-        fixture: Fixture::Empty,
-        method: "GET",
-        target: Target::Literal("/symbol.js"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"",
-        status: 200,
-        response_headers: &[
+    )
+    .headers(&[("accept", "text/markdown")]),
+    get(
+        "api client asset",
+        Empty,
+        "/symbol.js",
+        200,
+        &[
             header_value("content-type", "text/javascript; charset=utf-8"),
             header("etag"),
             header_value("cache-control", "no-cache"),
         ],
-    },
-    Probe {
-        endpoint: "api client hash",
-        fixture: Fixture::Empty,
-        method: "GET",
-        target: Target::Literal("/symbol.js/HASH"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"",
-        status: 200,
-        response_headers: PLAIN_HEADER,
-    },
-    Probe {
-        endpoint: "api version",
-        fixture: Fixture::Empty,
-        method: "GET",
-        target: Target::Literal("/API/VERSION"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"",
-        status: 200,
-        response_headers: &[
+    ),
+    get(
+        "api client hash",
+        Empty,
+        "/symbol.js/HASH",
+        200,
+        PLAIN_HEADER,
+    ),
+    get(
+        "api version",
+        Empty,
+        "/API/VERSION",
+        200,
+        &[
             header_value("content-type", "application/json; charset=utf-8"),
             header("etag"),
             header_value("cache-control", "no-cache"),
         ],
-    },
-    Probe {
-        endpoint: "site listing",
-        fixture: Fixture::Site,
-        method: "GET",
-        target: Target::Literal("/FILES"),
-        request_headers: &[("accept", "application/json")],
-        body: b"",
-        status: 200,
-        response_headers: &[
-            header("content-type"),
-            header("etag"),
-            header_value("cache-control", "no-cache"),
-        ],
-    },
-    Probe {
-        endpoint: "site redirect",
-        fixture: Fixture::Site,
-        method: "GET",
-        target: Target::Literal("/hello"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"",
-        status: 307,
-        response_headers: &[header_value("location", "/hello/")],
-    },
-    Probe {
-        endpoint: "site index",
-        fixture: Fixture::Site,
-        method: "GET",
-        target: Target::Literal("/hello/"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"",
-        status: 200,
-        response_headers: READ_HEADERS,
-    },
-    Probe {
-        endpoint: "site put",
-        fixture: Fixture::Site,
-        method: "PUT",
-        target: Target::Literal("/hello"),
-        request_headers: &[("content-type", "text/html")],
-        body: b"<h1>updated</h1>",
-        status: 200,
-        response_headers: MUTATION_HEADERS,
-    },
-    Probe {
-        endpoint: "site pop",
-        fixture: Fixture::Site,
-        method: "DELETE",
-        target: Target::Literal("/hello"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"",
-        status: 200,
-        response_headers: &[
-            header("content-type"),
-            header("content-length"),
-            header("content-disposition"),
-            header("undo-token"),
-            header("undo-expires"),
-        ],
-    },
-    Probe {
-        endpoint: "site copy",
-        fixture: Fixture::Site,
-        method: "COPY",
-        target: Target::Literal("/hello"),
-        request_headers: &[("destination", "/copy")],
-        body: b"",
-        status: 201,
-        response_headers: MUTATION_HEADERS,
-    },
-    Probe {
-        endpoint: "site move",
-        fixture: Fixture::Site,
-        method: "MOVE",
-        target: Target::Literal("/hello"),
-        request_headers: &[("destination", "/moved")],
-        body: b"",
-        status: 200,
-        response_headers: MUTATION_HEADERS,
-    },
-    Probe {
-        endpoint: "site undo",
-        fixture: Fixture::Undo,
-        method: "UNDO",
-        target: Target::Literal("/hello"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"",
-        status: 200,
-        response_headers: PLAIN_HEADER,
-    },
-    Probe {
-        endpoint: "site expire",
-        fixture: Fixture::Site,
-        method: "EXPIRE",
-        target: Target::Literal("/hello"),
-        request_headers: &[("expiry-mode", "relative"), ("expiry-in", "1h")],
-        body: b"",
-        status: 200,
-        response_headers: &[
-            header("content-type"),
-            header_value("cache-control", "no-cache"),
-            header("expires"),
-            header_value("expiry-mode", "relative"),
-            header("undo-token"),
-            header("undo-expires"),
-        ],
-    },
-    Probe {
-        endpoint: "site management",
-        fixture: Fixture::Site,
-        method: "MANAGE",
-        target: Target::Literal("/hello"),
-        request_headers: &[("management-action", "status")],
-        body: b"",
-        status: 200,
-        response_headers: &[
+    ),
+    get("site listing", Site, "/FILES", 200, ETAG_NO_CACHE_HEADERS)
+        .headers(&[("accept", "application/json")]),
+    get(
+        "site redirect",
+        Site,
+        "/hello",
+        307,
+        &[header_value("location", "/hello/")],
+    ),
+    get("site index", Site, "/hello/", 200, READ_HEADERS),
+    Probe::new("site put", Site, "PUT", at("/hello"), 200, MUTATION_HEADERS)
+        .headers(&[("content-type", "text/html")])
+        .body(b"<h1>updated</h1>"),
+    Probe::new("site pop", Site, "DELETE", at("/hello"), 200, POP_HEADERS),
+    Probe::new(
+        "site copy",
+        Site,
+        "COPY",
+        at("/hello"),
+        201,
+        MUTATION_HEADERS,
+    )
+    .headers(&[("destination", "/copy")]),
+    Probe::new(
+        "site move",
+        Site,
+        "MOVE",
+        at("/hello"),
+        200,
+        MUTATION_HEADERS,
+    )
+    .headers(&[("destination", "/moved")]),
+    Probe::new("site undo", Undo, "UNDO", at("/hello"), 200, PLAIN_HEADER),
+    Probe::new(
+        "site expire",
+        Site,
+        "EXPIRE",
+        at("/hello"),
+        200,
+        EXPIRE_HEADERS,
+    )
+    .headers(&[("expiry-mode", "relative"), ("expiry-in", "1h")]),
+    Probe::new(
+        "site management",
+        Site,
+        "MANAGE",
+        at("/hello"),
+        200,
+        &[
             header("content-type"),
             header_value("cache-control", "no-store"),
         ],
-    },
-    Probe {
-        endpoint: "site file",
-        fixture: Fixture::Site,
-        method: "GET",
-        target: Target::Literal("/hello/assets/app.js"),
-        request_headers: &[("range", "bytes=0-1")],
-        body: b"",
-        status: 206,
-        response_headers: &[
+    )
+    .headers(&[("management-action", "status")]),
+    get(
+        "site file",
+        Site,
+        "/hello/assets/app.js",
+        206,
+        &[
             header("content-type"),
             header("content-length"),
             header("content-range"),
@@ -360,182 +293,123 @@ const SUCCESS_PROBES: &[Probe] = &[
             header("etag"),
             header("cache-control"),
         ],
-    },
-    Probe {
-        endpoint: "file put",
-        fixture: Fixture::Site,
-        method: "PUT",
-        target: Target::Literal("/hello/new.txt"),
-        request_headers: &[("content-type", "text/plain")],
-        body: b"new",
-        status: 200,
-        response_headers: MUTATION_HEADERS,
-    },
-    Probe {
-        endpoint: "file delete",
-        fixture: Fixture::Site,
-        method: "DELETE",
-        target: Target::Literal("/hello/assets/app.js"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"",
-        status: 200,
-        response_headers: &[
+    )
+    .headers(&[("range", "bytes=0-1")]),
+    Probe::new(
+        "file put",
+        Site,
+        "PUT",
+        at("/hello/new.txt"),
+        200,
+        MUTATION_HEADERS,
+    )
+    .headers(&[("content-type", "text/plain")])
+    .body(b"new"),
+    Probe::new(
+        "file delete",
+        Site,
+        "DELETE",
+        at("/hello/assets/app.js"),
+        200,
+        &[
             header("content-type"),
             header("undo-token"),
             header("undo-expires"),
         ],
-    },
-    Probe {
-        endpoint: "file expire",
-        fixture: Fixture::Site,
-        method: "EXPIRE",
-        target: Target::Literal("/hello/assets/app.js"),
-        request_headers: &[("expiry-mode", "relative"), ("expiry-in", "1h")],
-        body: b"",
-        status: 200,
-        response_headers: &[
-            header("content-type"),
-            header_value("cache-control", "no-cache"),
-            header("expires"),
-            header_value("expiry-mode", "relative"),
-            header("undo-token"),
-            header("undo-expires"),
-        ],
-    },
-    Probe {
-        endpoint: "archive get",
-        fixture: Fixture::Site,
-        method: "GET",
-        target: Target::Literal("/hello.tar.gz"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"",
-        status: 200,
-        response_headers: ARCHIVE_HEADERS,
-    },
-    Probe {
-        endpoint: "archive pop",
-        fixture: Fixture::Site,
-        method: "DELETE",
-        target: Target::Literal("/hello.tar.gz"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"",
-        status: 200,
-        response_headers: &[
-            header("content-type"),
-            header("content-length"),
-            header("content-disposition"),
-            header("undo-token"),
-            header("undo-expires"),
-        ],
-    },
-    Probe {
-        endpoint: "files inventory",
-        fixture: Fixture::Site,
-        method: "GET",
-        target: Target::Literal("/hello/FILES"),
-        request_headers: &[("accept", "application/json")],
-        body: b"",
-        status: 200,
-        response_headers: &[
+    ),
+    Probe::new(
+        "file expire",
+        Site,
+        "EXPIRE",
+        at("/hello/assets/app.js"),
+        200,
+        EXPIRE_HEADERS,
+    )
+    .headers(&[("expiry-mode", "relative"), ("expiry-in", "1h")]),
+    get("archive get", Site, "/hello.tar.gz", 200, ARCHIVE_HEADERS),
+    Probe::new(
+        "archive pop",
+        Site,
+        "DELETE",
+        at("/hello.tar.gz"),
+        200,
+        POP_HEADERS,
+    ),
+    get(
+        "files inventory",
+        Site,
+        "/hello/FILES",
+        200,
+        &[
             header_value("content-type", "application/json"),
             header("etag"),
             header("content-revision"),
             header_value("cache-control", "no-cache"),
         ],
-    },
-    Probe {
-        endpoint: "files subtree",
-        fixture: Fixture::Site,
-        method: "GET",
-        target: Target::Literal("/hello/FILES/assets/"),
-        request_headers: &[("accept", "application/json")],
-        body: b"",
-        status: 200,
-        response_headers: &[
-            header("content-type"),
-            header("etag"),
-            header_value("cache-control", "no-cache"),
-        ],
-    },
-    Probe {
-        endpoint: "file hash",
-        fixture: Fixture::Site,
-        method: "GET",
-        target: Target::Literal("/hello/assets/app.js/HASH"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"",
-        status: 200,
-        response_headers: PLAIN_HEADER,
-    },
-    Probe {
-        endpoint: "render asset",
-        fixture: Fixture::Empty,
-        method: "GET",
-        target: Target::RenderAsset("markdown.css"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"",
-        status: 200,
-        response_headers: &[
+    )
+    .headers(&[("accept", "application/json")]),
+    get(
+        "files subtree",
+        Site,
+        "/hello/FILES/assets/",
+        200,
+        ETAG_NO_CACHE_HEADERS,
+    )
+    .headers(&[("accept", "application/json")]),
+    get(
+        "file hash",
+        Site,
+        "/hello/assets/app.js/HASH",
+        200,
+        PLAIN_HEADER,
+    ),
+    Probe::new(
+        "render asset",
+        Empty,
+        "GET",
+        Target::RenderAsset("markdown.css"),
+        200,
+        &[
             header_value("content-type", "text/css; charset=utf-8"),
             header("etag"),
             header_value("cache-control", "public, max-age=31536000, immutable"),
         ],
-    },
-    Probe {
-        endpoint: "file raw",
-        fixture: Fixture::Site,
-        method: "GET",
-        target: Target::Literal("/hello/assets/app.js/RAW"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"",
-        status: 200,
-        response_headers: &[
+    ),
+    get(
+        "file raw",
+        Site,
+        "/hello/assets/app.js/RAW",
+        200,
+        &[
             header_value("content-type", "text/javascript; charset=utf-8"),
             header("content-length"),
             header("etag"),
             header("cache-control"),
             header("accept-ranges"),
         ],
-    },
-    Probe {
-        endpoint: "undo stack",
-        fixture: Fixture::Undo,
-        method: "GET",
-        target: Target::Literal("/hello/UNDO"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"",
-        status: 200,
-        response_headers: CACHE_JSON_HEADERS,
-    },
-    Probe {
-        endpoint: "expiry inventory",
-        fixture: Fixture::Site,
-        method: "GET",
-        target: Target::Literal("/hello/EXPIRES"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"",
-        status: 200,
-        response_headers: CACHE_JSON_HEADERS,
-    },
-    Probe {
-        endpoint: "expiry target",
-        fixture: Fixture::Site,
-        method: "GET",
-        target: Target::Literal("/hello/assets/app.js/EXPIRES"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"",
-        status: 200,
-        response_headers: CACHE_JSON_HEADERS,
-    },
-    Probe {
-        endpoint: "immutable blob",
-        fixture: Fixture::Site,
-        method: "GET",
-        target: Target::Blob,
-        request_headers: &[("range", "bytes=0-1")],
-        body: b"",
-        status: 206,
-        response_headers: &[
+    ),
+    get("undo stack", Undo, "/hello/UNDO", 200, CACHE_JSON_HEADERS),
+    get(
+        "expiry inventory",
+        Site,
+        "/hello/EXPIRES",
+        200,
+        CACHE_JSON_HEADERS,
+    ),
+    get(
+        "expiry target",
+        Site,
+        "/hello/assets/app.js/EXPIRES",
+        200,
+        CACHE_JSON_HEADERS,
+    ),
+    Probe::new(
+        "immutable blob",
+        Site,
+        "GET",
+        Target::Blob,
+        206,
+        &[
             header("content-type"),
             header("content-length"),
             header("content-range"),
@@ -543,39 +417,34 @@ const SUCCESS_PROBES: &[Probe] = &[
             header("etag"),
             header_value("cache-control", "public, max-age=31536000, immutable"),
         ],
-    },
-    Probe {
-        endpoint: "alias batch",
-        fixture: Fixture::Site,
-        method: "ALIAS",
-        target: Target::Literal("/hello/"),
-        request_headers: &[("content-type", "application/json")],
-        body: br#"{"aliases":[{"path":"batch-link","target":"assets/app.js"}]}"#,
-        status: 201,
-        response_headers: MUTATION_HEADERS,
-    },
-    Probe {
-        endpoint: "alias file",
-        fixture: Fixture::Site,
-        method: "ALIAS",
-        target: Target::Literal("/hello/latest.js"),
-        request_headers: &[("alias-target", "assets/app.js")],
-        body: b"",
-        status: 201,
-        response_headers: MUTATION_HEADERS,
-    },
-    Probe {
-        endpoint: "allocated file",
-        fixture: Fixture::Site,
-        method: "POST",
-        target: Target::Literal("/hello/generated/"),
-        request_headers: &[
-            ("content-type", "application/octet-stream"),
-            ("file-extension", "bin"),
-        ],
-        body: b"allocated",
-        status: 201,
-        response_headers: &[
+    )
+    .headers(&[("range", "bytes=0-1")]),
+    Probe::new(
+        "alias batch",
+        Site,
+        "ALIAS",
+        at("/hello/"),
+        201,
+        MUTATION_HEADERS,
+    )
+    .headers(&[("content-type", "application/json")])
+    .body(br#"{"aliases":[{"path":"batch-link","target":"assets/app.js"}]}"#),
+    Probe::new(
+        "alias file",
+        Site,
+        "ALIAS",
+        at("/hello/latest.js"),
+        201,
+        MUTATION_HEADERS,
+    )
+    .headers(&[("alias-target", "assets/app.js")]),
+    Probe::new(
+        "allocated file",
+        Site,
+        "POST",
+        at("/hello/generated/"),
+        201,
+        &[
             header("content-type"),
             header("content-location"),
             header("location"),
@@ -584,540 +453,442 @@ const SUCCESS_PROBES: &[Probe] = &[
             header("undo-token"),
             header("undo-expires"),
         ],
-    },
-    Probe {
-        endpoint: "file replace",
-        fixture: Fixture::Site,
-        method: "REPLACE",
-        target: Target::Literal("/hello/assets/app.js"),
-        request_headers: &[("if-content-match", "{fixture-file-hash}")],
-        body: b"replacement",
-        status: 200,
-        response_headers: MUTATION_HEADERS,
-    },
-    Probe {
-        endpoint: "file splice",
-        fixture: Fixture::Site,
-        method: "PATCH",
-        target: Target::Literal("/hello/assets/app.js"),
-        request_headers: &[
-            ("if-content-match", "{fixture-file-hash}"),
-            ("splice", "offset=0; delete=0; insert=1"),
-        ],
-        body: b"X",
-        status: 200,
-        response_headers: MUTATION_HEADERS,
-    },
+    )
+    .headers(&[
+        ("content-type", "application/octet-stream"),
+        ("file-extension", "bin"),
+    ])
+    .body(b"allocated"),
+    Probe::new(
+        "file replace",
+        Site,
+        "REPLACE",
+        at("/hello/assets/app.js"),
+        200,
+        MUTATION_HEADERS,
+    )
+    .headers(&[("if-content-match", "{fixture-file-hash}")])
+    .body(b"replacement"),
+    Probe::new(
+        "file splice",
+        Site,
+        "PATCH",
+        at("/hello/assets/app.js"),
+        200,
+        MUTATION_HEADERS,
+    )
+    .headers(&[
+        ("if-content-match", "{fixture-file-hash}"),
+        ("splice", "offset=0; delete=0; insert=1"),
+    ])
+    .body(b"X"),
 ];
 
 const ERROR_PROBES: &[Probe] = &[
-    Probe {
-        endpoint: "unnamed put",
-        fixture: Fixture::Empty,
-        method: "PUT",
-        target: Target::Literal("/"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"",
-        status: 400,
-        response_headers: PLAIN_HEADER,
-    },
-    Probe {
-        endpoint: "site redirect",
-        fixture: Fixture::Empty,
-        method: "GET",
-        target: Target::Literal("/missing"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"",
-        status: 404,
-        response_headers: PLAIN_HEADER,
-    },
-    Probe {
-        endpoint: "site index",
-        fixture: Fixture::Empty,
-        method: "GET",
-        target: Target::Literal("/missing/"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"",
-        status: 404,
-        response_headers: PLAIN_HEADER,
-    },
-    Probe {
-        endpoint: "site put",
-        fixture: Fixture::Site,
-        method: "PUT",
-        target: Target::Literal("/hello"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"",
-        status: 400,
-        response_headers: PLAIN_HEADER,
-    },
-    Probe {
-        endpoint: "site pop",
-        fixture: Fixture::Empty,
-        method: "DELETE",
-        target: Target::Literal("/missing"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"",
-        status: 404,
-        response_headers: PLAIN_HEADER,
-    },
-    Probe {
-        endpoint: "site copy",
-        fixture: Fixture::Site,
-        method: "COPY",
-        target: Target::Literal("/hello"),
-        request_headers: &[("destination", "/hello")],
-        body: b"",
-        status: 409,
-        response_headers: PLAIN_HEADER,
-    },
-    Probe {
-        endpoint: "site move",
-        fixture: Fixture::Site,
-        method: "MOVE",
-        target: Target::Literal("/hello"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"",
-        status: 400,
-        response_headers: PLAIN_HEADER,
-    },
-    Probe {
-        endpoint: "site undo",
-        fixture: Fixture::Empty,
-        method: "UNDO",
-        target: Target::Literal("/missing"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"",
-        status: 404,
-        response_headers: PLAIN_HEADER,
-    },
-    Probe {
-        endpoint: "site expire",
-        fixture: Fixture::Site,
-        method: "EXPIRE",
-        target: Target::Literal("/hello"),
-        request_headers: &[("expiry-mode", "relative")],
-        body: b"",
-        status: 400,
-        response_headers: PLAIN_HEADER,
-    },
-    Probe {
-        endpoint: "site management",
-        fixture: Fixture::Site,
-        method: "MANAGE",
-        target: Target::Literal("/hello"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"",
-        status: 400,
-        response_headers: PLAIN_HEADER,
-    },
-    Probe {
-        endpoint: "site management",
-        fixture: Fixture::Site,
-        method: "MANAGE",
-        target: Target::Literal("/hello"),
-        request_headers: &[("management-action", "claim")],
-        body: b"",
-        status: 403,
-        response_headers: PLAIN_HEADER,
-    },
-    Probe {
-        endpoint: "site file",
-        fixture: Fixture::Site,
-        method: "GET",
-        target: Target::Literal("/hello/assets/app.js"),
-        request_headers: &[("range", "bytes=99-100")],
-        body: b"",
-        status: 416,
-        response_headers: &[
-            header("content-range"),
-            header("accept-ranges"),
-            header("etag"),
-            header("cache-control"),
-        ],
-    },
-    Probe {
-        endpoint: "file put",
-        fixture: Fixture::Site,
-        method: "PUT",
-        target: Target::Literal("/hello/new.txt"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"",
-        status: 400,
-        response_headers: PLAIN_HEADER,
-    },
-    Probe {
-        endpoint: "file delete",
-        fixture: Fixture::Site,
-        method: "DELETE",
-        target: Target::Literal("/hello/missing.txt"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"",
-        status: 404,
-        response_headers: PLAIN_HEADER,
-    },
-    Probe {
-        endpoint: "file expire",
-        fixture: Fixture::Site,
-        method: "EXPIRE",
-        target: Target::Literal("/hello/missing.txt"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"",
-        status: 404,
-        response_headers: PLAIN_HEADER,
-    },
-    Probe {
-        endpoint: "archive get",
-        fixture: Fixture::Empty,
-        method: "GET",
-        target: Target::Literal("/missing.tar.gz"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"",
-        status: 404,
-        response_headers: PLAIN_HEADER,
-    },
-    Probe {
-        endpoint: "archive pop",
-        fixture: Fixture::Empty,
-        method: "DELETE",
-        target: Target::Literal("/missing.tar.gz"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"",
-        status: 404,
-        response_headers: PLAIN_HEADER,
-    },
-    Probe {
-        endpoint: "files inventory",
-        fixture: Fixture::Empty,
-        method: "GET",
-        target: Target::Literal("/missing/FILES"),
-        request_headers: &[("accept", "application/json")],
-        body: b"",
-        status: 404,
-        response_headers: PLAIN_HEADER,
-    },
-    Probe {
-        endpoint: "files subtree",
-        fixture: Fixture::Empty,
-        method: "GET",
-        target: Target::Literal("/missing/FILES/path"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"",
-        status: 404,
-        response_headers: PLAIN_HEADER,
-    },
-    Probe {
-        endpoint: "file hash",
-        fixture: Fixture::Site,
-        method: "GET",
-        target: Target::Literal("/hello/missing.txt/HASH"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"",
-        status: 404,
-        response_headers: PLAIN_HEADER,
-    },
+    Probe::new("unnamed put", Empty, "PUT", at("/"), 400, PLAIN_HEADER),
+    get("site redirect", Empty, "/missing", 404, PLAIN_HEADER),
+    get("site index", Empty, "/missing/", 404, PLAIN_HEADER),
+    Probe::new("site put", Site, "PUT", at("/hello"), 400, PLAIN_HEADER),
+    Probe::new(
+        "site pop",
+        Empty,
+        "DELETE",
+        at("/missing"),
+        404,
+        PLAIN_HEADER,
+    ),
+    Probe::new("site copy", Site, "COPY", at("/hello"), 409, PLAIN_HEADER)
+        .headers(&[("destination", "/hello")]),
+    Probe::new("site move", Site, "MOVE", at("/hello"), 400, PLAIN_HEADER),
+    Probe::new(
+        "site undo",
+        Empty,
+        "UNDO",
+        at("/missing"),
+        404,
+        PLAIN_HEADER,
+    ),
+    Probe::new(
+        "site expire",
+        Site,
+        "EXPIRE",
+        at("/hello"),
+        400,
+        PLAIN_HEADER,
+    )
+    .headers(&[("expiry-mode", "relative")]),
+    Probe::new(
+        "site management",
+        Site,
+        "MANAGE",
+        at("/hello"),
+        400,
+        PLAIN_HEADER,
+    ),
+    Probe::new(
+        "site management",
+        Site,
+        "MANAGE",
+        at("/hello"),
+        403,
+        PLAIN_HEADER,
+    )
+    .headers(&[("management-action", "claim")]),
+    get(
+        "site file",
+        Site,
+        "/hello/assets/app.js",
+        416,
+        UNSATISFIABLE_RANGE_HEADERS,
+    )
+    .headers(&[("range", "bytes=99-100")]),
+    Probe::new(
+        "file put",
+        Site,
+        "PUT",
+        at("/hello/new.txt"),
+        400,
+        PLAIN_HEADER,
+    ),
+    Probe::new(
+        "file delete",
+        Site,
+        "DELETE",
+        at("/hello/missing.txt"),
+        404,
+        PLAIN_HEADER,
+    ),
+    Probe::new(
+        "file expire",
+        Site,
+        "EXPIRE",
+        at("/hello/missing.txt"),
+        404,
+        PLAIN_HEADER,
+    ),
+    get("archive get", Empty, "/missing.tar.gz", 404, PLAIN_HEADER),
+    Probe::new(
+        "archive pop",
+        Empty,
+        "DELETE",
+        at("/missing.tar.gz"),
+        404,
+        PLAIN_HEADER,
+    ),
+    get(
+        "files inventory",
+        Empty,
+        "/missing/FILES",
+        404,
+        PLAIN_HEADER,
+    )
+    .headers(&[("accept", "application/json")]),
+    get(
+        "files subtree",
+        Empty,
+        "/missing/FILES/path",
+        404,
+        PLAIN_HEADER,
+    ),
+    get(
+        "file hash",
+        Site,
+        "/hello/missing.txt/HASH",
+        404,
+        PLAIN_HEADER,
+    ),
     // A bundle this binary does not serve is a 404, never a substitution:
     // anything else would break the `immutable` promise.
-    Probe {
-        endpoint: "render asset",
-        fixture: Fixture::Empty,
-        method: "GET",
-        target: Target::Literal("/ASSETS/0000000000000000/markdown.css"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"",
-        status: 404,
-        response_headers: PLAIN_HEADER,
-    },
-    Probe {
-        endpoint: "render asset",
-        fixture: Fixture::Empty,
-        method: "GET",
-        target: Target::RenderAsset("missing.css"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"",
-        status: 404,
-        response_headers: PLAIN_HEADER,
-    },
-    Probe {
-        endpoint: "file raw",
-        fixture: Fixture::Site,
-        method: "GET",
-        target: Target::Literal("/hello/missing.txt/RAW"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"",
-        status: 404,
-        response_headers: PLAIN_HEADER,
-    },
+    get(
+        "render asset",
+        Empty,
+        "/ASSETS/0000000000000000/markdown.css",
+        404,
+        PLAIN_HEADER,
+    ),
+    Probe::new(
+        "render asset",
+        Empty,
+        "GET",
+        Target::RenderAsset("missing.css"),
+        404,
+        PLAIN_HEADER,
+    ),
+    get(
+        "file raw",
+        Site,
+        "/hello/missing.txt/RAW",
+        404,
+        PLAIN_HEADER,
+    ),
     // A directory has no raw bytes, even one with an index file.
-    Probe {
-        endpoint: "file raw",
-        fixture: Fixture::Site,
-        method: "GET",
-        target: Target::Literal("/hello/assets/RAW"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"",
-        status: 404,
-        response_headers: PLAIN_HEADER,
-    },
-    Probe {
-        endpoint: "file raw",
-        fixture: Fixture::Site,
-        method: "GET",
-        target: Target::Literal("/hello/RAW"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"",
-        status: 404,
-        response_headers: PLAIN_HEADER,
-    },
-    Probe {
-        endpoint: "file raw",
-        fixture: Fixture::Site,
-        method: "GET",
-        target: Target::Literal("/hello/assets/app.js/RAW"),
-        request_headers: &[("range", "bytes=99-100")],
-        body: b"",
-        status: 416,
-        response_headers: &[
-            header("content-range"),
-            header("accept-ranges"),
-            header("etag"),
-            header("cache-control"),
-        ],
-    },
-    Probe {
-        endpoint: "expiry inventory",
-        fixture: Fixture::Empty,
-        method: "GET",
-        target: Target::Literal("/missing/EXPIRES"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"",
-        status: 404,
-        response_headers: PLAIN_HEADER,
-    },
-    Probe {
-        endpoint: "expiry target",
-        fixture: Fixture::Site,
-        method: "GET",
-        target: Target::Literal("/hello/missing.txt/EXPIRES"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"",
-        status: 404,
-        response_headers: PLAIN_HEADER,
-    },
-    Probe {
-        endpoint: "immutable blob",
-        fixture: Fixture::Site,
-        method: "GET",
-        target: Target::Literal("/.blob/hello/deadbeef"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"",
-        status: 404,
-        response_headers: PLAIN_HEADER,
-    },
-    Probe {
-        endpoint: "site put",
-        fixture: Fixture::Managed,
-        method: "PUT",
-        target: Target::Literal("/hello"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"<h1>unauthorized</h1>",
-        status: 401,
-        response_headers: &[
+    get("file raw", Site, "/hello/assets/RAW", 404, PLAIN_HEADER),
+    get("file raw", Site, "/hello/RAW", 404, PLAIN_HEADER),
+    get(
+        "file raw",
+        Site,
+        "/hello/assets/app.js/RAW",
+        416,
+        UNSATISFIABLE_RANGE_HEADERS,
+    )
+    .headers(&[("range", "bytes=99-100")]),
+    get(
+        "expiry inventory",
+        Empty,
+        "/missing/EXPIRES",
+        404,
+        PLAIN_HEADER,
+    ),
+    get(
+        "expiry target",
+        Site,
+        "/hello/missing.txt/EXPIRES",
+        404,
+        PLAIN_HEADER,
+    ),
+    get(
+        "immutable blob",
+        Site,
+        "/.blob/hello/deadbeef",
+        404,
+        PLAIN_HEADER,
+    ),
+    Probe::new(
+        "site put",
+        Managed,
+        "PUT",
+        at("/hello"),
+        401,
+        &[
             header_value("content-type", "text/plain; charset=utf-8"),
             header_value("www-authenticate", "Bearer realm=\"symbol\""),
             header_value("cache-control", "no-store"),
         ],
-    },
-    Probe {
-        endpoint: "site pop",
-        fixture: Fixture::Managed,
-        method: "DELETE",
-        target: Target::Literal("/hello"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"",
-        status: 401,
-        response_headers: &[
+    )
+    .body(b"<h1>unauthorized</h1>"),
+    Probe::new(
+        "site pop",
+        Managed,
+        "DELETE",
+        at("/hello"),
+        401,
+        &[
             header_value("www-authenticate", "Bearer realm=\"symbol\""),
             header_value("cache-control", "no-store"),
         ],
-    },
-    Probe {
-        endpoint: "site move",
-        fixture: Fixture::Managed,
-        method: "MOVE",
-        target: Target::Literal("/hello"),
-        request_headers: &[("destination", "/moved")],
-        body: b"",
-        status: 401,
-        response_headers: &[header_value("www-authenticate", "Bearer realm=\"symbol\"")],
-    },
-    Probe {
-        endpoint: "site undo",
-        fixture: Fixture::Managed,
-        method: "UNDO",
-        target: Target::Literal("/hello"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"",
-        status: 401,
-        response_headers: &[header_value("www-authenticate", "Bearer realm=\"symbol\"")],
-    },
-    Probe {
-        endpoint: "site expire",
-        fixture: Fixture::Managed,
-        method: "EXPIRE",
-        target: Target::Literal("/hello"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"",
-        status: 401,
-        response_headers: &[header_value("www-authenticate", "Bearer realm=\"symbol\"")],
-    },
-    Probe {
-        endpoint: "file put",
-        fixture: Fixture::Managed,
-        method: "PUT",
-        target: Target::Literal("/hello/new.txt"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"unauthorized",
-        status: 401,
-        response_headers: &[header_value("www-authenticate", "Bearer realm=\"symbol\"")],
-    },
-    Probe {
-        endpoint: "file delete",
-        fixture: Fixture::Managed,
-        method: "DELETE",
-        target: Target::Literal("/hello/assets/app.js"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"",
-        status: 401,
-        response_headers: &[header_value("www-authenticate", "Bearer realm=\"symbol\"")],
-    },
-    Probe {
-        endpoint: "file expire",
-        fixture: Fixture::Managed,
-        method: "EXPIRE",
-        target: Target::Literal("/hello/assets/app.js"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"",
-        status: 401,
-        response_headers: &[header_value("www-authenticate", "Bearer realm=\"symbol\"")],
-    },
-    Probe {
-        endpoint: "archive pop",
-        fixture: Fixture::Managed,
-        method: "DELETE",
-        target: Target::Literal("/hello.tar.gz"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"",
-        status: 401,
-        response_headers: &[header_value("www-authenticate", "Bearer realm=\"symbol\"")],
-    },
-    Probe {
-        endpoint: "alias batch",
-        fixture: Fixture::Site,
-        method: "ALIAS",
-        target: Target::Literal("/hello/"),
-        request_headers: &[("content-type", "application/json")],
-        body: br#"{"aliases":[]}"#,
-        status: 400,
-        response_headers: PLAIN_HEADER,
-    },
-    Probe {
-        endpoint: "alias file",
-        fixture: Fixture::Site,
-        method: "ALIAS",
-        target: Target::Literal("/hello/latest.js"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"",
-        status: 400,
-        response_headers: PLAIN_HEADER,
-    },
-    Probe {
-        endpoint: "allocated file",
-        fixture: Fixture::Empty,
-        method: "POST",
-        target: Target::Literal("/missing/"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"must not spool",
-        status: 404,
-        response_headers: PLAIN_HEADER,
-    },
-    Probe {
-        endpoint: "file replace",
-        fixture: Fixture::Site,
-        method: "REPLACE",
-        target: Target::Literal("/hello/assets/app.js"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"replacement",
-        status: 400,
-        response_headers: PLAIN_HEADER,
-    },
-    Probe {
-        endpoint: "file splice",
-        fixture: Fixture::Site,
-        method: "PATCH",
-        target: Target::Literal("/hello/assets/app.js"),
-        request_headers: &[
-            ("if-content-match", "{fixture-file-hash}"),
-            ("splice", "offset=999; delete=0; insert=0"),
-        ],
-        body: b"",
-        status: 416,
-        response_headers: PLAIN_HEADER,
-    },
-    Probe {
-        endpoint: "alias batch",
-        fixture: Fixture::Managed,
-        method: "ALIAS",
-        target: Target::Literal("/hello/"),
-        request_headers: &[("content-type", "application/json")],
-        body: br#"{"aliases":[{"path":"blocked","target":"index.html"}]}"#,
-        status: 401,
-        response_headers: &[header_value("www-authenticate", "Bearer realm=\"symbol\"")],
-    },
-    Probe {
-        endpoint: "alias file",
-        fixture: Fixture::Managed,
-        method: "ALIAS",
-        target: Target::Literal("/hello/blocked"),
-        request_headers: &[("alias-target", "index.html")],
-        body: b"",
-        status: 401,
-        response_headers: &[header_value("www-authenticate", "Bearer realm=\"symbol\"")],
-    },
-    Probe {
-        endpoint: "allocated file",
-        fixture: Fixture::Managed,
-        method: "POST",
-        target: Target::Literal("/hello/"),
-        request_headers: NO_REQUEST_HEADERS,
-        body: b"must not spool",
-        status: 401,
-        response_headers: &[header_value("www-authenticate", "Bearer realm=\"symbol\"")],
-    },
-    Probe {
-        endpoint: "file replace",
-        fixture: Fixture::Managed,
-        method: "REPLACE",
-        target: Target::Literal("/hello/index.html"),
-        request_headers: &[("if-content-match", "{fixture-file-hash}")],
-        body: b"must not spool",
-        status: 401,
-        response_headers: &[header_value("www-authenticate", "Bearer realm=\"symbol\"")],
-    },
-    Probe {
-        endpoint: "file splice",
-        fixture: Fixture::Managed,
-        method: "PATCH",
-        target: Target::Literal("/hello/index.html"),
-        request_headers: &[
-            ("if-content-match", "{fixture-file-hash}"),
-            ("splice", "offset=0; delete=0; insert=1"),
-        ],
-        body: b"x",
-        status: 401,
-        response_headers: &[header_value("www-authenticate", "Bearer realm=\"symbol\"")],
-    },
+    ),
+    Probe::new(
+        "site move",
+        Managed,
+        "MOVE",
+        at("/hello"),
+        401,
+        UNAUTHORIZED_HEADER,
+    )
+    .headers(&[("destination", "/moved")]),
+    Probe::new(
+        "site undo",
+        Managed,
+        "UNDO",
+        at("/hello"),
+        401,
+        UNAUTHORIZED_HEADER,
+    ),
+    Probe::new(
+        "site expire",
+        Managed,
+        "EXPIRE",
+        at("/hello"),
+        401,
+        UNAUTHORIZED_HEADER,
+    ),
+    Probe::new(
+        "file put",
+        Managed,
+        "PUT",
+        at("/hello/new.txt"),
+        401,
+        UNAUTHORIZED_HEADER,
+    )
+    .body(b"unauthorized"),
+    Probe::new(
+        "file delete",
+        Managed,
+        "DELETE",
+        at("/hello/assets/app.js"),
+        401,
+        UNAUTHORIZED_HEADER,
+    ),
+    Probe::new(
+        "file expire",
+        Managed,
+        "EXPIRE",
+        at("/hello/assets/app.js"),
+        401,
+        UNAUTHORIZED_HEADER,
+    ),
+    Probe::new(
+        "archive pop",
+        Managed,
+        "DELETE",
+        at("/hello.tar.gz"),
+        401,
+        UNAUTHORIZED_HEADER,
+    ),
+    Probe::new(
+        "alias batch",
+        Site,
+        "ALIAS",
+        at("/hello/"),
+        400,
+        PLAIN_HEADER,
+    )
+    .headers(&[("content-type", "application/json")])
+    .body(br#"{"aliases":[]}"#),
+    Probe::new(
+        "alias file",
+        Site,
+        "ALIAS",
+        at("/hello/latest.js"),
+        400,
+        PLAIN_HEADER,
+    ),
+    Probe::new(
+        "allocated file",
+        Empty,
+        "POST",
+        at("/missing/"),
+        404,
+        PLAIN_HEADER,
+    )
+    .body(b"must not spool"),
+    Probe::new(
+        "file replace",
+        Site,
+        "REPLACE",
+        at("/hello/assets/app.js"),
+        400,
+        PLAIN_HEADER,
+    )
+    .body(b"replacement"),
+    Probe::new(
+        "file splice",
+        Site,
+        "PATCH",
+        at("/hello/assets/app.js"),
+        416,
+        PLAIN_HEADER,
+    )
+    .headers(&[
+        ("if-content-match", "{fixture-file-hash}"),
+        ("splice", "offset=999; delete=0; insert=0"),
+    ]),
+    Probe::new(
+        "alias batch",
+        Managed,
+        "ALIAS",
+        at("/hello/"),
+        401,
+        UNAUTHORIZED_HEADER,
+    )
+    .headers(&[("content-type", "application/json")])
+    .body(br#"{"aliases":[{"path":"blocked","target":"index.html"}]}"#),
+    Probe::new(
+        "alias file",
+        Managed,
+        "ALIAS",
+        at("/hello/blocked"),
+        401,
+        UNAUTHORIZED_HEADER,
+    )
+    .headers(&[("alias-target", "index.html")]),
+    Probe::new(
+        "allocated file",
+        Managed,
+        "POST",
+        at("/hello/"),
+        401,
+        UNAUTHORIZED_HEADER,
+    )
+    .body(b"must not spool"),
+    Probe::new(
+        "file replace",
+        Managed,
+        "REPLACE",
+        at("/hello/index.html"),
+        401,
+        UNAUTHORIZED_HEADER,
+    )
+    .headers(&[("if-content-match", "{fixture-file-hash}")])
+    .body(b"must not spool"),
+    Probe::new(
+        "file splice",
+        Managed,
+        "PATCH",
+        at("/hello/index.html"),
+        401,
+        UNAUTHORIZED_HEADER,
+    )
+    .headers(&[
+        ("if-content-match", "{fixture-file-hash}"),
+        ("splice", "offset=0; delete=0; insert=1"),
+    ])
+    .body(b"x"),
 ];
+
+fn fresh_store() -> (tempfile::TempDir, Store) {
+    let root = tempfile::tempdir().unwrap();
+    let store = Store::new(root.path().to_path_buf()).unwrap();
+    (root, store)
+}
+
+fn put(store: &Store, site: &str, path: &str, bytes: &[u8]) {
+    store.put_file(site, path, bytes).unwrap();
+}
+
+fn file_hash(store: &Store, site: &str, path: &str) -> ContentHash {
+    let store::Node::File { hash, .. } = store.lookup(site, path).unwrap() else {
+        panic!("{site}/{path} must be a file");
+    };
+    hash
+}
+
+fn set_relative_expiry(store: &Store, site: &str, path: &str, duration_seconds: u64) {
+    store
+        .set_expiry(
+            site,
+            path,
+            Some(expiry::ExpiryPolicy::Relative { duration_seconds }),
+        )
+        .unwrap();
+}
+
+fn own_expiry_mode(store: &Store, site: &str, path: &str) -> expiry::ExpiryMode {
+    store
+        .expiry_report(site, path)
+        .unwrap()
+        .own_policy
+        .unwrap()
+        .mode
+}
+
+/// Spooled upload bodies live under `<root>/tmp`; a request rejected before
+/// spooling leaves it empty.
+fn tmp_entries(root: &std::path::Path) -> usize {
+    std::fs::read_dir(root.join("tmp")).unwrap().count()
+}
+
+fn assert_replayed(response: &Response) {
+    assert_eq!(response.headers()["idempotency-replayed"], "true");
+}
+
+fn header_text(response: &Response, name: impl axum::http::header::AsHeaderName) -> String {
+    response.headers()[name].to_str().unwrap().to_string()
+}
+
+async fn body_bytes(response: Response) -> axum::body::Bytes {
+    to_bytes(response.into_body(), usize::MAX).await.unwrap()
+}
 
 fn endpoint(name: &str) -> &'static contract::EndpointContract {
     contract::ENDPOINTS
@@ -1127,32 +898,17 @@ fn endpoint(name: &str) -> &'static contract::EndpointContract {
 }
 
 async fn fixture(kind: Fixture) -> (tempfile::TempDir, Store, Router) {
-    let root = tempfile::tempdir().unwrap();
-    let store = Store::new(root.path().to_path_buf()).unwrap();
+    let (root, store) = fresh_store();
     if matches!(kind, Fixture::Site | Fixture::Undo | Fixture::Managed) {
-        store
-            .put_file("hello", "index.html", b"<h1>hello</h1>")
-            .unwrap();
-        store
-            .put_file("hello", "assets/app.js", b"console.log('hello')")
-            .unwrap();
+        put(&store, "hello", "index.html", b"<h1>hello</h1>");
+        put(&store, "hello", "assets/app.js", b"console.log('hello')");
     }
     if matches!(kind, Fixture::Managed) {
         store.operator_claim("hello").unwrap();
     }
     let app = router(App::new(store.clone()));
     if matches!(kind, Fixture::Undo) {
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("PUT")
-                    .uri("/hello/undo.txt")
-                    .body(Body::from("undo me"))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        let response = send(&app, "PUT", "/hello/undo.txt", &[], "undo me").await;
         assert_eq!(response.status(), StatusCode::OK);
     }
     (root, store, app)
@@ -1162,10 +918,7 @@ fn target_uri(target: Target, store: &Store) -> String {
     match target {
         Target::Literal(path) => path.to_string(),
         Target::Blob => {
-            let store::Node::File { hash, .. } = store.lookup("hello", "assets/app.js").unwrap()
-            else {
-                panic!("fixture file must be a blob");
-            };
+            let hash = file_hash(store, "hello", "assets/app.js");
             format!("/.blob/hello/{}", hash.to_hex())
         }
         Target::RenderAsset(path) => format!("{}/{path}", crate::assets::base()),
@@ -1321,7 +1074,7 @@ async fn assert_exact_outcome(probe: Probe, response: Response) {
         .and_then(|value| value.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = body_bytes(response).await;
     match expected.body {
         contract::WireBody::Empty => assert!(body.is_empty()),
         contract::WireBody::Json => {
@@ -1376,9 +1129,106 @@ async fn send(
         .unwrap()
 }
 
+async fn fetch(app: &Router, path: &str) -> Response {
+    send(app, "GET", path, &[], Body::empty()).await
+}
+
+/// `POST /hello/generated/` of an allocated file named from `asset-`.
+async fn post_generated(
+    app: &Router,
+    extension: &str,
+    extra_headers: &[(&str, &str)],
+    idempotency_key: &str,
+    body: &str,
+) -> Response {
+    let mut headers = vec![
+        ("content-type", "application/octet-stream"),
+        ("file-prefix", "asset-"),
+        ("file-extension", extension),
+    ];
+    headers.extend_from_slice(extra_headers);
+    headers.push(("idempotency-key", idempotency_key));
+    send(app, "POST", "/hello/generated/", &headers, body.to_string()).await
+}
+
+async fn alias_latest(app: &Router, target: &str, idempotency_key: &str) -> Response {
+    send(
+        app,
+        "ALIAS",
+        "/hello/latest.js",
+        &[
+            ("alias-target", target),
+            ("idempotency-key", idempotency_key),
+        ],
+        Body::empty(),
+    )
+    .await
+}
+
+async fn replace_at(
+    app: &Router,
+    path: &str,
+    base_hash: &str,
+    idempotency_key: &str,
+    body: &str,
+) -> Response {
+    send(
+        app,
+        "REPLACE",
+        path,
+        &[
+            ("if-content-match", base_hash),
+            ("idempotency-key", idempotency_key),
+        ],
+        body.to_string(),
+    )
+    .await
+}
+
+async fn splice_at(
+    app: &Router,
+    path: &str,
+    base_hash: &str,
+    splice: &str,
+    extra_headers: &[(&str, &str)],
+    body: impl Into<Body>,
+) -> Response {
+    let mut headers = vec![("if-content-match", base_hash), ("splice", splice)];
+    headers.extend_from_slice(extra_headers);
+    send(app, "PATCH", path, &headers, body).await
+}
+
+fn declares_exact_outcome(endpoint_name: &str, kind: contract::OutcomeKind, status: u16) -> bool {
+    endpoint(endpoint_name)
+        .exact_outcome(kind, status, contract::RequestVariant::Default)
+        .is_some()
+}
+
+/// `ALIAS` of a batch to a folder, optionally idempotent.
+async fn alias_batch(
+    app: &Router,
+    path: &str,
+    idempotency_key: Option<&str>,
+    body: impl Into<Body>,
+) -> Response {
+    let mut headers = vec![("content-type", "application/json")];
+    if let Some(key) = idempotency_key {
+        headers.push(("idempotency-key", key));
+    }
+    send(app, "ALIAS", path, &headers, body).await
+}
+
+/// Borrow owned header values for [`send`].
+fn borrowed<'a>(headers: &'a [(&'static str, String)]) -> Vec<(&'static str, &'a str)> {
+    headers
+        .iter()
+        .map(|(name, value)| (*name, value.as_str()))
+        .collect()
+}
+
 async fn json(response: Response) -> (HeaderMap, serde_json::Value) {
     let headers = response.headers().clone();
-    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let bytes = body_bytes(response).await;
     (
         headers,
         serde_json::from_slice(&bytes).unwrap_or_else(|error| {
@@ -1392,37 +1242,26 @@ async fn json(response: Response) -> (HeaderMap, serde_json::Value) {
 
 async fn conditional_probe(endpoint_name: &str, path: &str) {
     let (_root, _store, app) = fixture(Fixture::Site).await;
-    let first = app
-        .clone()
-        .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
-        .await
-        .unwrap();
-    let etag = first.headers()["etag"].clone();
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri(path)
-                .header("if-none-match", etag)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let first = fetch(&app, path).await;
+    let etag = header_text(&first, "etag");
+    let response = send(
+        &app,
+        "GET",
+        path,
+        &[("if-none-match", &etag)],
+        Body::empty(),
+    )
+    .await;
     assert_eq!(
         response.status(),
         StatusCode::NOT_MODIFIED,
         "{endpoint_name}"
     );
-    let contract = endpoint(endpoint_name);
-    assert!(
-        contract
-            .exact_outcome(
-                contract::OutcomeKind::Success,
-                304,
-                contract::RequestVariant::Default,
-            )
-            .is_some()
-    );
+    assert!(declares_exact_outcome(
+        endpoint_name,
+        contract::OutcomeKind::Success,
+        304
+    ));
     assert!(response.headers().contains_key("etag"));
     assert!(response.headers().contains_key("cache-control"));
 }
@@ -1448,9 +1287,8 @@ async fn every_contract_endpoint_executes_success_and_normative_error_probes() {
 
 #[tokio::test]
 async fn allocated_post_rejects_reserved_control_directories_consistently() {
-    let root = tempfile::tempdir().unwrap();
-    let store = Store::new(root.path().to_path_buf()).unwrap();
-    store.put_file("hello", "index.html", b"site").unwrap();
+    let (root, store) = fresh_store();
+    put(&store, "hello", "index.html", b"site");
     let token = store.operator_claim("hello").unwrap().encode();
     let authorization = format!("Bearer {token}");
     let reserved_body = format!("{}\n", contract::RESERVED_MUTATION_ERROR);
@@ -1483,9 +1321,7 @@ async fn allocated_post_rejects_reserved_control_directories_consistently() {
                 "{method} {path} must authenticate first"
             );
             assert_eq!(
-                to_bytes(unauthorized.into_body(), usize::MAX)
-                    .await
-                    .unwrap(),
+                body_bytes(unauthorized).await,
                 "error: management token required\n",
                 "{method} {path} unauthorized body"
             );
@@ -1503,7 +1339,7 @@ async fn allocated_post_rejects_reserved_control_directories_consistently() {
                 "{method} {path}"
             );
             assert_eq!(
-                to_bytes(rejected.into_body(), usize::MAX).await.unwrap(),
+                body_bytes(rejected).await,
                 reserved_body,
                 "{method} {path} reserved-path body"
             );
@@ -1524,7 +1360,7 @@ async fn allocated_post_rejects_reserved_control_directories_consistently() {
         ));
     }
     assert_eq!(
-        std::fs::read_dir(root.path().join("tmp")).unwrap().count(),
+        tmp_entries(root.path()),
         0,
         "virtual namespace rejection must precede body spooling"
     );
@@ -1547,77 +1383,55 @@ async fn cacheable_contract_endpoints_execute_conditional_requests() {
 #[tokio::test]
 async fn mutation_contract_executes_noop_and_stale_write_paths() {
     let (_root, _store, app) = fixture(Fixture::Site).await;
-    let no_op = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/hello")
-                .header("content-type", "text/html")
-                .body(Body::from("<h1>hello</h1>"))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let no_op = send(
+        &app,
+        "PUT",
+        "/hello",
+        &[("content-type", "text/html")],
+        "<h1>hello</h1>",
+    )
+    .await;
     assert_eq!(no_op.status(), StatusCode::OK);
-    assert!(
-        endpoint("site put")
-            .exact_outcome(
-                contract::OutcomeKind::Success,
-                200,
-                contract::RequestVariant::Default,
-            )
-            .is_some()
-    );
+    assert!(declares_exact_outcome(
+        "site put",
+        contract::OutcomeKind::Success,
+        200
+    ));
     assert!(!no_op.headers().contains_key("undo-token"));
 
-    let inventory = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/hello/FILES")
-                .header("accept", "application/json")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let stale_etag = inventory.headers()["etag"].clone();
-    let update = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/hello/first.txt")
-                .header("if-match", stale_etag.clone())
-                .body(Body::from("first"))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let inventory = send(
+        &app,
+        "GET",
+        "/hello/FILES",
+        &[("accept", "application/json")],
+        Body::empty(),
+    )
+    .await;
+    let stale_etag = header_text(&inventory, "etag");
+    let update = send(
+        &app,
+        "PUT",
+        "/hello/first.txt",
+        &[("if-match", &stale_etag)],
+        "first",
+    )
+    .await;
     assert_eq!(update.status(), StatusCode::OK);
 
-    let stale = app
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/hello/raced.txt")
-                .header("if-match", stale_etag)
-                .body(Body::from("must not commit"))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let stale = send(
+        &app,
+        "PUT",
+        "/hello/raced.txt",
+        &[("if-match", &stale_etag)],
+        "must not commit",
+    )
+    .await;
     assert_eq!(stale.status(), StatusCode::PRECONDITION_FAILED);
-    assert!(
-        endpoint("file put")
-            .exact_outcome(
-                contract::OutcomeKind::Error,
-                412,
-                contract::RequestVariant::Default,
-            )
-            .is_some()
-    );
+    assert!(declares_exact_outcome(
+        "file put",
+        contract::OutcomeKind::Error,
+        412
+    ));
     assert!(stale.headers().contains_key("etag"));
     assert!(stale.headers().contains_key("content-revision"));
 }
@@ -1627,19 +1441,7 @@ async fn mutation_contract_executes_noop_and_stale_write_paths() {
 async fn phase_five_mutations_cover_replay_conflict_limits_and_two_phase_outcomes() {
     let (_root, store, app) = fixture(Fixture::Site).await;
 
-    let allocated = send(
-        &app,
-        "POST",
-        "/hello/generated/",
-        &[
-            ("content-type", "application/octet-stream"),
-            ("file-prefix", "asset-"),
-            ("file-extension", ".BIN"),
-            ("idempotency-key", "allocate-dropped"),
-        ],
-        "allocated-body",
-    )
-    .await;
+    let allocated = post_generated(&app, ".BIN", &[], "allocate-dropped", "allocated-body").await;
     assert_eq!(allocated.status(), StatusCode::CREATED);
     let (allocated_headers, allocated_json) = json(allocated).await;
     assert!(allocated_headers.contains_key("content-location"));
@@ -1652,93 +1454,46 @@ async fn phase_five_mutations_cover_replay_conflict_limits_and_two_phase_outcome
         .trim_start_matches("blake3:")
         .to_string();
 
-    let replay = send(
-        &app,
-        "POST",
-        "/hello/generated/",
-        &[
-            ("content-type", "application/octet-stream"),
-            ("file-prefix", "asset-"),
-            ("file-extension", "bin"),
-            ("idempotency-key", "allocate-dropped"),
-        ],
-        "allocated-body",
-    )
-    .await;
+    let replay = post_generated(&app, "bin", &[], "allocate-dropped", "allocated-body").await;
     assert_eq!(replay.status(), StatusCode::CREATED);
-    assert_eq!(replay.headers()["idempotency-replayed"], "true");
+    assert_replayed(&replay);
     let (_, replay_json) = json(replay).await;
     assert_eq!(replay_json["path"], allocated_path);
     assert_eq!(replay_json["replayed"], true);
 
-    let no_op = send(
-        &app,
-        "POST",
-        "/hello/generated/",
-        &[
-            ("content-type", "application/octet-stream"),
-            ("file-prefix", "asset-"),
-            ("file-extension", "bin"),
-            ("idempotency-key", "allocate-noop"),
-        ],
-        "allocated-body",
-    )
-    .await;
+    let no_op = post_generated(&app, "bin", &[], "allocate-noop", "allocated-body").await;
     assert_eq!(no_op.status(), StatusCode::OK);
     assert!(!no_op.headers().contains_key("undo-token"));
     let (_, no_op_json) = json(no_op).await;
     assert_eq!(no_op_json["outcome"], "existing");
     assert_eq!(no_op_json["changed"], false);
 
-    let conflict = send(
-        &app,
-        "POST",
-        "/hello/generated/",
-        &[
-            ("content-type", "application/octet-stream"),
-            ("file-prefix", "asset-"),
-            ("file-extension", "bin"),
-            ("idempotency-key", "allocate-dropped"),
-        ],
-        "different",
-    )
-    .await;
+    let conflict = post_generated(&app, "bin", &[], "allocate-dropped", "different").await;
     assert_eq!(conflict.status(), StatusCode::CONFLICT);
 
-    let expiring = send(
+    let expiring = post_generated(
         &app,
-        "POST",
-        "/hello/generated/",
-        &[
-            ("content-type", "application/octet-stream"),
-            ("file-prefix", "asset-"),
-            ("file-extension", "bin"),
-            ("expiry-mode", "relative"),
-            ("expiry-in", "1h"),
-            ("idempotency-key", "allocate-expiry"),
-        ],
+        "bin",
+        &[("expiry-mode", "relative"), ("expiry-in", "1h")],
+        "allocate-expiry",
         "allocated-body",
     )
     .await;
     assert_eq!(expiring.status(), StatusCode::OK);
     assert_eq!(
-        store
-            .expiry_report("hello", &allocated_path)
-            .unwrap()
-            .own_policy
-            .unwrap()
-            .mode,
+        own_expiry_mode(&store, "hello", &allocated_path),
         expiry::ExpiryMode::Relative
     );
     let allocated_route = format!("/hello/{allocated_path}");
+    let relocate_headers = [
+        ("if-content-match", allocated_hash.as_str()),
+        ("idempotency-key", "allocated-replace-dropped"),
+    ];
     let relocated = send(
         &app,
         "REPLACE",
         &allocated_route,
-        &[
-            ("if-content-match", &allocated_hash),
-            ("idempotency-key", "allocated-replace-dropped"),
-        ],
+        &relocate_headers,
         "relocated allocated body",
     )
     .await;
@@ -1756,77 +1511,27 @@ async fn phase_five_mutations_cover_replay_conflict_limits_and_two_phase_outcome
         &app,
         "REPLACE",
         &allocated_route,
-        &[
-            ("if-content-match", &allocated_hash),
-            ("idempotency-key", "allocated-replace-dropped"),
-        ],
+        &relocate_headers,
         "relocated allocated body",
     )
     .await;
     assert_eq!(relocated_replay.status(), StatusCode::OK);
-    assert_eq!(relocated_replay.headers()["idempotency-replayed"], "true");
+    assert_replayed(&relocated_replay);
     assert_eq!(
-        store
-            .expiry_report("hello", &relocated_path)
-            .unwrap()
-            .own_policy
-            .unwrap()
-            .mode,
+        own_expiry_mode(&store, "hello", &relocated_path),
         expiry::ExpiryMode::Relative
     );
 
-    let alias = send(
-        &app,
-        "ALIAS",
-        "/hello/latest.js",
-        &[
-            ("alias-target", "assets/app.js"),
-            ("idempotency-key", "alias-dropped"),
-        ],
-        Body::empty(),
-    )
-    .await;
+    let alias = alias_latest(&app, "assets/app.js", "alias-dropped").await;
     assert_eq!(alias.status(), StatusCode::CREATED);
-    let alias_body = to_bytes(alias.into_body(), usize::MAX).await.unwrap();
-    let alias_replay = send(
-        &app,
-        "ALIAS",
-        "/hello/latest.js",
-        &[
-            ("alias-target", "assets/app.js"),
-            ("idempotency-key", "alias-dropped"),
-        ],
-        Body::empty(),
-    )
-    .await;
+    let alias_body = body_bytes(alias).await;
+    let alias_replay = alias_latest(&app, "assets/app.js", "alias-dropped").await;
     assert_eq!(alias_replay.status(), StatusCode::CREATED);
-    assert_eq!(alias_replay.headers()["idempotency-replayed"], "true");
-    let replay_drift = send(
-        &app,
-        "ALIAS",
-        "/hello/latest.js",
-        &[
-            ("alias-target", "index.html"),
-            ("idempotency-key", "alias-retarget"),
-        ],
-        Body::empty(),
-    )
-    .await;
+    assert_replayed(&alias_replay);
+    let replay_drift = alias_latest(&app, "index.html", "alias-retarget").await;
     assert_eq!(replay_drift.status(), StatusCode::OK);
-    let replay_after_retarget = send(
-        &app,
-        "ALIAS",
-        "/hello/latest.js",
-        &[
-            ("alias-target", "assets/app.js"),
-            ("idempotency-key", "alias-dropped"),
-        ],
-        Body::empty(),
-    )
-    .await;
-    let replay_after_retarget = to_bytes(replay_after_retarget.into_body(), usize::MAX)
-        .await
-        .unwrap();
+    let replay_after_retarget = alias_latest(&app, "assets/app.js", "alias-dropped").await;
+    let replay_after_retarget = body_bytes(replay_after_retarget).await;
     let mut original_alias: serde_json::Value = serde_json::from_slice(&alias_body).unwrap();
     let replay_after_retarget: serde_json::Value =
         serde_json::from_slice(&replay_after_retarget).unwrap();
@@ -1846,49 +1551,19 @@ async fn phase_five_mutations_cover_replay_conflict_limits_and_two_phase_outcome
         &[
             ("alias-target", "assets/app.js"),
             ("idempotency-key", "alias-dropped"),
-            (
-                "if-match",
-                "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            ),
+            ("if-match", UNRELATED_TREE_HASH),
         ],
         Body::empty(),
     )
     .await;
     assert_eq!(changed_tree_guard.status(), StatusCode::CONFLICT);
-    let alias_noop = send(
-        &app,
-        "ALIAS",
-        "/hello/latest.js",
-        &[
-            ("alias-target", "index.html"),
-            ("idempotency-key", "alias-noop"),
-        ],
-        Body::empty(),
-    )
-    .await;
+    let alias_noop = alias_latest(&app, "index.html", "alias-noop").await;
     assert_eq!(alias_noop.status(), StatusCode::OK);
     assert!(!alias_noop.headers().contains_key("undo-token"));
 
-    let batch = send(
-        &app,
-        "ALIAS",
-        "/hello/",
-        &[
-            ("content-type", "application/json"),
-            ("idempotency-key", "alias-batch"),
-        ],
-        r#"{"aliases":[{"path":"home","target":"index.html"},{"path":"app","target":"assets/app.js"}]}"#,
-    )
-    .await;
+    let batch = alias_batch(&app, "/hello/", Some("alias-batch"), r#"{"aliases":[{"path":"home","target":"index.html"},{"path":"app","target":"assets/app.js"}]}"#).await;
     assert_eq!(batch.status(), StatusCode::CREATED);
-    let mixed_batch = send(
-        &app,
-        "ALIAS",
-        "/hello/",
-        &[("content-type", "application/json")],
-        r#"{"aliases":[{"path":"home","target":"assets/app.js"},{"path":"new-link","target":"index.html"}]}"#,
-    )
-    .await;
+    let mixed_batch = alias_batch(&app, "/hello/", None, r#"{"aliases":[{"path":"home","target":"assets/app.js"},{"path":"new-link","target":"index.html"}]}"#).await;
     assert_eq!(
         mixed_batch.status(),
         StatusCode::OK,
@@ -1912,27 +1587,18 @@ async fn phase_five_mutations_cover_replay_conflict_limits_and_two_phase_outcome
         Body::empty(),
     )
     .await;
-    let listing = to_bytes(listing.into_body(), usize::MAX).await.unwrap();
+    let listing = body_bytes(listing).await;
     assert!(String::from_utf8_lossy(&listing).contains("latest.js -> index.html"));
-    let stats = send(&app, "GET", "/STATS", &[], Body::empty()).await;
+    let stats = fetch(&app, "/STATS").await;
     let (_, stats) = json(stats).await;
     assert_eq!(stats["aliases"], 4);
 
-    let store::Node::File {
-        hash: original_hash,
-        ..
-    } = store.lookup("hello", "assets/app.js").unwrap()
-    else {
-        panic!("fixture path is a file");
-    };
-    let replaced = send(
+    let original_hash = file_hash(&store, "hello", "assets/app.js");
+    let replaced = replace_at(
         &app,
-        "REPLACE",
         "/hello/assets/app.js",
-        &[
-            ("if-content-match", &original_hash.to_wire()),
-            ("idempotency-key", "replace-dropped"),
-        ],
+        &original_hash.to_wire(),
+        "replace-dropped",
         "replacement",
     )
     .await;
@@ -1943,42 +1609,33 @@ async fn phase_five_mutations_cover_replay_conflict_limits_and_two_phase_outcome
         .unwrap()
         .trim_start_matches("blake3:")
         .to_string();
-    let replace_replay = send(
+    let replace_replay = replace_at(
         &app,
-        "REPLACE",
         "/hello/assets/app.js",
-        &[
-            ("if-content-match", &original_hash.to_wire()),
-            ("idempotency-key", "replace-dropped"),
-        ],
+        &original_hash.to_wire(),
+        "replace-dropped",
         "replacement",
     )
     .await;
     assert_eq!(replace_replay.status(), StatusCode::OK);
-    assert_eq!(replace_replay.headers()["idempotency-replayed"], "true");
-    let stale_replace = send(
+    assert_replayed(&replace_replay);
+    let stale_replace = replace_at(
         &app,
-        "REPLACE",
         "/hello/assets/app.js",
-        &[
-            ("if-content-match", &original_hash.to_wire()),
-            ("idempotency-key", "replace-stale"),
-        ],
+        &original_hash.to_wire(),
+        "replace-stale",
         "stale",
     )
     .await;
     assert_eq!(stale_replace.status(), StatusCode::PRECONDITION_FAILED);
     assert!(stale_replace.headers().contains_key("content-revision"));
 
-    let splice = send(
+    let splice = splice_at(
         &app,
-        "PATCH",
         "/hello/assets/app.js",
-        &[
-            ("if-content-match", &replacement_hash),
-            ("splice", "offset=0; delete=1; insert=1"),
-            ("idempotency-key", "splice-dropped"),
-        ],
+        &replacement_hash,
+        "offset=0; delete=1; insert=1",
+        &[("idempotency-key", "splice-dropped")],
         "R",
     )
     .await;
@@ -1989,28 +1646,23 @@ async fn phase_five_mutations_cover_replay_conflict_limits_and_two_phase_outcome
         .unwrap()
         .trim_start_matches("blake3:")
         .to_string();
-    let splice_replay = send(
+    let splice_replay = splice_at(
         &app,
-        "PATCH",
         "/hello/assets/app.js",
-        &[
-            ("if-content-match", &replacement_hash),
-            ("splice", "offset=0; delete=1; insert=1"),
-            ("idempotency-key", "splice-dropped"),
-        ],
+        &replacement_hash,
+        "offset=0; delete=1; insert=1",
+        &[("idempotency-key", "splice-dropped")],
         "R",
     )
     .await;
     assert_eq!(splice_replay.status(), StatusCode::OK);
-    assert_eq!(splice_replay.headers()["idempotency-replayed"], "true");
-    let range = send(
+    assert_replayed(&splice_replay);
+    let range = splice_at(
         &app,
-        "PATCH",
         "/hello/assets/app.js",
-        &[
-            ("if-content-match", &spliced_hash),
-            ("splice", "offset=999; delete=0; insert=0"),
-        ],
+        &spliced_hash,
+        "offset=999; delete=0; insert=0",
+        &[],
         Body::empty(),
     )
     .await;
@@ -2038,66 +1690,56 @@ async fn phase_five_mutations_cover_replay_conflict_limits_and_two_phase_outcome
     assert_eq!(framed_response.status(), StatusCode::OK);
 
     let descriptors = vec!["offset=0; delete=0; insert=0"; 65].join(",");
-    let over_limit = send(
+    let over_limit = splice_at(
         &app,
-        "PATCH",
         "/hello/assets/app.js",
-        &[
-            ("if-content-match", &spliced_hash),
-            ("splice", &descriptors),
-        ],
+        &spliced_hash,
+        &descriptors,
+        &[],
         Body::empty(),
     )
     .await;
     assert_eq!(over_limit.status(), StatusCode::PAYLOAD_TOO_LARGE);
 
+    let propose_headers = [
+        ("allocation-action", "propose"),
+        ("content-type", "text/plain"),
+        ("expiry-mode", "relative"),
+        ("expiry-in", "1h"),
+        ("idempotency-key", "proposal-dropped"),
+    ];
     let proposal = send(
         &app,
         "POST",
         "/hello/custom/",
-        &[
-            ("allocation-action", "propose"),
-            ("content-type", "text/plain"),
-            ("expiry-mode", "relative"),
-            ("expiry-in", "1h"),
-            ("idempotency-key", "proposal-dropped"),
-        ],
+        &propose_headers,
         "custom body",
     )
     .await;
     assert_eq!(proposal.status(), StatusCode::ACCEPTED);
-    let proposal_etag = proposal.headers()[header::ETAG]
-        .to_str()
-        .unwrap()
-        .to_string();
-    let proposal_revision = proposal.headers()["content-revision"]
-        .to_str()
-        .unwrap()
-        .to_string();
+    let proposal_etag = header_text(&proposal, header::ETAG);
+    let proposal_revision = header_text(&proposal, "content-revision");
     let (_, proposal_json) = json(proposal).await;
     let proposal_token = proposal_json["allocation_token"]
         .as_str()
         .unwrap()
         .to_string();
-    store
-        .put_file("hello", "after-proposal.txt", b"intervening mutation")
-        .unwrap();
+    put(
+        &store,
+        "hello",
+        "after-proposal.txt",
+        b"intervening mutation",
+    );
     let proposal_replay = send(
         &app,
         "POST",
         "/hello/custom/",
-        &[
-            ("allocation-action", "propose"),
-            ("content-type", "text/plain"),
-            ("expiry-mode", "relative"),
-            ("expiry-in", "1h"),
-            ("idempotency-key", "proposal-dropped"),
-        ],
+        &propose_headers,
         "custom body",
     )
     .await;
     assert_eq!(proposal_replay.status(), StatusCode::ACCEPTED);
-    assert_eq!(proposal_replay.headers()["idempotency-replayed"], "true");
+    assert_replayed(&proposal_replay);
     assert_eq!(proposal_replay.headers()[header::ETAG], proposal_etag);
     assert_eq!(
         proposal_replay.headers()["content-revision"],
@@ -2119,21 +1761,22 @@ async fn phase_five_mutations_cover_replay_conflict_limits_and_two_phase_outcome
     )
     .await;
     assert_eq!(changed_hint.status(), StatusCode::CONFLICT);
+    let finalize_headers = [
+        ("allocation-action", "finalize"),
+        ("allocation-token", proposal_token.as_str()),
+        ("file-name", "chosen"),
+        ("idempotency-key", "finalize-dropped"),
+    ];
     let finalized = send(
         &app,
         "POST",
         "/hello/custom/",
-        &[
-            ("allocation-action", "finalize"),
-            ("allocation-token", &proposal_token),
-            ("file-name", "chosen"),
-            ("idempotency-key", "finalize-dropped"),
-        ],
+        &finalize_headers,
         Body::empty(),
     )
     .await;
     assert_eq!(finalized.status(), StatusCode::CREATED);
-    let custom_content = send(&app, "GET", "/hello/custom/chosen", &[], Body::empty()).await;
+    let custom_content = fetch(&app, "/hello/custom/chosen").await;
     assert_eq!(custom_content.status(), StatusCode::OK);
     assert_eq!(
         custom_content.headers()[header::CONTENT_TYPE],
@@ -2148,7 +1791,7 @@ async fn phase_five_mutations_cover_replay_conflict_limits_and_two_phase_outcome
     )
     .await;
     assert_eq!(custom_alias.status(), StatusCode::CREATED);
-    let custom_alias_content = send(&app, "GET", "/hello/custom-link", &[], Body::empty()).await;
+    let custom_alias_content = fetch(&app, "/hello/custom-link").await;
     assert_eq!(
         custom_alias_content.headers()[header::CONTENT_TYPE],
         "text/plain; charset=utf-8"
@@ -2157,24 +1800,14 @@ async fn phase_five_mutations_cover_replay_conflict_limits_and_two_phase_outcome
         &app,
         "POST",
         "/hello/custom/",
-        &[
-            ("allocation-action", "finalize"),
-            ("allocation-token", &proposal_token),
-            ("file-name", "chosen"),
-            ("idempotency-key", "finalize-dropped"),
-        ],
+        &finalize_headers,
         Body::empty(),
     )
     .await;
     assert_eq!(finalized_replay.status(), StatusCode::CREATED);
-    assert_eq!(finalized_replay.headers()["idempotency-replayed"], "true");
+    assert_replayed(&finalized_replay);
     assert_eq!(
-        store
-            .expiry_report("hello", "custom/chosen")
-            .unwrap()
-            .own_policy
-            .unwrap()
-            .mode,
+        own_expiry_mode(&store, "hello", "custom/chosen"),
         expiry::ExpiryMode::Relative
     );
 
@@ -2205,47 +1838,35 @@ async fn phase_five_mutations_cover_replay_conflict_limits_and_two_phase_outcome
     .await;
     assert_eq!(wrong_folder.status(), StatusCode::NOT_FOUND);
     let cancel_tree = store.site_inventory("hello").unwrap().tree_hash;
+    let cancel_headers = [
+        ("allocation-action", "cancel"),
+        ("allocation-token", cancel_token),
+        ("idempotency-key", "cancel-dropped"),
+        ("if-match", cancel_tree.as_str()),
+    ];
     let cancelled = send(
         &app,
         "POST",
         "/hello/custom/",
-        &[
-            ("allocation-action", "cancel"),
-            ("allocation-token", cancel_token),
-            ("idempotency-key", "cancel-dropped"),
-            ("if-match", &cancel_tree),
-        ],
+        &cancel_headers,
         Body::empty(),
     )
     .await;
     assert_eq!(cancelled.status(), StatusCode::OK);
-    let cancel_etag = cancelled.headers()[header::ETAG]
-        .to_str()
-        .unwrap()
-        .to_string();
-    let cancel_revision = cancelled.headers()["content-revision"]
-        .to_str()
-        .unwrap()
-        .to_string();
+    let cancel_etag = header_text(&cancelled, header::ETAG);
+    let cancel_revision = header_text(&cancelled, "content-revision");
     let (_, cancelled_body) = json(cancelled).await;
-    store
-        .put_file("hello", "after-cancel.txt", b"changed tree")
-        .unwrap();
+    put(&store, "hello", "after-cancel.txt", b"changed tree");
     let cancelled_replay = send(
         &app,
         "POST",
         "/hello/custom/",
-        &[
-            ("allocation-action", "cancel"),
-            ("allocation-token", cancel_token),
-            ("idempotency-key", "cancel-dropped"),
-            ("if-match", &cancel_tree),
-        ],
+        &cancel_headers,
         Body::empty(),
     )
     .await;
     assert_eq!(cancelled_replay.status(), StatusCode::OK);
-    assert_eq!(cancelled_replay.headers()["idempotency-replayed"], "true");
+    assert_replayed(&cancelled_replay);
     assert_eq!(cancelled_replay.headers()[header::ETAG], cancel_etag);
     assert_eq!(
         cancelled_replay.headers()["content-revision"],
@@ -2264,10 +1885,7 @@ async fn phase_five_mutations_cover_replay_conflict_limits_and_two_phase_outcome
             ("allocation-action", "cancel"),
             ("allocation-token", cancel_token),
             ("idempotency-key", "cancel-dropped"),
-            (
-                "if-match",
-                "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            ),
+            ("if-match", UNRELATED_TREE_HASH),
         ],
         Body::empty(),
     )
@@ -2284,14 +1902,7 @@ async fn phase_five_mutations_cover_replay_conflict_limits_and_two_phase_outcome
     .await;
     let (_, media) = json(media).await;
     let media_path = media["path"].as_str().unwrap();
-    let media_response = send(
-        &app,
-        "GET",
-        &format!("/hello/{media_path}"),
-        &[],
-        Body::empty(),
-    )
-    .await;
+    let media_response = fetch(&app, &format!("/hello/{media_path}")).await;
     assert_eq!(media_response.headers()[header::CONTENT_TYPE], "image/png");
 }
 
@@ -2300,33 +1911,45 @@ async fn fetch_absolute_location(app: &Router, location: &str) -> Response {
     let target = location
         .path_and_query()
         .map_or_else(|| location.path(), axum::http::uri::PathAndQuery::as_str);
-    send(app, "GET", target, &[], Body::empty()).await
+    fetch(app, target).await
+}
+
+/// A mutation response names `expected` both in `Location` and in its JSON
+/// body, and that URL serves `content`.
+async fn assert_location_fetchable(
+    app: &Router,
+    headers: &HeaderMap,
+    body: &serde_json::Value,
+    expected: &str,
+    content: &str,
+) {
+    let location = headers[header::LOCATION].to_str().unwrap();
+    assert_eq!(location, expected);
+    assert_eq!(body["location"], expected);
+    let fetched = fetch_absolute_location(app, location).await;
+    assert_eq!(fetched.status(), StatusCode::OK);
+    assert_eq!(body_bytes(fetched).await, content);
 }
 
 #[tokio::test]
 #[expect(clippy::too_many_lines)]
 async fn phase_five_mutation_urls_encode_each_stored_path_segment_and_are_fetchable() {
     const ENCODED_SEGMENT: &str = "100%25%20caf%C3%A9%20%3F%23";
-    let root = tempfile::tempdir().unwrap();
-    let store = Store::new(root.path().to_path_buf()).unwrap();
+    let (_root, store) = fresh_store();
     let raw_folder = "paths/100% café ?#";
-    store
-        .put_file("encoded", "target.txt", b"alias target")
-        .unwrap();
-    store
-        .put_file(
-            "encoded",
-            &format!("{raw_folder}/replace.txt"),
-            b"replace before",
-        )
-        .unwrap();
-    store
-        .put_file(
-            "encoded",
-            &format!("{raw_folder}/splice.txt"),
-            b"splice before",
-        )
-        .unwrap();
+    put(&store, "encoded", "target.txt", b"alias target");
+    put(
+        &store,
+        "encoded",
+        &format!("{raw_folder}/replace.txt"),
+        b"replace before",
+    );
+    put(
+        &store,
+        "encoded",
+        &format!("{raw_folder}/splice.txt"),
+        b"splice before",
+    );
     let app = router(App::new(store.clone()));
 
     let alias = send(
@@ -2339,16 +1962,15 @@ async fn phase_five_mutation_urls_encode_each_stored_path_segment_and_are_fetcha
     .await;
     assert_eq!(alias.status(), StatusCode::CREATED);
     let (alias_headers, alias_json) = json(alias).await;
-    let alias_location = alias_headers[header::LOCATION].to_str().unwrap();
     let expected_alias = format!("http://symbol/encoded/paths/{ENCODED_SEGMENT}/alias.txt");
-    assert_eq!(alias_location, expected_alias);
-    assert_eq!(alias_json["location"], expected_alias);
-    let fetched = fetch_absolute_location(&app, alias_location).await;
-    assert_eq!(fetched.status(), StatusCode::OK);
-    assert_eq!(
-        to_bytes(fetched.into_body(), usize::MAX).await.unwrap(),
-        "alias target"
-    );
+    assert_location_fetchable(
+        &app,
+        &alias_headers,
+        &alias_json,
+        &expected_alias,
+        "alias target",
+    )
+    .await;
 
     let allocated = send(
         &app,
@@ -2360,28 +1982,22 @@ async fn phase_five_mutation_urls_encode_each_stored_path_segment_and_are_fetcha
     .await;
     assert_eq!(allocated.status(), StatusCode::CREATED);
     let (allocated_headers, allocated_json) = json(allocated).await;
-    let allocated_location = allocated_headers[header::LOCATION].to_str().unwrap();
     let expected_allocated = format!(
         "http://symbol/encoded/paths/{ENCODED_SEGMENT}/{}",
         allocated_json["name"].as_str().unwrap()
     );
-    assert_eq!(allocated_location, expected_allocated);
-    assert_eq!(allocated_json["location"], expected_allocated);
     assert_eq!(allocated_json["url"], expected_allocated);
-    let fetched = fetch_absolute_location(&app, allocated_location).await;
-    assert_eq!(fetched.status(), StatusCode::OK);
-    assert_eq!(
-        to_bytes(fetched.into_body(), usize::MAX).await.unwrap(),
-        "allocated body"
-    );
+    assert_location_fetchable(
+        &app,
+        &allocated_headers,
+        &allocated_json,
+        &expected_allocated,
+        "allocated body",
+    )
+    .await;
 
     let replace_path = format!("{raw_folder}/replace.txt");
-    let store::Node::File {
-        hash: replace_hash, ..
-    } = store.lookup("encoded", &replace_path).unwrap()
-    else {
-        panic!("replacement fixture must be a file");
-    };
+    let replace_hash = file_hash(&store, "encoded", &replace_path);
     let replaced = send(
         &app,
         "REPLACE",
@@ -2392,56 +2008,44 @@ async fn phase_five_mutation_urls_encode_each_stored_path_segment_and_are_fetcha
     .await;
     assert_eq!(replaced.status(), StatusCode::OK);
     let (replaced_headers, replaced_json) = json(replaced).await;
-    let replaced_location = replaced_headers[header::LOCATION].to_str().unwrap();
     let expected_replaced = format!("http://symbol/encoded/paths/{ENCODED_SEGMENT}/replace.txt");
-    assert_eq!(replaced_location, expected_replaced);
-    assert_eq!(replaced_json["location"], expected_replaced);
-    let fetched = fetch_absolute_location(&app, replaced_location).await;
-    assert_eq!(fetched.status(), StatusCode::OK);
-    assert_eq!(
-        to_bytes(fetched.into_body(), usize::MAX).await.unwrap(),
-        "replace after"
-    );
+    assert_location_fetchable(
+        &app,
+        &replaced_headers,
+        &replaced_json,
+        &expected_replaced,
+        "replace after",
+    )
+    .await;
 
     let splice_path = format!("{raw_folder}/splice.txt");
-    let store::Node::File {
-        hash: splice_hash, ..
-    } = store.lookup("encoded", &splice_path).unwrap()
-    else {
-        panic!("splice fixture must be a file");
-    };
-    let spliced = send(
+    let splice_hash = file_hash(&store, "encoded", &splice_path);
+    let spliced = splice_at(
         &app,
-        "PATCH",
         &format!("/encoded/paths/{ENCODED_SEGMENT}/splice.txt"),
-        &[
-            ("if-content-match", &splice_hash.to_wire()),
-            ("splice", "offset=0; delete=6; insert=6"),
-        ],
+        &splice_hash.to_wire(),
+        "offset=0; delete=6; insert=6",
+        &[],
         "after ",
     )
     .await;
     assert_eq!(spliced.status(), StatusCode::OK);
     let (spliced_headers, spliced_json) = json(spliced).await;
-    let spliced_location = spliced_headers[header::LOCATION].to_str().unwrap();
     let expected_spliced = format!("http://symbol/encoded/paths/{ENCODED_SEGMENT}/splice.txt");
-    assert_eq!(spliced_location, expected_spliced);
-    assert_eq!(spliced_json["location"], expected_spliced);
-    let fetched = fetch_absolute_location(&app, spliced_location).await;
-    assert_eq!(fetched.status(), StatusCode::OK);
-    assert_eq!(
-        to_bytes(fetched.into_body(), usize::MAX).await.unwrap(),
-        "after  before"
-    );
+    assert_location_fetchable(
+        &app,
+        &spliced_headers,
+        &spliced_json,
+        &expected_spliced,
+        "after  before",
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn alias_batch_rejects_manifest_unsafe_paths_and_accepts_safe_punctuation() {
-    let root = tempfile::tempdir().unwrap();
-    let store = Store::new(root.path().to_path_buf()).unwrap();
-    store
-        .put_file("alias-input", "target.txt", b"target")
-        .unwrap();
+    let (_root, store) = fresh_store();
+    put(&store, "alias-input", "target.txt", b"target");
     let app = router(App::new(store));
     for path in [
         "line\nbreak",
@@ -2453,14 +2057,7 @@ async fn alias_batch_rejects_manifest_unsafe_paths_and_accepts_safe_punctuation(
             "aliases": [{"path": path, "target": "target.txt"}]
         })
         .to_string();
-        let rejected = send(
-            &app,
-            "ALIAS",
-            "/alias-input/",
-            &[("content-type", "application/json")],
-            body,
-        )
-        .await;
+        let rejected = alias_batch(&app, "/alias-input/", None, body).await;
         assert_eq!(rejected.status(), StatusCode::BAD_REQUEST, "{path:?}");
     }
 
@@ -2469,135 +2066,45 @@ async fn alias_batch_rejects_manifest_unsafe_paths_and_accepts_safe_punctuation(
         "aliases": [{"path": safe_path, "target": "target.txt"}]
     })
     .to_string();
-    let accepted = send(
-        &app,
-        "ALIAS",
-        "/alias-input/",
-        &[("content-type", "application/json")],
-        body,
-    )
-    .await;
+    let accepted = alias_batch(&app, "/alias-input/", None, body).await;
     assert_eq!(accepted.status(), StatusCode::CREATED);
     let (_, accepted) = json(accepted).await;
     assert_eq!(accepted["aliases"][0]["path"], safe_path);
 }
 
 #[tokio::test]
-#[expect(clippy::too_many_lines)]
 async fn alias_responses_inherit_target_and_intermediate_expiry_caps() {
-    let root = tempfile::tempdir().unwrap();
-    let store = Store::new(root.path().to_path_buf()).unwrap();
-    store
-        .put_file("expiry-alias", "target.txt", b"target")
-        .unwrap();
-    store
-        .put_file("expiry-alias", "directory/item.txt", b"item")
-        .unwrap();
-    store
-        .put_file("expiry-alias", "links/anchor.txt", b"anchor")
-        .unwrap();
-    store
-        .set_expiry(
-            "expiry-alias",
-            "target.txt",
-            Some(expiry::ExpiryPolicy::Relative {
-                duration_seconds: 80,
-            }),
-        )
-        .unwrap();
-    store
-        .set_expiry(
-            "expiry-alias",
-            "directory/item.txt",
-            Some(expiry::ExpiryPolicy::Relative {
-                duration_seconds: 30,
-            }),
-        )
-        .unwrap();
+    let (_root, store) = fresh_store();
+    put(&store, "expiry-alias", "target.txt", b"target");
+    put(&store, "expiry-alias", "directory/item.txt", b"item");
+    put(&store, "expiry-alias", "links/anchor.txt", b"anchor");
+    set_relative_expiry(&store, "expiry-alias", "target.txt", 80);
+    set_relative_expiry(&store, "expiry-alias", "directory/item.txt", 30);
+    let aliases = [
+        ("links/target-capped", "../target.txt"),
+        ("links/direct", "../target.txt"),
+        ("links/chain", "direct"),
+        ("view", "directory"),
+        ("dangling", "missing"),
+    ]
+    .map(|(path, target)| store::AliasSpec { path, target });
     store
         .put_aliases(
             "expiry-alias",
-            &[
-                store::AliasSpec {
-                    path: "links/target-capped",
-                    target: "../target.txt",
-                },
-                store::AliasSpec {
-                    path: "links/direct",
-                    target: "../target.txt",
-                },
-                store::AliasSpec {
-                    path: "links/chain",
-                    target: "direct",
-                },
-                store::AliasSpec {
-                    path: "view",
-                    target: "directory",
-                },
-                store::AliasSpec {
-                    path: "dangling",
-                    target: "missing",
-                },
-            ],
+            &aliases,
             store::FileMutationOptions::default(),
         )
         .unwrap();
-    store
-        .set_expiry(
-            "expiry-alias",
-            "links",
-            Some(expiry::ExpiryPolicy::Relative {
-                duration_seconds: 120,
-            }),
-        )
-        .unwrap();
-    store
-        .set_expiry(
-            "expiry-alias",
-            "links/direct",
-            Some(expiry::ExpiryPolicy::Relative {
-                duration_seconds: 40,
-            }),
-        )
-        .unwrap();
-    store
-        .set_expiry(
-            "expiry-alias",
-            "links/chain",
-            Some(expiry::ExpiryPolicy::Relative {
-                duration_seconds: 60,
-            }),
-        )
-        .unwrap();
-    store
-        .set_expiry(
-            "expiry-alias",
-            "dangling",
-            Some(expiry::ExpiryPolicy::Relative {
-                duration_seconds: 45,
-            }),
-        )
-        .unwrap();
+    set_relative_expiry(&store, "expiry-alias", "links", 120);
+    set_relative_expiry(&store, "expiry-alias", "links/direct", 40);
+    set_relative_expiry(&store, "expiry-alias", "links/chain", 60);
+    set_relative_expiry(&store, "expiry-alias", "dangling", 45);
     let app = router(App::new(store));
 
-    let target = send(&app, "GET", "/expiry-alias/target.txt", &[], Body::empty()).await;
-    let target_capped = send(
-        &app,
-        "GET",
-        "/expiry-alias/links/target-capped",
-        &[],
-        Body::empty(),
-    )
-    .await;
-    let direct = send(
-        &app,
-        "GET",
-        "/expiry-alias/links/direct",
-        &[],
-        Body::empty(),
-    )
-    .await;
-    let chain = send(&app, "GET", "/expiry-alias/links/chain", &[], Body::empty()).await;
+    let target = fetch(&app, "/expiry-alias/target.txt").await;
+    let target_capped = fetch(&app, "/expiry-alias/links/target-capped").await;
+    let direct = fetch(&app, "/expiry-alias/links/direct").await;
+    let chain = fetch(&app, "/expiry-alias/links/chain").await;
     assert!(target.headers().contains_key(header::EXPIRES));
     assert_eq!(
         target_capped.headers()[header::EXPIRES],
@@ -2615,54 +2122,27 @@ async fn alias_responses_inherit_target_and_intermediate_expiry_caps() {
         "alias chains must inherit intermediate alias caps"
     );
 
-    let item = send(
-        &app,
-        "GET",
-        "/expiry-alias/directory/item.txt",
-        &[],
-        Body::empty(),
-    )
-    .await;
-    let through_directory = send(
-        &app,
-        "GET",
-        "/expiry-alias/view/item.txt",
-        &[],
-        Body::empty(),
-    )
-    .await;
+    let item = fetch(&app, "/expiry-alias/directory/item.txt").await;
+    let through_directory = fetch(&app, "/expiry-alias/view/item.txt").await;
     assert_eq!(
         through_directory.headers()[header::EXPIRES],
         item.headers()[header::EXPIRES],
         "directory alias descendants must inherit the resolved file cap"
     );
 
-    let dangling = send(&app, "GET", "/expiry-alias/dangling", &[], Body::empty()).await;
+    let dangling = fetch(&app, "/expiry-alias/dangling").await;
     assert_eq!(dangling.status(), StatusCode::NOT_FOUND);
-    let dangling_report = send(
-        &app,
-        "GET",
-        "/expiry-alias/dangling/EXPIRES",
-        &[],
-        Body::empty(),
-    )
-    .await;
+    let dangling_report = fetch(&app, "/expiry-alias/dangling/EXPIRES").await;
     assert_eq!(dangling_report.status(), StatusCode::OK);
     let (_, dangling_report) = json(dangling_report).await;
     assert!(dangling_report["effective_expires_at"].is_string());
 }
 
 #[tokio::test]
-#[expect(clippy::too_many_lines)]
 async fn phase_five_content_mutations_report_and_store_sanitized_bytes() {
-    let root = tempfile::tempdir().unwrap();
-    let store = Store::new(root.path().to_path_buf()).unwrap();
-    store
-        .put_file("redacted", "replace.txt", b"before")
-        .unwrap();
-    store
-        .put_file("redacted", "splice.txt", b"prefix:")
-        .unwrap();
+    let (_root, store) = fresh_store();
+    put(&store, "redacted", "replace.txt", b"before");
+    put(&store, "redacted", "splice.txt", b"prefix:");
     let app = router(App::new(store.clone()));
     let management = format!("sym_mgmt_{}", "a".repeat(64));
     let claim = format!("sym_claim_{}", "b".repeat(64));
@@ -2695,18 +2175,9 @@ async fn phase_five_content_mutations_report_and_store_sanitized_bytes() {
             .contains(&allocation_hash)
     );
     let fetched = fetch_absolute_location(&app, allocated_json["url"].as_str().unwrap()).await;
-    assert_eq!(
-        to_bytes(fetched.into_body(), usize::MAX).await.unwrap(),
-        allocation_bytes
-    );
+    assert_eq!(body_bytes(fetched).await, allocation_bytes);
 
-    let store::Node::File {
-        hash: replacement_base,
-        ..
-    } = store.lookup("redacted", "replace.txt").unwrap()
-    else {
-        panic!("replacement fixture must be a file");
-    };
+    let replacement_base = file_hash(&store, "redacted", "replace.txt");
     let replaced = send(
         &app,
         "REPLACE",
@@ -2727,23 +2198,13 @@ async fn phase_five_content_mutations_report_and_store_sanitized_bytes() {
         )
     );
 
-    let store::Node::File {
-        hash: splice_base, ..
-    } = store.lookup("redacted", "splice.txt").unwrap()
-    else {
-        panic!("splice fixture must be a file");
-    };
-    let spliced = send(
+    let splice_base = file_hash(&store, "redacted", "splice.txt");
+    let spliced = splice_at(
         &app,
-        "PATCH",
         "/redacted/splice.txt",
-        &[
-            ("if-content-match", &splice_base.to_wire()),
-            (
-                "splice",
-                &format!("offset=7; delete=0; insert={}", management.len()),
-            ),
-        ],
+        &splice_base.to_wire(),
+        &format!("offset=7; delete=0; insert={}", management.len()),
+        &[],
         management,
     )
     .await;
@@ -2760,29 +2221,21 @@ async fn phase_five_content_mutations_report_and_store_sanitized_bytes() {
         )
     );
     let fetched = fetch_absolute_location(&app, spliced_json["location"].as_str().unwrap()).await;
-    assert_eq!(
-        to_bytes(fetched.into_body(), usize::MAX).await.unwrap(),
-        expected_splice
-    );
+    assert_eq!(body_bytes(fetched).await, expected_splice);
 }
 
 #[tokio::test]
 async fn splice_result_limit_and_stale_guard_precede_materialization() {
-    let root = tempfile::tempdir().unwrap();
-    let store = Store::new(root.path().to_path_buf()).unwrap();
-    store.put_file("bounded", "data.bin", b"abcd").unwrap();
-    let store::Node::File { hash, .. } = store.lookup("bounded", "data.bin").unwrap() else {
-        panic!("fixture path is a file");
-    };
+    let (root, store) = fresh_store();
+    put(&store, "bounded", "data.bin", b"abcd");
+    let hash = file_hash(&store, "bounded", "data.bin");
     let app = router(App::with_max_file_size(store.clone(), 4));
-    let too_large = send(
+    let too_large = splice_at(
         &app,
-        "PATCH",
         "/bounded/data.bin",
-        &[
-            ("if-content-match", &hash.to_wire()),
-            ("splice", "offset=4; delete=0; insert=1"),
-        ],
+        &hash.to_wire(),
+        "offset=4; delete=0; insert=1",
+        &[],
         "x",
     )
     .await;
@@ -2792,20 +2245,15 @@ async fn splice_result_limit_and_stale_guard_precede_materialization() {
         b"abcd",
         "failed splice must not replace the source"
     );
-    assert_eq!(
-        std::fs::read_dir(root.path().join("tmp")).unwrap().count(),
-        0
-    );
+    assert_eq!(tmp_entries(root.path()), 0);
 
-    store.put_file("bounded", "data.bin", b"xy").unwrap();
-    let stale = send(
+    put(&store, "bounded", "data.bin", b"xy");
+    let stale = splice_at(
         &app,
-        "PATCH",
         "/bounded/data.bin",
-        &[
-            ("if-content-match", &hash.to_wire()),
-            ("splice", "offset=999; delete=0; insert=0"),
-        ],
+        &hash.to_wire(),
+        "offset=999; delete=0; insert=0",
+        &[],
         Body::empty(),
     )
     .await;
@@ -2818,7 +2266,7 @@ async fn splice_result_limit_and_stale_guard_precede_materialization() {
         stale.headers()[header::ETAG],
         format!("\"{}\"", current.to_wire()).as_str()
     );
-    let body = to_bytes(stale.into_body(), usize::MAX).await.unwrap();
+    let body = body_bytes(stale).await;
     let body = String::from_utf8(body.to_vec()).unwrap();
     assert!(
         body.contains(&current.to_wire()),
@@ -2845,24 +2293,17 @@ async fn managed_phase_five_mutations_reject_before_spooling() {
             ],
         ),
     ] {
-        let borrowed = headers
-            .iter()
-            .map(|(name, value)| (*name, value.as_str()))
-            .collect::<Vec<_>>();
+        let borrowed = borrowed(&headers);
         let response = send(&app, method, path, &borrowed, "must not spool").await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(
-            std::fs::read_dir(root.path().join("tmp")).unwrap().count(),
-            0
-        );
+        assert_eq!(tmp_entries(root.path()), 0);
     }
 }
 
 #[tokio::test]
 async fn pending_allocations_remain_bound_to_the_proposing_bearer() {
-    let root = tempfile::tempdir().unwrap();
-    let store = Store::new(root.path().to_path_buf()).unwrap();
-    store.put_file("managed", "index.html", b"site").unwrap();
+    let (_root, store) = fresh_store();
+    put(&store, "managed", "index.html", b"site");
     let original = store.operator_claim("managed").unwrap();
     let app = router(App::new(store.clone()));
     let original_authorization = format!("Bearer {}", original.encode());
@@ -2908,14 +2349,11 @@ async fn pending_allocations_remain_bound_to_the_proposing_bearer() {
 #[tokio::test]
 #[expect(clippy::too_many_lines)]
 async fn every_phase_five_endpoint_exercises_stale_noop_conflict_and_limits() {
-    let root = tempfile::tempdir().unwrap();
-    let store = Store::new(root.path().to_path_buf()).unwrap();
-    store.put_file("edge", "data.bin", b"data").unwrap();
+    let (root, store) = fresh_store();
+    put(&store, "edge", "data.bin", b"data");
     let stale_tree = store.site_inventory("edge").unwrap().tree_hash;
-    let store::Node::File { hash, .. } = store.lookup("edge", "data.bin").unwrap() else {
-        panic!("fixture path is a file");
-    };
-    store.put_file("edge", "later.bin", b"later").unwrap();
+    let hash = file_hash(&store, "edge", "data.bin");
+    put(&store, "edge", "later.bin", b"later");
     let app = router(App::new(store.clone()));
 
     for (method, path, headers, body) in [
@@ -2963,10 +2401,7 @@ async fn every_phase_five_endpoint_exercises_stale_noop_conflict_and_limits() {
             "x".to_string(),
         ),
     ] {
-        let borrowed = headers
-            .iter()
-            .map(|(name, value)| (*name, value.as_str()))
-            .collect::<Vec<_>>();
+        let borrowed = borrowed(&headers);
         let response = send(&app, method, path, &borrowed, body).await;
         assert_eq!(
             response.status(),
@@ -2979,124 +2414,67 @@ async fn every_phase_five_endpoint_exercises_stale_noop_conflict_and_limits() {
         store.lookup("edge", "generated"),
         Err(StoreError::NotFound) | Ok(store::Node::Dir)
     ));
-    assert_eq!(
-        std::fs::read_dir(root.path().join("tmp")).unwrap().count(),
-        0
-    );
+    assert_eq!(tmp_entries(root.path()), 0);
 
-    let replace_noop = send(
+    let replace_noop = replace_at(
         &app,
-        "REPLACE",
         "/edge/data.bin",
-        &[
-            ("if-content-match", &hash.to_wire()),
-            ("idempotency-key", "edge-replace-noop"),
-        ],
+        &hash.to_wire(),
+        "edge-replace-noop",
         "data",
     )
     .await;
     assert_eq!(replace_noop.status(), StatusCode::OK);
     assert!(!replace_noop.headers().contains_key("undo-token"));
     let replace_noop_etag = replace_noop.headers()["etag"].clone();
-    store.put_file("edge", "after-noop.bin", b"after").unwrap();
-    let replace_noop_replay = send(
+    put(&store, "edge", "after-noop.bin", b"after");
+    let replace_noop_replay = replace_at(
         &app,
-        "REPLACE",
         "/edge/data.bin",
-        &[
-            ("if-content-match", &hash.to_wire()),
-            ("idempotency-key", "edge-replace-noop"),
-        ],
+        &hash.to_wire(),
+        "edge-replace-noop",
         "data",
     )
     .await;
     assert_eq!(replace_noop_replay.headers()["etag"], replace_noop_etag);
-    assert_eq!(
-        replace_noop_replay.headers()["idempotency-replayed"],
-        "true"
-    );
-    let splice_noop = send(
+    assert_replayed(&replace_noop_replay);
+    let splice_noop = splice_at(
         &app,
-        "PATCH",
         "/edge/data.bin",
-        &[
-            ("if-content-match", &hash.to_wire()),
-            ("splice", "offset=0; delete=0; insert=0"),
-            ("idempotency-key", "edge-splice-noop"),
-        ],
+        &hash.to_wire(),
+        "offset=0; delete=0; insert=0",
+        &[("idempotency-key", "edge-splice-noop")],
         Body::empty(),
     )
     .await;
     assert_eq!(splice_noop.status(), StatusCode::OK);
     assert!(!splice_noop.headers().contains_key("undo-token"));
     let splice_noop_etag = splice_noop.headers()["etag"].clone();
-    store
-        .put_file("edge", "after-splice-noop.bin", b"after")
-        .unwrap();
-    let splice_noop_replay = send(
+    put(&store, "edge", "after-splice-noop.bin", b"after");
+    let splice_noop_replay = splice_at(
         &app,
-        "PATCH",
         "/edge/data.bin",
-        &[
-            ("if-content-match", &hash.to_wire()),
-            ("splice", "offset=0; delete=0; insert=0"),
-            ("idempotency-key", "edge-splice-noop"),
-        ],
+        &hash.to_wire(),
+        "offset=0; delete=0; insert=0",
+        &[("idempotency-key", "edge-splice-noop")],
         Body::empty(),
     )
     .await;
     assert_eq!(splice_noop_replay.headers()["etag"], splice_noop_etag);
-    assert_eq!(splice_noop_replay.headers()["idempotency-replayed"], "true");
+    assert_replayed(&splice_noop_replay);
 
     let batch_body =
         r#"{"aliases":[{"path":"one","target":"data.bin"},{"path":"two","target":"data.bin"}]}"#;
-    let first_batch = send(
-        &app,
-        "ALIAS",
-        "/edge/",
-        &[
-            ("content-type", "application/json"),
-            ("idempotency-key", "edge-batch-replay"),
-        ],
-        batch_body,
-    )
-    .await;
+    let first_batch = alias_batch(&app, "/edge/", Some("edge-batch-replay"), batch_body).await;
     assert_eq!(first_batch.status(), StatusCode::CREATED);
-    let replay_batch = send(
-        &app,
-        "ALIAS",
-        "/edge/",
-        &[
-            ("content-type", "application/json"),
-            ("idempotency-key", "edge-batch-replay"),
-        ],
-        batch_body,
-    )
-    .await;
+    let replay_batch = alias_batch(&app, "/edge/", Some("edge-batch-replay"), batch_body).await;
     assert_eq!(replay_batch.status(), StatusCode::CREATED);
-    assert_eq!(replay_batch.headers()["idempotency-replayed"], "true");
-    let noop_batch = send(
-        &app,
-        "ALIAS",
-        "/edge/",
-        &[
-            ("content-type", "application/json"),
-            ("idempotency-key", "edge-batch-noop"),
-        ],
-        batch_body,
-    )
-    .await;
+    assert_replayed(&replay_batch);
+    let noop_batch = alias_batch(&app, "/edge/", Some("edge-batch-noop"), batch_body).await;
     assert_eq!(noop_batch.status(), StatusCode::OK);
     assert!(!noop_batch.headers().contains_key("undo-token"));
 
-    let conflict = send(
-        &app,
-        "ALIAS",
-        "/edge/",
-        &[("content-type", "application/json")],
-        r#"{"aliases":[{"path":"rollback","target":"data.bin"},{"path":"data.bin","target":"later.bin"}]}"#,
-    )
-    .await;
+    let conflict = alias_batch(&app, "/edge/", None, r#"{"aliases":[{"path":"rollback","target":"data.bin"},{"path":"data.bin","target":"later.bin"}]}"#).await;
     assert_eq!(conflict.status(), StatusCode::CONFLICT);
     assert!(matches!(
         store.alias("edge", "rollback"),
@@ -3110,14 +2488,7 @@ async fn every_phase_five_endpoint_exercises_stale_noop_conflict_and_limits() {
         })
         .collect::<Vec<_>>();
     let oversized_batch = serde_json::to_string(&contract::AliasBatchRequest { aliases }).unwrap();
-    let batch_limit = send(
-        &app,
-        "ALIAS",
-        "/edge/",
-        &[("content-type", "application/json")],
-        oversized_batch,
-    )
-    .await;
+    let batch_limit = alias_batch(&app, "/edge/", None, oversized_batch).await;
     assert_eq!(batch_limit.status(), StatusCode::PAYLOAD_TOO_LARGE);
     let oversized_target = "x".repeat(upload::MAX_ALIAS_TARGET_BYTES + 1);
     let target_limit = send(

@@ -1,7 +1,3 @@
-// `Result<_, Response>` is pervasive here and `axum::response::Response` is the
-// large variant; this is not about StoreError's size.
-#![expect(clippy::result_large_err)]
-
 use std::fmt::Write as _;
 use std::io;
 
@@ -14,21 +10,33 @@ use futures_util::StreamExt as _;
 use tokio::io::AsyncWriteExt as _;
 
 use super::{
-    App, ExpiryRequest, TemporaryUpload, expiry_policy_from, has_expiry_parameters, if_match_from,
-    insert_sanitized_headers, insert_undo_headers, management_bearer, plain,
+    App, ExpiryRequest, TemporaryUpload, authorize, created_or_ok, expiry_policy_from,
+    has_expiry_parameters, if_match_from, insert_sanitized_headers, insert_undo_headers, plain,
 };
+use crate::api_error::ApiError;
 use crate::hash::ContentHash;
 use crate::secrets::ManagementToken;
 use crate::splice::{self, ProtocolError};
 use crate::store::{
     AliasEntry, AliasResolvedKind, AliasSpec, AllocatedFile, AllocatedName, AllocationSource,
     AllocationSpec, FileExpiry, FileMutationOptions, Idempotency, MutationResult,
-    PendingAllocationSpec, StoreError,
+    PendingAllocationSpec, SiteInventory, Store, StoreError,
 };
 use symbol_contract as contract;
 
 const MAX_ALIAS_BATCH_BYTES: usize = 1024 * 1024;
 const MAX_ALIAS_BATCH_ENTRIES: usize = 4096;
+
+/// A fallible step whose error is already the response to send.
+type Reply<T> = Result<T, ApiError>;
+
+fn bad_request(message: impl AsRef<str>) -> ApiError {
+    plain(StatusCode::BAD_REQUEST, message).into()
+}
+
+fn too_large(message: &'static str) -> ApiError {
+    plain(StatusCode::PAYLOAD_TOO_LARGE, message).into()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AllocationAction {
@@ -44,6 +52,18 @@ struct MutationRequest {
     authorization: Option<ManagementToken>,
 }
 
+impl MutationRequest {
+    fn options(&self, expiry: FileExpiry) -> FileMutationOptions<'_> {
+        FileMutationOptions {
+            expected_tree_hash: self.expected_tree_hash.as_deref(),
+            idempotency: Some(&self.idempotency),
+            authorization: self.authorization.as_ref(),
+            expiry,
+        }
+    }
+}
+
+#[derive(Clone)]
 struct GeneratedNaming {
     prefix: String,
     suffix: String,
@@ -56,7 +76,9 @@ pub async fn allocate_root(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    allocate(&app, name, String::new(), &headers, body).await
+    allocate(&app, name, String::new(), &headers, body)
+        .await
+        .into_response()
 }
 
 pub async fn reject_control_allocation(
@@ -69,8 +91,8 @@ pub async fn reject_control_allocation(
 }
 
 pub async fn reject_control_mutation(app: &App, name: &str, headers: &HeaderMap) -> Response {
-    if let Err(response) = mutation_request(app, name, headers).await {
-        return response;
+    if let Err(error) = mutation_request(app, name, headers).await {
+        return error.into_response();
     }
     plain(StatusCode::BAD_REQUEST, contract::RESERVED_MUTATION_ERROR)
 }
@@ -88,14 +110,10 @@ pub async fn allocate_path(
             "error: allocated file target must end in /",
         );
     }
-    allocate(
-        &app,
-        name,
-        path.trim_end_matches('/').to_string(),
-        &headers,
-        body,
-    )
-    .await
+    let folder = path.trim_end_matches('/').to_string();
+    allocate(&app, name, folder, &headers, body)
+        .await
+        .into_response()
 }
 
 pub async fn allocate_files_path(
@@ -104,14 +122,10 @@ pub async fn allocate_files_path(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    allocate(
-        &app,
-        name,
-        format!("FILES/{}", path.trim_end_matches('/')),
-        &headers,
-        body,
-    )
-    .await
+    let folder = format!("FILES/{}", path.trim_end_matches('/'));
+    allocate(&app, name, folder, &headers, body)
+        .await
+        .into_response()
 }
 
 async fn allocate(
@@ -120,19 +134,9 @@ async fn allocate(
     folder: String,
     headers: &HeaderMap,
     body: Body,
-) -> Response {
-    let request = match mutation_request(app, &name, headers).await {
-        Ok(request) => request,
-        Err(response) => return response,
-    };
-    if let Err(error) = crate::store::validate_mutation_target(&folder) {
-        return error.into_response();
-    }
-    let action = match allocation_action(headers) {
-        Ok(action) => action,
-        Err(response) => return response,
-    };
-    match action {
+) -> Reply<Response> {
+    let request = target_request(app, &name, &folder, headers).await?;
+    match allocation_action(headers)? {
         AllocationAction::Create => allocate_fast(app, name, folder, headers, body, request).await,
         AllocationAction::Propose => {
             propose_allocation(app, name, folder, headers, body, request).await
@@ -153,69 +157,39 @@ async fn allocate_fast(
     headers: &HeaderMap,
     body: Body,
     request: MutationRequest,
-) -> Response {
+) -> Reply<Response> {
     if headers.contains_key("file-name") {
-        return plain(
-            StatusCode::BAD_REQUEST,
+        return Err(bad_request(
             "error: File-Name is only valid when finalizing an allocation",
-        );
+        ));
     }
-    let naming = match generated_naming(headers) {
-        Ok(naming) => naming,
-        Err(response) => return response,
-    };
-    let media_type = match media_type(headers) {
-        Ok(media_type) => media_type,
-        Err(response) => return response,
-    };
-    let expiry = match allocation_expiry(headers, app.store.expiry_defaults(), FileExpiry::Clear) {
-        Ok(expiry) => expiry,
-        Err(response) => return response,
-    };
-    let temporary = match spool_content(app, headers, body, app.max_file_size).await {
-        Ok(temporary) => temporary,
-        Err(response) => return response,
-    };
+    let naming = generated_naming(headers)?;
+    let media_type = media_type(headers)?;
+    let expiry = allocation_expiry(headers, app.store.expiry_defaults(), FileExpiry::Clear)?;
+    let temporary = spool_content(app, headers, body, app.max_file_size).await?;
     let idempotency_key = request.idempotency.key.clone();
-    let store_idempotency = request.idempotency.clone();
-    let store_authorization = request.authorization.clone();
-    let store_expected_tree_hash = request.expected_tree_hash.clone();
-    let result = app
-        .run_store({
-            let source = temporary.path.clone();
-            let folder = folder.clone();
-            let prefix = naming.prefix.clone();
-            let suffix = naming.suffix.clone();
-            let extension = naming.extension.clone();
-            let media_type = media_type.clone();
-            let name = name.clone();
-            move |store| {
-                store.allocate_file(
-                    &name,
-                    &source,
-                    AllocationSpec {
-                        folder: &folder,
-                        naming: AllocatedName {
-                            prefix: &prefix,
-                            suffix: &suffix,
-                            extension: extension.as_deref(),
-                        },
-                        media_type: &media_type,
+    let allocated = run_mutation(app, &name, {
+        let source = temporary.path.clone();
+        let name = name.clone();
+        let naming = naming.clone();
+        move |store| {
+            store.allocate_file(
+                &name,
+                &source,
+                AllocationSpec {
+                    folder: &folder,
+                    naming: AllocatedName {
+                        prefix: &naming.prefix,
+                        suffix: &naming.suffix,
+                        extension: naming.extension.as_deref(),
                     },
-                    FileMutationOptions {
-                        expected_tree_hash: store_expected_tree_hash.as_deref(),
-                        idempotency: Some(&store_idempotency),
-                        authorization: store_authorization.as_ref(),
-                        expiry,
-                    },
-                )
-            }
-        })
-        .await;
-    let allocated = match result {
-        Ok(allocated) => allocated,
-        Err(error) => return mutation_error(app, &name, error).await,
-    };
+                    media_type: &media_type,
+                },
+                request.options(expiry),
+            )
+        }
+    })
+    .await?;
     allocated_response(
         app,
         &name,
@@ -237,70 +211,40 @@ async fn propose_allocation(
     headers: &HeaderMap,
     body: Body,
     request: MutationRequest,
-) -> Response {
+) -> Reply<Response> {
     if headers.contains_key("file-name")
         || headers.contains_key("file-prefix")
         || headers.contains_key("file-suffix")
     {
-        return plain(
-            StatusCode::BAD_REQUEST,
+        return Err(bad_request(
             "error: proposal accepts only File-Extension as a naming hint",
-        );
+        ));
     }
-    let media_type = match media_type(headers) {
-        Ok(media_type) => media_type,
-        Err(response) => return response,
+    let media_type = media_type(headers)?;
+    let inferred_extension = match optional_header(headers, "file-extension", "File-Extension")? {
+        Some(extension) => Some(crate::store::normalize_allocated_extension(&extension)?),
+        None => infer_extension(&media_type).map(str::to_string),
     };
-    let inferred_extension = match optional_header(headers, "file-extension", "File-Extension") {
-        Ok(Some(extension)) => match crate::store::normalize_allocated_extension(&extension) {
-            Ok(extension) => Some(extension),
-            Err(error) => return error.into_response(),
-        },
-        Ok(None) => infer_extension(&media_type).map(str::to_string),
-        Err(response) => return response,
-    };
-    let expiry = match allocation_expiry(headers, app.store.expiry_defaults(), FileExpiry::Clear) {
-        Ok(expiry) => expiry,
-        Err(response) => return response,
-    };
-    let temporary = match spool_content(app, headers, body, app.max_file_size).await {
-        Ok(temporary) => temporary,
-        Err(response) => return response,
-    };
+    let expiry = allocation_expiry(headers, app.store.expiry_defaults(), FileExpiry::Clear)?;
+    let temporary = spool_content(app, headers, body, app.max_file_size).await?;
     let idempotency_key = request.idempotency.key.clone();
-    let store_idempotency = request.idempotency.clone();
-    let store_authorization = request.authorization.clone();
-    let store_expected_tree_hash = request.expected_tree_hash.clone();
-    let store_extension = inferred_extension.clone();
-    let result = app
-        .run_store({
-            let source = temporary.path.clone();
-            let name = name.clone();
-            let folder = folder.clone();
-            let media_type = media_type.clone();
-            move |store| {
-                store.propose_allocation_idempotent(
-                    &name,
-                    AllocationSource::File(&source),
-                    PendingAllocationSpec {
-                        folder: &folder,
-                        media_type: &media_type,
-                        extension: store_extension.as_deref(),
-                    },
-                    FileMutationOptions {
-                        expected_tree_hash: store_expected_tree_hash.as_deref(),
-                        idempotency: Some(&store_idempotency),
-                        authorization: store_authorization.as_ref(),
-                        expiry,
-                    },
-                )
-            }
-        })
-        .await;
-    let pending = match result {
-        Ok(pending) => pending,
-        Err(error) => return mutation_error(app, &name, error).await,
-    };
+    let pending = run_mutation(app, &name, {
+        let source = temporary.path.clone();
+        let name = name.clone();
+        move |store| {
+            store.propose_allocation_idempotent(
+                &name,
+                AllocationSource::File(&source),
+                PendingAllocationSpec {
+                    folder: &folder,
+                    media_type: &media_type,
+                    extension: inferred_extension.as_deref(),
+                },
+                request.options(expiry),
+            )
+        }
+    })
+    .await?;
     let replayed = pending.replayed;
     let proposal_tree_hash = pending.tree_hash.clone();
     let proposal_revision = pending.content_revision;
@@ -330,9 +274,9 @@ async fn propose_allocation(
         &location,
         &proposal_tree_hash,
         proposal_revision,
+        replayed,
     );
-    insert_replay_header(response.headers_mut(), replayed);
-    response
+    Ok(response)
 }
 
 async fn finalize_allocation(
@@ -342,62 +286,33 @@ async fn finalize_allocation(
     headers: &HeaderMap,
     body: Body,
     request: MutationRequest,
-) -> Response {
-    if let Err(response) = require_empty_body(body).await {
-        return response;
-    }
-    let token = match required_text_header(headers, "allocation-token", "Allocation-Token") {
-        Ok(token) => token,
-        Err(response) => return response,
-    };
-    let basename = match required_text_header(headers, "file-name", "File-Name") {
-        Ok(name) => name,
-        Err(response) => return response,
-    };
+) -> Reply<Response> {
+    require_empty_body(body).await?;
+    let token = required_text_header(headers, "allocation-token", "Allocation-Token")?;
+    let basename = required_text_header(headers, "file-name", "File-Name")?;
     if ["file-prefix", "file-extension", "file-suffix"]
         .iter()
         .any(|header| headers.contains_key(*header))
     {
-        return plain(
-            StatusCode::BAD_REQUEST,
+        return Err(bad_request(
             "error: generated naming headers cannot be combined with File-Name",
-        );
+        ));
     }
-    let expiry = match allocation_expiry(headers, app.store.expiry_defaults(), FileExpiry::Preserve)
-    {
-        Ok(expiry) => expiry,
-        Err(response) => return response,
-    };
+    let expiry = allocation_expiry(headers, app.store.expiry_defaults(), FileExpiry::Preserve)?;
     let idempotency_key = request.idempotency.key.clone();
-    let store_idempotency = request.idempotency.clone();
-    let store_authorization = request.authorization.clone();
-    let store_expected_tree_hash = request.expected_tree_hash.clone();
-    let result = app
-        .run_store({
-            let name = name.clone();
-            let token = token.clone();
-            let basename = basename.clone();
-            let folder = folder.clone();
-            move |store| {
-                store.finalize_allocation_custom_in_folder(
-                    &name,
-                    &token,
-                    &folder,
-                    &basename,
-                    FileMutationOptions {
-                        expected_tree_hash: store_expected_tree_hash.as_deref(),
-                        idempotency: Some(&store_idempotency),
-                        authorization: store_authorization.as_ref(),
-                        expiry,
-                    },
-                )
-            }
-        })
-        .await;
-    let allocated = match result {
-        Ok(allocated) => allocated,
-        Err(error) => return mutation_error(app, &name, error).await,
-    };
+    let allocated = run_mutation(app, &name, {
+        let name = name.clone();
+        move |store| {
+            store.finalize_allocation_custom_in_folder(
+                &name,
+                &token,
+                &folder,
+                &basename,
+                request.options(expiry),
+            )
+        }
+    })
+    .await?;
     allocated_response(
         app,
         &name,
@@ -415,46 +330,29 @@ async fn cancel_allocation(
     headers: &HeaderMap,
     body: Body,
     request: MutationRequest,
-) -> Response {
-    if let Err(response) = require_empty_body(body).await {
-        return response;
-    }
-    let token = match required_text_header(headers, "allocation-token", "Allocation-Token") {
-        Ok(token) => token,
-        Err(response) => return response,
-    };
-    let result = app
+) -> Reply<Response> {
+    require_empty_body(body).await?;
+    let token = required_text_header(headers, "allocation-token", "Allocation-Token")?;
+    let idempotency_key = request.idempotency.key.clone();
+    let cancellation = app
         .run_store({
             let name = name.clone();
             let token = token.clone();
-            let folder = folder.clone();
-            let authorization = request.authorization.clone();
-            let idempotency = request.idempotency.clone();
-            let expected_tree_hash = request.expected_tree_hash.clone();
             move |store| {
                 store.cancel_allocation_idempotent_for_folder(
                     &name,
                     &token,
                     &folder,
-                    FileMutationOptions {
-                        expected_tree_hash: expected_tree_hash.as_deref(),
-                        idempotency: Some(&idempotency),
-                        authorization: authorization.as_ref(),
-                        expiry: FileExpiry::Preserve,
-                    },
+                    request.options(FileExpiry::Preserve),
                 )
             }
         })
-        .await;
-    let cancellation = match result {
-        Ok(cancelled) => cancelled,
-        Err(error) => return error.into_response(),
-    };
+        .await?;
     let replayed = cancellation.replayed;
     let receipt = contract::AllocationCancellationReceipt {
         allocation_token: token,
         cancelled: true,
-        idempotency_key: request.idempotency.key,
+        idempotency_key,
         replayed,
     };
     let location = site_location(app, &name);
@@ -464,60 +362,46 @@ async fn cancel_allocation(
         &location,
         &cancellation.tree_hash,
         cancellation.content_revision,
+        replayed,
     );
-    if replayed {
-        response
-            .headers_mut()
-            .insert("idempotency-replayed", HeaderValue::from_static("true"));
-    }
-    response
+    Ok(response)
 }
 
 pub async fn alias_file(app: &App, name: &str, path: &str, headers: &HeaderMap) -> Response {
-    let request = match mutation_request(app, name, headers).await {
-        Ok(request) => request,
-        Err(response) => return response,
-    };
-    if let Err(error) = crate::store::validate_mutation_target(path) {
-        return error.into_response();
-    }
-    let target = match required_text_header(headers, "alias-target", "Alias-Target") {
-        Ok(target) => target,
-        Err(response) => return response,
-    };
+    alias_file_reply(app, name, path, headers)
+        .await
+        .into_response()
+}
+
+async fn alias_file_reply(
+    app: &App,
+    name: &str,
+    path: &str,
+    headers: &HeaderMap,
+) -> Reply<Response> {
+    let request = target_request(app, name, path, headers).await?;
+    let target = required_text_header(headers, "alias-target", "Alias-Target")?;
     if target.len() > crate::upload::MAX_ALIAS_TARGET_BYTES {
-        return plain(
-            StatusCode::PAYLOAD_TOO_LARGE,
+        return Err(too_large(
             "error: Alias-Target exceeds the configured limit",
-        );
+        ));
     }
     let idempotency_key = request.idempotency.key.clone();
-    let result = app
-        .run_store({
-            let name = name.to_string();
-            let path = path.to_string();
-            move |store| {
-                let result = store.put_aliases_with_receipt(
-                    &name,
-                    &[AliasSpec {
-                        path: &path,
-                        target: &target,
-                    }],
-                    FileMutationOptions {
-                        expected_tree_hash: request.expected_tree_hash.as_deref(),
-                        idempotency: Some(&request.idempotency),
-                        authorization: request.authorization.as_ref(),
-                        expiry: FileExpiry::Preserve,
-                    },
-                )?;
-                Ok(result)
-            }
-        })
-        .await;
-    let result = match result {
-        Ok(result) => result,
-        Err(error) => return mutation_error(app, name, error).await,
-    };
+    let result = run_mutation(app, name, {
+        let name = name.to_string();
+        let path = path.to_string();
+        move |store| {
+            store.put_aliases_with_receipt(
+                &name,
+                &[AliasSpec {
+                    path: &path,
+                    target: &target,
+                }],
+                request.options(FileExpiry::Preserve),
+            )
+        }
+    })
+    .await?;
     let mutation = result.mutation;
     let alias = result
         .aliases
@@ -529,95 +413,72 @@ pub async fn alias_file(app: &App, name: &str, path: &str, headers: &HeaderMap) 
         alias,
         mutation_receipt(&mutation, &idempotency_key, location.clone()),
     );
-    let status = if mutation.created {
-        StatusCode::CREATED
-    } else {
-        StatusCode::OK
-    };
-    let mut response = (status, Json(receipt)).into_response();
+    let mut response = (created_or_ok(&mutation), Json(receipt)).into_response();
     insert_mutation_headers(response.headers_mut(), &mutation, &location);
-    response
+    Ok(response)
 }
 
 pub async fn alias_batch(app: &App, name: &str, headers: &HeaderMap, body: Body) -> Response {
-    let request = match mutation_request(app, name, headers).await {
-        Ok(request) => request,
-        Err(response) => return response,
-    };
+    alias_batch_reply(app, name, headers, body)
+        .await
+        .into_response()
+}
+
+async fn alias_batch_reply(
+    app: &App,
+    name: &str,
+    headers: &HeaderMap,
+    body: Body,
+) -> Reply<Response> {
+    let request = mutation_request(app, name, headers).await?;
     if !content_type_is(headers, "application/json") {
-        return plain(
-            StatusCode::BAD_REQUEST,
+        return Err(bad_request(
             "error: alias batch Content-Type must be application/json",
-        );
+        ));
     }
-    if content_length(headers).is_some_and(|length| length > MAX_ALIAS_BATCH_BYTES as u64) {
-        return plain(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "error: alias batch is too large",
-        );
-    }
-    let Ok(bytes) = to_bytes(body, MAX_ALIAS_BATCH_BYTES).await else {
-        return plain(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "error: alias batch is too large",
-        );
+    let oversized =
+        content_length(headers).is_some_and(|length| length > MAX_ALIAS_BATCH_BYTES as u64);
+    let bytes = if oversized {
+        None
+    } else {
+        to_bytes(body, MAX_ALIAS_BATCH_BYTES).await.ok()
     };
-    let batch = match parse_alias_batch(&bytes) {
-        Ok(batch) => batch,
-        Err(response) => return response,
+    let Some(bytes) = bytes else {
+        return Err(too_large("error: alias batch is too large"));
     };
+    let batch = parse_alias_batch(&bytes)?;
     if let Some(error) = batch
         .aliases
         .iter()
         .find_map(|alias| crate::store::validate_mutation_target(&alias.path).err())
     {
-        return error.into_response();
+        return Err(error.into());
     }
     let idempotency_key = request.idempotency.key.clone();
-    let result = app
-        .run_store({
-            let name = name.to_string();
-            move |store| {
-                let specs = batch
-                    .aliases
-                    .iter()
-                    .map(|alias| AliasSpec {
-                        path: &alias.path,
-                        target: &alias.target,
-                    })
-                    .collect::<Vec<_>>();
-                store.put_aliases_with_receipt(
-                    &name,
-                    &specs,
-                    FileMutationOptions {
-                        expected_tree_hash: request.expected_tree_hash.as_deref(),
-                        idempotency: Some(&request.idempotency),
-                        authorization: request.authorization.as_ref(),
-                        expiry: FileExpiry::Preserve,
-                    },
-                )
-            }
-        })
-        .await;
-    let result = match result {
-        Ok(result) => result,
-        Err(error) => return mutation_error(app, name, error).await,
-    };
+    let result = run_mutation(app, name, {
+        let name = name.to_string();
+        move |store| {
+            let specs = batch
+                .aliases
+                .iter()
+                .map(|alias| AliasSpec {
+                    path: &alias.path,
+                    target: &alias.target,
+                })
+                .collect::<Vec<_>>();
+            store.put_aliases_with_receipt(&name, &specs, request.options(FileExpiry::Preserve))
+        }
+    })
+    .await?;
     let mutation = result.mutation;
-    let aliases = result.aliases;
     let location = site_location(app, name);
     let receipt = contract::AliasBatchReceipt {
-        aliases: aliases.into_iter().map(inventory_alias).collect(),
+        aliases: result.aliases.into_iter().map(inventory_alias).collect(),
         mutation: mutation_receipt(&mutation, &idempotency_key, location.clone()),
     };
-    let status = if mutation.created {
-        StatusCode::CREATED
-    } else {
-        StatusCode::OK
-    };
-    let mut response = (status, Json(receipt)).into_response();
+    let mut response = (created_or_ok(&mutation), Json(receipt)).into_response();
     insert_mutation_headers(response.headers_mut(), &mutation, &location);
-    response
+    Ok(response)
 }
 
 pub async fn replace_file(
@@ -627,49 +488,38 @@ pub async fn replace_file(
     headers: &HeaderMap,
     body: Body,
 ) -> Response {
-    let request = match mutation_request(app, name, headers).await {
-        Ok(request) => request,
-        Err(response) => return response,
-    };
-    if let Err(error) = crate::store::validate_mutation_target(path) {
-        return error.into_response();
-    }
-    let base_hash = match content_match(headers) {
-        Ok(hash) => hash,
-        Err(response) => return response,
-    };
-    let temporary = match spool_content(app, headers, body, app.max_file_size).await {
-        Ok(temporary) => temporary,
-        Err(response) => return response,
-    };
+    replace_file_reply(app, name, path, headers, body)
+        .await
+        .into_response()
+}
+
+async fn replace_file_reply(
+    app: &App,
+    name: &str,
+    path: &str,
+    headers: &HeaderMap,
+    body: Body,
+) -> Reply<Response> {
+    let request = target_request(app, name, path, headers).await?;
+    let base_hash = content_match(headers)?;
+    let temporary = spool_content(app, headers, body, app.max_file_size).await?;
     let idempotency_key = request.idempotency.key.clone();
-    let result = app
-        .run_store({
-            let name = name.to_string();
-            let path = path.to_string();
-            let base_hash = base_hash.to_hex();
-            let source = temporary.path.clone();
-            move |store| {
-                store.replace_file_content(
-                    &name,
-                    &path,
-                    &base_hash,
-                    AllocationSource::File(&source),
-                    FileMutationOptions {
-                        expected_tree_hash: request.expected_tree_hash.as_deref(),
-                        idempotency: Some(&request.idempotency),
-                        authorization: request.authorization.as_ref(),
-                        expiry: FileExpiry::Preserve,
-                    },
-                )
-            }
-        })
-        .await;
-    let replaced = match result {
-        Ok(replaced) => replaced,
-        Err(error) => return mutation_error(app, name, error).await,
-    };
-    let location = resource_location(app, name, &replaced.path);
+    let replaced = run_mutation(app, name, {
+        let name = name.to_string();
+        let path = path.to_string();
+        let base_hash = base_hash.to_hex();
+        let source = temporary.path.clone();
+        move |store| {
+            store.replace_file_content(
+                &name,
+                &path,
+                &base_hash,
+                AllocationSource::File(&source),
+                request.options(FileExpiry::Preserve),
+            )
+        }
+    })
+    .await?;
     let relocated = replaced.path != path;
     let outcome = if !replaced.changed {
         contract::ReplacementOutcome::Unchanged
@@ -678,30 +528,24 @@ pub async fn replace_file(
     } else {
         contract::ReplacementOutcome::Replaced
     };
-    let mutation =
-        match allocated_mutation_receipt(app, name, &replaced, &idempotency_key, location.clone())
-            .await
-        {
-            Ok(mutation) => mutation,
-            Err(error) => return error.into_response(),
-        };
-    let receipt = contract::FileReplaceReceipt {
-        outcome,
-        old_path: path.to_string(),
-        new_path: replaced.path.clone(),
-        relocated,
-        old_hash: base_hash.to_wire(),
-        new_hash: prefixed_hash(&replaced.hash),
-        size: replaced.size,
-        mutation,
-    };
-    let mut response = (StatusCode::OK, Json(receipt)).into_response();
-    if let Err(error) =
-        insert_allocated_headers(app, name, &replaced, &location, response.headers_mut()).await
-    {
-        return error.into_response();
-    }
-    response
+    allocated_json(
+        app,
+        name,
+        &replaced,
+        StatusCode::OK,
+        &idempotency_key,
+        |mutation| contract::FileReplaceReceipt {
+            outcome,
+            old_path: path.to_string(),
+            new_path: replaced.path.clone(),
+            relocated,
+            old_hash: base_hash.to_wire(),
+            new_hash: prefixed_hash(&replaced.hash),
+            size: replaced.size,
+            mutation,
+        },
+    )
+    .await
 }
 
 pub async fn splice_file(
@@ -710,7 +554,9 @@ pub async fn splice_file(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    splice_file_inner(app, name, path, headers, body).await
+    splice_file_inner(app, name, path, headers, body)
+        .await
+        .into_response()
 }
 
 pub async fn splice_files_path(
@@ -719,7 +565,9 @@ pub async fn splice_files_path(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    splice_file_inner(app, name, format!("FILES/{path}"), headers, body).await
+    splice_file_inner(app, name, format!("FILES/{path}"), headers, body)
+        .await
+        .into_response()
 }
 
 async fn splice_file_inner(
@@ -728,23 +576,11 @@ async fn splice_file_inner(
     path: String,
     headers: HeaderMap,
     body: Body,
-) -> Response {
-    let request = match mutation_request(&app, &name, &headers).await {
-        Ok(request) => request,
-        Err(response) => return response,
-    };
-    if let Err(error) = crate::store::validate_mutation_target(&path) {
-        return error.into_response();
-    }
-    let base_hash = match content_match(&headers) {
-        Ok(hash) => hash,
-        Err(response) => return response,
-    };
-    let format = match splice::select_format(&headers) {
-        Ok(format) => format,
-        Err(error) => return splice_error(&error),
-    };
-    let parsed = match splice::parse(
+) -> Reply<Response> {
+    let request = target_request(&app, &name, &path, &headers).await?;
+    let base_hash = content_match(&headers)?;
+    let format = splice::select_format(&headers).map_err(|error| splice_error(&error))?;
+    let parsed = splice::parse(
         format,
         &headers,
         body,
@@ -752,72 +588,70 @@ async fn splice_file_inner(
         app.max_file_size,
     )
     .await
-    {
-        Ok(parsed) => parsed,
-        Err(error) => return splice_error(&error),
-    };
+    .map_err(|error| splice_error(&error))?;
     let old_size = tokio::fs::metadata(app.store.blob_path(base_hash))
         .await
         .ok()
         .map(|metadata| metadata.len());
     let maximum_result_size = app.max_file_size;
     let idempotency_key = request.idempotency.key.clone();
-    let result = app
-        .run_store({
-            let name = name.clone();
-            let path = path.clone();
-            let base_hash = base_hash.to_hex();
-            move |store| {
-                let old_size = old_size.unwrap_or(0);
-                let count = parsed.count();
-                let splices = parsed.as_store_splices();
-                let result = store.splice_file_with_limit(
-                    &name,
-                    &path,
-                    &base_hash,
-                    &splices,
-                    FileMutationOptions {
-                        expected_tree_hash: request.expected_tree_hash.as_deref(),
-                        idempotency: Some(&request.idempotency),
-                        authorization: request.authorization.as_ref(),
-                        expiry: FileExpiry::Preserve,
-                    },
-                    maximum_result_size,
-                )?;
-                Ok((result, old_size, count))
-            }
-        })
-        .await;
-    let (spliced, old_size, count) = match result {
-        Ok(result) => result,
-        Err(error) => return mutation_error(&app, &name, error).await,
-    };
-    let location = resource_location(&app, &name, &spliced.path);
+    let (spliced, old_size, count) = run_mutation(&app, &name, {
+        let name = name.clone();
+        let path = path.clone();
+        let base_hash = base_hash.to_hex();
+        move |store| {
+            let old_size = old_size.unwrap_or(0);
+            let count = parsed.count();
+            let splices = parsed.as_store_splices();
+            let result = store.splice_file_with_limit(
+                &name,
+                &path,
+                &base_hash,
+                &splices,
+                request.options(FileExpiry::Preserve),
+                maximum_result_size,
+            )?;
+            Ok((result, old_size, count))
+        }
+    })
+    .await?;
+    allocated_json(
+        &app,
+        &name,
+        &spliced,
+        StatusCode::OK,
+        &idempotency_key,
+        |mutation| contract::SpliceReceipt {
+            old_path: path.clone(),
+            new_path: spliced.path.clone(),
+            relocated: spliced.path != path,
+            old_hash: base_hash.to_wire(),
+            new_hash: prefixed_hash(&spliced.hash),
+            old_size,
+            new_size: spliced.size,
+            splices: count,
+            mutation,
+        },
+    )
+    .await
+}
+
+/// Builds the JSON response for a mutation that produced an allocated file: the
+/// receipt (given its mutation part) plus the snapshot headers.
+async fn allocated_json<T: serde::Serialize>(
+    app: &App,
+    name: &str,
+    allocated: &AllocatedFile,
+    status: StatusCode,
+    idempotency_key: &str,
+    receipt: impl FnOnce(contract::MutationReceipt) -> T + Send,
+) -> Reply<Response> {
+    let location = resource_location(app, name, &allocated.path);
     let mutation =
-        match allocated_mutation_receipt(&app, &name, &spliced, &idempotency_key, location.clone())
-            .await
-        {
-            Ok(mutation) => mutation,
-            Err(error) => return error.into_response(),
-        };
-    let receipt = contract::SpliceReceipt {
-        old_path: path.clone(),
-        new_path: spliced.path.clone(),
-        relocated: spliced.path != path,
-        old_hash: base_hash.to_wire(),
-        new_hash: prefixed_hash(&spliced.hash),
-        old_size,
-        new_size: spliced.size,
-        splices: count,
-        mutation,
-    };
-    let mut response = (StatusCode::OK, Json(receipt)).into_response();
-    if let Err(error) =
-        insert_allocated_headers(&app, &name, &spliced, &location, response.headers_mut()).await
-    {
-        return error.into_response();
-    }
-    response
+        allocated_mutation_receipt(app, name, allocated, idempotency_key, location.clone()).await?;
+    let mut response = (status, Json(receipt(mutation))).into_response();
+    insert_allocated_headers(app, name, allocated, &location, response.headers_mut()).await?;
+    Ok(response)
 }
 
 async fn allocated_response(
@@ -826,86 +660,57 @@ async fn allocated_response(
     allocated: AllocatedFile,
     idempotency_key: String,
     naming: contract::AllocationNaming,
-) -> Response {
+) -> Reply<Response> {
     let url = resource_location(app, name, &allocated.path);
     let blob_url = format!(
         "{}/.blob/{name}/{}",
         app.public_url,
         bare_hash(&allocated.hash)
     );
-    let created = allocated
+    let status = allocated
         .mutation
         .as_ref()
-        .is_some_and(|mutation| mutation.created);
-    let mutation = match allocated_mutation_receipt(
+        .map_or(StatusCode::OK, created_or_ok);
+    let created = status == StatusCode::CREATED;
+    let mut response = allocated_json(
         app,
         name,
         &allocated,
+        status,
         &idempotency_key,
-        url.clone(),
-    )
-    .await
-    {
-        Ok(mutation) => mutation,
-        Err(error) => return error.into_response(),
-    };
-    let receipt = contract::AllocatedFileReceipt {
-        outcome: if created {
-            contract::AllocationOutcome::Created
-        } else {
-            contract::AllocationOutcome::Existing
+        |mutation| contract::AllocatedFileReceipt {
+            outcome: if created {
+                contract::AllocationOutcome::Created
+            } else {
+                contract::AllocationOutcome::Existing
+            },
+            site: name.to_string(),
+            name: allocated
+                .path
+                .rsplit('/')
+                .next()
+                .unwrap_or(&allocated.path)
+                .to_string(),
+            path: allocated.path.clone(),
+            url: url.clone(),
+            hash: prefixed_hash(&allocated.hash),
+            size: allocated.size,
+            blob_url: blob_url.clone(),
+            naming,
+            mutation,
         },
-        site: name.to_string(),
-        name: allocated
-            .path
-            .rsplit('/')
-            .next()
-            .unwrap_or(&allocated.path)
-            .to_string(),
-        path: allocated.path.clone(),
-        url: url.clone(),
-        hash: prefixed_hash(&allocated.hash),
-        size: allocated.size,
-        blob_url: blob_url.clone(),
-        naming,
-        mutation,
-    };
-    let status = if created {
-        StatusCode::CREATED
-    } else {
-        StatusCode::OK
-    };
-    let mut response = (status, Json(receipt)).into_response();
-    if let Err(error) =
-        insert_allocated_headers(app, name, &allocated, &url, response.headers_mut()).await
-    {
-        return error.into_response();
-    }
+    )
+    .await?;
     response.headers_mut().insert(
         "content-location",
         HeaderValue::from_str(&blob_url).expect("valid blob URL"),
     );
-    response
+    Ok(response)
 }
 
-async fn mutation_request(
-    app: &App,
-    name: &str,
-    headers: &HeaderMap,
-) -> Result<MutationRequest, Response> {
-    let authorization = management_bearer(headers).map_err(IntoResponse::into_response)?;
-    let authorized = app
-        .run_store({
-            let name = name.to_string();
-            let authorization = authorization.clone();
-            move |store| store.authorize_mutation(&name, authorization.as_ref())
-        })
-        .await;
-    if let Err(error) = authorized {
-        return Err(error.into_response());
-    }
-    let expected_tree_hash =
-        if_match_from(headers).map_err(|message| plain(StatusCode::BAD_REQUEST, message))?;
+async fn mutation_request(app: &App, name: &str, headers: &HeaderMap) -> Reply<MutationRequest> {
+    let authorization = authorize(app, name, headers).await?;
+    let expected_tree_hash = if_match_from(headers)?;
     let idempotency = idempotency(headers)?;
     Ok(MutationRequest {
         expected_tree_hash,
@@ -914,24 +719,44 @@ async fn mutation_request(
     })
 }
 
-fn allocation_action(headers: &HeaderMap) -> Result<AllocationAction, Response> {
+/// `mutation_request` followed by validation of the mutation target path.
+async fn target_request(
+    app: &App,
+    name: &str,
+    target: &str,
+    headers: &HeaderMap,
+) -> Reply<MutationRequest> {
+    let request = mutation_request(app, name, headers).await?;
+    crate::store::validate_mutation_target(target)?;
+    Ok(request)
+}
+
+/// Runs a store mutation, mapping its error through `mutation_error`.
+async fn run_mutation<T, F>(app: &App, name: &str, work: F) -> Reply<T>
+where
+    T: Send + 'static,
+    F: FnOnce(Store) -> Result<T, StoreError> + Send + 'static,
+{
+    match app.run_store(work).await {
+        Ok(value) => Ok(value),
+        Err(error) => Err(mutation_error(app, name, error).await.into()),
+    }
+}
+
+fn allocation_action(headers: &HeaderMap) -> Reply<AllocationAction> {
     match optional_header(headers, "allocation-action", "Allocation-Action")?.as_deref() {
         None | Some("create") => Ok(AllocationAction::Create),
         Some("propose") => Ok(AllocationAction::Propose),
         Some("finalize") => Ok(AllocationAction::Finalize),
         Some("cancel") => Ok(AllocationAction::Cancel),
-        Some(_) => Err(plain(
-            StatusCode::BAD_REQUEST,
-            "error: invalid Allocation-Action header",
-        )),
+        Some(_) => Err(bad_request("error: invalid Allocation-Action header")),
     }
 }
 
-fn generated_naming(headers: &HeaderMap) -> Result<GeneratedNaming, Response> {
+fn generated_naming(headers: &HeaderMap) -> Reply<GeneratedNaming> {
     let extension = optional_header(headers, "file-extension", "File-Extension")?
         .map(|extension| crate::store::normalize_allocated_extension(&extension))
-        .transpose()
-        .map_err(IntoResponse::into_response)?;
+        .transpose()?;
     Ok(GeneratedNaming {
         prefix: optional_header(headers, "file-prefix", "File-Prefix")?.unwrap_or_default(),
         suffix: optional_header(headers, "file-suffix", "File-Suffix")?.unwrap_or_default(),
@@ -939,18 +764,16 @@ fn generated_naming(headers: &HeaderMap) -> Result<GeneratedNaming, Response> {
     })
 }
 
-fn parse_alias_batch(bytes: &[u8]) -> Result<contract::AliasBatchRequest, Response> {
+fn parse_alias_batch(bytes: &[u8]) -> Reply<contract::AliasBatchRequest> {
     let batch = serde_json::from_slice::<contract::AliasBatchRequest>(bytes)
-        .map_err(|_| plain(StatusCode::BAD_REQUEST, "error: invalid alias batch JSON"))?;
+        .map_err(|_| bad_request("error: invalid alias batch JSON"))?;
     if batch.aliases.is_empty() {
-        return Err(plain(
-            StatusCode::BAD_REQUEST,
+        return Err(bad_request(
             "error: alias batch must contain 1-4096 aliases",
         ));
     }
     if batch.aliases.len() > MAX_ALIAS_BATCH_ENTRIES {
-        return Err(plain(
-            StatusCode::PAYLOAD_TOO_LARGE,
+        return Err(too_large(
             "error: alias batch exceeds the configured entry limit",
         ));
     }
@@ -959,15 +782,14 @@ fn parse_alias_batch(bytes: &[u8]) -> Result<contract::AliasBatchRequest, Respon
         .iter()
         .any(|alias| alias.target.len() > crate::upload::MAX_ALIAS_TARGET_BYTES)
     {
-        return Err(plain(
-            StatusCode::PAYLOAD_TOO_LARGE,
+        return Err(too_large(
             "error: alias batch target exceeds the configured limit",
         ));
     }
     Ok(batch)
 }
 
-fn media_type(headers: &HeaderMap) -> Result<String, Response> {
+fn media_type(headers: &HeaderMap) -> Reply<String> {
     optional_header(headers, header::CONTENT_TYPE.as_str(), "Content-Type")
         .map(|value| value.unwrap_or_else(|| "application/octet-stream".to_string()))
 }
@@ -976,7 +798,7 @@ fn allocation_expiry(
     headers: &HeaderMap,
     defaults: crate::expiry::DecayPolicy,
     absent: FileExpiry,
-) -> Result<FileExpiry, Response> {
+) -> Reply<FileExpiry> {
     if !headers.contains_key("expiry-mode") && !has_expiry_parameters(headers) {
         return Ok(absent);
     }
@@ -984,22 +806,17 @@ fn allocation_expiry(
         Ok(ExpiryRequest::Never) => Ok(FileExpiry::Clear),
         Ok(ExpiryRequest::Policy(policy)) => Ok(FileExpiry::Policy(policy)),
         Ok(ExpiryRequest::Default) => unreachable!("expiry headers were present"),
-        Err(error) => Err(StoreError::Expiry(error).into_response()),
+        Err(error) => Err(StoreError::Expiry(error).into()),
     }
 }
 
-fn idempotency(headers: &HeaderMap) -> Result<Idempotency, Response> {
+fn idempotency(headers: &HeaderMap) -> Reply<Idempotency> {
     let key = match headers.get("idempotency-key") {
         Some(value) => value
             .to_str()
-            .map_err(|_| {
-                plain(
-                    StatusCode::BAD_REQUEST,
-                    "error: invalid Idempotency-Key header",
-                )
-            })?
+            .map_err(|_| bad_request("error: invalid Idempotency-Key header"))?
             .to_string(),
-        None => generated_idempotency_key().map_err(IntoResponse::into_response)?,
+        None => generated_idempotency_key()?,
     };
     if key.is_empty()
         || key.len() > 256
@@ -1008,8 +825,7 @@ fn idempotency(headers: &HeaderMap) -> Result<Idempotency, Response> {
             .iter()
             .all(|byte| (0x21..=0x7e).contains(byte))
     {
-        return Err(plain(
-            StatusCode::BAD_REQUEST,
+        return Err(bad_request(
             "error: idempotency key must be 1-256 visible ASCII characters",
         ));
     }
@@ -1026,7 +842,8 @@ fn generated_idempotency_key() -> Result<String, StoreError> {
     Ok(encoded)
 }
 
-fn content_match(headers: &HeaderMap) -> Result<ContentHash, Response> {
+fn content_match(headers: &HeaderMap) -> Reply<ContentHash> {
+    const INVALID: &str = "error: If-Content-Match must contain one raw Blake3 hash";
     let value = required_text_header(headers, "if-content-match", "If-Content-Match")?;
     let value = value.trim();
     let value = value
@@ -1039,46 +856,32 @@ fn content_match(headers: &HeaderMap) -> Result<ContentHash, Response> {
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
     {
-        return Err(plain(
-            StatusCode::BAD_REQUEST,
-            "error: If-Content-Match must contain one raw Blake3 hash",
-        ));
+        return Err(bad_request(INVALID));
     }
-    ContentHash::parse_hex(value).map_err(|_| {
-        plain(
-            StatusCode::BAD_REQUEST,
-            "error: If-Content-Match must contain one raw Blake3 hash",
-        )
-    })
+    ContentHash::parse_hex(value).map_err(|_| bad_request(INVALID))
 }
 
 fn required_text_header(
     headers: &HeaderMap,
     name: &str,
     display_name: &'static str,
-) -> Result<String, Response> {
-    optional_header(headers, name, display_name)?.ok_or_else(|| {
-        plain(
-            StatusCode::BAD_REQUEST,
-            format!("error: {display_name} header is required"),
-        )
-    })
+) -> Reply<String> {
+    optional_header(headers, name, display_name)?
+        .ok_or_else(|| bad_request(format!("error: {display_name} header is required")))
 }
 
 fn optional_header(
     headers: &HeaderMap,
     name: &str,
     display_name: &'static str,
-) -> Result<Option<String>, Response> {
+) -> Reply<Option<String>> {
     headers
         .get(name)
         .map(|value| {
-            value.to_str().map(str::to_string).map_err(|_| {
-                plain(
-                    StatusCode::BAD_REQUEST,
-                    format!("error: invalid {display_name} header"),
-                )
-            })
+            value
+                .to_str()
+                .map(str::to_string)
+                .map_err(|_| bad_request(format!("error: invalid {display_name} header")))
         })
         .transpose()
 }
@@ -1088,9 +891,9 @@ async fn spool_content(
     headers: &HeaderMap,
     body: Body,
     limit: u64,
-) -> Result<TemporaryUpload, Response> {
+) -> Reply<TemporaryUpload> {
     if content_length(headers).is_some_and(|size| size > limit) {
-        return Err(StoreError::Upload(crate::upload::UploadError::FileTooLarge).into_response());
+        return Err(StoreError::Upload(crate::upload::UploadError::FileTooLarge).into());
     }
     let temporary = TemporaryUpload {
         path: app.store.upload_path(),
@@ -1113,15 +916,14 @@ async fn spool_content(
         Ok::<(), StoreError>(())
     }
     .await;
-    result.map_err(IntoResponse::into_response)?;
+    result?;
     Ok(temporary)
 }
 
-async fn require_empty_body(body: Body) -> Result<(), Response> {
+async fn require_empty_body(body: Body) -> Reply<()> {
     match to_bytes(body, 1).await {
         Ok(bytes) if bytes.is_empty() => Ok(()),
-        Ok(_) | Err(_) => Err(plain(
-            StatusCode::BAD_REQUEST,
+        Ok(_) | Err(_) => Err(bad_request(
             "error: this allocation action requires an empty body",
         )),
     }
@@ -1226,6 +1028,12 @@ fn mutation_receipt(
     }
 }
 
+async fn site_snapshot(app: &App, name: &str) -> Result<SiteInventory, StoreError> {
+    let name = name.to_string();
+    app.run_store(move |store| store.site_inventory(&name))
+        .await
+}
+
 async fn allocated_mutation_receipt(
     app: &App,
     name: &str,
@@ -1236,12 +1044,7 @@ async fn allocated_mutation_receipt(
     if let Some(mutation) = &allocated.mutation {
         return Ok(mutation_receipt(mutation, idempotency_key, location));
     }
-    let snapshot = app
-        .run_store({
-            let name = name.to_string();
-            move |store| store.site_inventory(&name)
-        })
-        .await?;
+    let snapshot = site_snapshot(app, name).await?;
     Ok(contract::MutationReceipt {
         changed: allocated.changed,
         replayed: allocated.replayed,
@@ -1256,32 +1059,20 @@ async fn allocated_mutation_receipt(
 }
 
 fn insert_mutation_headers(headers: &mut HeaderMap, mutation: &MutationResult, location: &str) {
-    headers.insert(
-        header::LOCATION,
-        HeaderValue::from_str(location).expect("valid location"),
+    insert_snapshot_values(
+        headers,
+        location,
+        &mutation.tree_hash,
+        mutation.revision,
+        mutation.replayed,
     );
-    headers.insert(
-        header::ETAG,
-        HeaderValue::from_str(&format!("\"{}\"", mutation.tree_hash)).expect("valid ETag"),
-    );
-    headers.insert(
-        "content-revision",
-        HeaderValue::from_str(&mutation.revision.to_string()).expect("valid revision"),
-    );
-    if mutation.replayed {
-        headers.insert("idempotency-replayed", HeaderValue::from_static("true"));
-    }
     if let Some(undo) = &mutation.undo {
         insert_undo_headers(headers, undo);
     }
     insert_sanitized_headers(headers, mutation.sanitized);
 }
 
-fn insert_snapshot_values(headers: &mut HeaderMap, location: &str, tree_hash: &str, revision: u64) {
-    headers.insert(
-        header::LOCATION,
-        HeaderValue::from_str(location).expect("valid location"),
-    );
+fn insert_etag_headers(headers: &mut HeaderMap, tree_hash: &str, revision: u64) {
     headers.insert(
         header::ETAG,
         HeaderValue::from_str(&format!("\"{tree_hash}\"")).expect("valid ETag"),
@@ -1292,7 +1083,18 @@ fn insert_snapshot_values(headers: &mut HeaderMap, location: &str, tree_hash: &s
     );
 }
 
-fn insert_replay_header(headers: &mut HeaderMap, replayed: bool) {
+fn insert_snapshot_values(
+    headers: &mut HeaderMap,
+    location: &str,
+    tree_hash: &str,
+    revision: u64,
+    replayed: bool,
+) {
+    headers.insert(
+        header::LOCATION,
+        HeaderValue::from_str(location).expect("valid location"),
+    );
+    insert_etag_headers(headers, tree_hash, revision);
     if replayed {
         headers.insert("idempotency-replayed", HeaderValue::from_static("true"));
     }
@@ -1309,55 +1111,28 @@ async fn insert_allocated_headers(
         insert_mutation_headers(headers, mutation, location);
         return Ok(());
     }
-    headers.insert(
-        header::LOCATION,
-        HeaderValue::from_str(location).expect("valid location"),
-    );
-    if allocated.replayed {
-        headers.insert("idempotency-replayed", HeaderValue::from_static("true"));
-    }
-    let snapshot = app
-        .run_store({
-            let name = name.to_string();
-            move |store| store.site_inventory(&name)
-        })
-        .await?;
-    headers.insert(
-        header::ETAG,
-        HeaderValue::from_str(&format!("\"{}\"", snapshot.tree_hash)).expect("valid ETag"),
-    );
-    headers.insert(
-        "content-revision",
-        HeaderValue::from_str(&snapshot.content_revision.to_string()).expect("valid revision"),
+    let snapshot = site_snapshot(app, name).await?;
+    insert_snapshot_values(
+        headers,
+        location,
+        &snapshot.tree_hash,
+        snapshot.content_revision,
+        allocated.replayed,
     );
     Ok(())
 }
 
 async fn mutation_error(app: &App, name: &str, error: StoreError) -> Response {
     if let StoreError::StaleContentHash(current_hash) = error {
-        let revision = app
-            .run_store({
-                let name = name.to_string();
-                move |store| store.site_inventory(&name)
-            })
+        let revision = site_snapshot(app, name)
             .await
             .map_or(0, |snapshot| snapshot.content_revision);
+        let current = current_hash.to_wire();
         let mut response = plain(
             StatusCode::PRECONDITION_FAILED,
-            format!(
-                "error: file content hash is stale; current hash is {}",
-                current_hash.to_wire()
-            ),
+            format!("error: file content hash is stale; current hash is {current}"),
         );
-        response.headers_mut().insert(
-            header::ETAG,
-            HeaderValue::from_str(&format!("\"{}\"", current_hash.to_wire()))
-                .expect("valid content ETag"),
-        );
-        response.headers_mut().insert(
-            "content-revision",
-            HeaderValue::from_str(&revision.to_string()).expect("valid revision"),
-        );
+        insert_etag_headers(response.headers_mut(), &current, revision);
         response
     } else {
         error.into_response()
