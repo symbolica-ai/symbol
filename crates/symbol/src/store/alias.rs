@@ -70,17 +70,11 @@ pub(super) fn alias_mutation_fingerprint(
     aliases: &BTreeMap<String, String>,
     expected_tree_hash: Option<&str>,
 ) -> String {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"symbol-alias-mutation-v1\0");
-    hasher.update(name.as_bytes());
+    let mut fingerprint = Fingerprint::new("symbol-alias-mutation-v1").raw(name);
     for (path, target) in aliases {
-        hasher.update(&(path.len() as u64).to_le_bytes());
-        hasher.update(path.as_bytes());
-        hasher.update(&(target.len() as u64).to_le_bytes());
-        hasher.update(target.as_bytes());
+        fingerprint = fingerprint.len_prefixed(path).len_prefixed(target);
     }
-    hasher.update(expected_tree_hash.unwrap_or("").as_bytes());
-    hasher.finalize().to_hex().to_string()
+    fingerprint.raw(expected_tree_hash.unwrap_or("")).finish()
 }
 
 pub(super) fn load_requested_aliases_locked<'a>(
@@ -106,25 +100,16 @@ pub(super) fn alias_mutation_replay(
     fingerprint: &str,
 ) -> Result<Option<AliasMutationResult>, StoreError> {
     validate_idempotency_key(&idempotency.key)?;
-    let record = idempotency_records::table
-        .find(idempotency_key_hash(&idempotency.key))
-        .select((
-            idempotency_records::fingerprint,
-            idempotency_records::operation_kind,
-            idempotency_records::result_metadata,
-        ))
-        .first::<(String, i64, String)>(tx)
-        .optional()?;
-    let Some((stored_fingerprint, kind, metadata)) = record else {
-        return Ok(None);
-    };
-    if stored_fingerprint != fingerprint || kind != IdempotencyKind::AliasMutation as i64 {
-        return Err(StoreError::IdempotencyConflict);
+    let mut result = replay_record::<AliasMutationResult>(
+        tx,
+        &idempotency.key,
+        IdempotencyKind::AliasMutation,
+        Some(fingerprint),
+    )?;
+    if let Some(result) = &mut result {
+        result.mutation.replayed = true;
     }
-    let mut result = serde_json::from_str::<AliasMutationResult>(&metadata)
-        .map_err(|error| StoreError::Io(io::Error::new(io::ErrorKind::InvalidData, error)))?;
-    result.mutation.replayed = true;
-    Ok(Some(result))
+    Ok(result)
 }
 
 pub(super) fn store_alias_mutation(
@@ -137,18 +122,14 @@ pub(super) fn store_alias_mutation(
     let Some(idempotency) = idempotency else {
         return Ok(());
     };
-    let metadata = serde_json::to_string(result)
-        .map_err(|error| StoreError::Io(io::Error::new(io::ErrorKind::InvalidData, error)))?;
-    diesel::insert_into(idempotency_records::table)
-        .values((
-            idempotency_records::key_hash.eq(idempotency_key_hash(&idempotency.key)),
-            idempotency_records::fingerprint.eq(fingerprint),
-            idempotency_records::operation_kind.eq(IdempotencyKind::AliasMutation as i64),
-            idempotency_records::result_metadata.eq(metadata),
-            idempotency_records::expires.eq(now + IDEMPOTENCY_RETENTION_MILLIS),
-        ))
-        .execute(tx)?;
-    Ok(())
+    store_record(
+        tx,
+        &idempotency.key,
+        IdempotencyKind::AliasMutation,
+        fingerprint,
+        result,
+        now,
+    )
 }
 
 pub(super) fn alias_entry(row: AliasRow) -> Result<AliasEntry, StoreError> {
@@ -1035,29 +1016,7 @@ pub(super) fn zip_safe_relative_alias_target(path: &str, target: &str) -> io::Re
 }
 
 impl Store {
-    #[cfg(test)]
-    pub fn put_alias(
-        &self,
-        name: &str,
-        path: &str,
-        target: &str,
-        options: FileMutationOptions<'_>,
-    ) -> Result<MutationResult, StoreError> {
-        self.put_aliases(name, &[AliasSpec { path, target }], options)
-    }
-
-    #[cfg(test)]
-    pub fn put_aliases(
-        &self,
-        name: &str,
-        specs: &[AliasSpec<'_>],
-        options: FileMutationOptions<'_>,
-    ) -> Result<MutationResult, StoreError> {
-        self.put_aliases_with_receipt(name, specs, options)
-            .map(|result| result.mutation)
-    }
-
-    #[expect(clippy::significant_drop_tightening, clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     pub fn put_aliases_with_receipt(
         &self,
         name: &str,
@@ -1099,177 +1058,143 @@ impl Store {
         }
         let fingerprint = alias_mutation_fingerprint(name, &requested, options.expected_tree_hash);
         let now = self.now_millis();
-        let mut db = self.inner.writer.lock().unwrap();
-        let mut tx = DbTransaction::begin(&mut db)?;
-        authorize_locked(&mut tx, name, options.authorization)?;
-        prune_idempotency_locked(&mut tx, now)?;
-        if let Some(idempotency) = options.idempotency {
-            validate_idempotency_key(&idempotency.key)?;
-            if let Some(replay) = alias_mutation_replay(&mut tx, idempotency, &fingerprint)? {
-                return Ok(replay);
+        self.write_outcome(|tx| {
+            authorize_locked(tx, name, options.authorization)?;
+            prune_idempotency_locked(tx, now)?;
+            if let Some(idempotency) = options.idempotency {
+                validate_idempotency_key(&idempotency.key)?;
+                if let Some(replay) = alias_mutation_replay(tx, idempotency, &fingerprint)? {
+                    return Ok(TxOutcome::Rollback(replay));
+                }
             }
-        }
-        check_tree_precondition(&mut tx, name, options.expected_tree_hash)?;
-        let site_id = site_id_locked(&mut tx, name)?;
-        let entry_kinds = site_entries::table
-            .filter(site_entries::site_id.eq(site_id))
-            .select((site_entries::path, site_entries::kind))
-            .load::<(String, i64)>(&mut *tx)?
-            .into_iter()
-            .collect::<HashMap<_, _>>();
-        let entry_paths = entry_kinds.keys().cloned().collect::<BTreeSet<_>>();
-        let existing_aliases = aliases::table
-            .filter(aliases::site_id.eq(site_id))
-            .select((aliases::path, aliases::canonical_target))
-            .load::<(String, String)>(&mut *tx)?
-            .into_iter()
-            .collect::<BTreeMap<_, _>>();
-        let prospective_alias_paths = existing_aliases
-            .keys()
-            .chain(requested.keys())
-            .map(String::as_str)
-            .collect::<HashSet<_>>();
-        let mut changed_paths = Vec::new();
-        let mut created_paths = 0_usize;
-        for (path, target) in &requested {
-            if path
-                .strip_prefix(target)
-                .is_some_and(|suffix| suffix.starts_with('/'))
-            {
-                return Err(StoreError::AliasCycle);
-            }
-            if aggregate_paths(path)
+            check_tree_precondition(tx, name, options.expected_tree_hash)?;
+            let site_id = site_id_locked(tx, name)?;
+            let entry_kinds = site_entries::table
+                .filter(site_entries::site_id.eq(site_id))
+                .select((site_entries::path, site_entries::kind))
+                .load::<(String, i64)>(&mut *tx)?
                 .into_iter()
-                .any(|ancestor| !ancestor.is_empty() && prospective_alias_paths.contains(ancestor))
-            {
-                return Err(StoreError::AliasWrite);
-            }
-            let (descendant_start, descendant_end) = descendant_bounds(path);
-            if entry_paths
-                .range(descendant_start..descendant_end)
-                .next()
-                .is_some()
-            {
-                return Err(StoreError::AliasConflict);
-            }
-            let entry_kind = entry_kinds.get(path).copied();
-            match entry_kind {
-                Some(kind) if kind != database::schema::ALIAS_ENTRY_KIND => {
+                .collect::<HashMap<_, _>>();
+            let entry_paths = entry_kinds.keys().cloned().collect::<BTreeSet<_>>();
+            let existing_aliases = aliases::table
+                .filter(aliases::site_id.eq(site_id))
+                .select((aliases::path, aliases::canonical_target))
+                .load::<(String, String)>(&mut *tx)?
+                .into_iter()
+                .collect::<BTreeMap<_, _>>();
+            let prospective_alias_paths = existing_aliases
+                .keys()
+                .chain(requested.keys())
+                .map(String::as_str)
+                .collect::<HashSet<_>>();
+            let mut changed_paths = Vec::new();
+            let mut created_paths = 0_usize;
+            for (path, target) in &requested {
+                if path
+                    .strip_prefix(target)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+                {
+                    return Err(StoreError::AliasCycle);
+                }
+                if aggregate_paths(path).into_iter().any(|ancestor| {
+                    !ancestor.is_empty() && prospective_alias_paths.contains(ancestor)
+                }) {
+                    return Err(StoreError::AliasWrite);
+                }
+                let (descendant_start, descendant_end) = descendant_bounds(path);
+                if entry_paths
+                    .range(descendant_start..descendant_end)
+                    .next()
+                    .is_some()
+                {
                     return Err(StoreError::AliasConflict);
                 }
-                Some(_) => {
-                    let current = existing_aliases
-                        .get(path)
-                        .expect("alias entry has alias metadata");
-                    if current != target {
+                let entry_kind = entry_kinds.get(path).copied();
+                match entry_kind {
+                    Some(kind) if kind != database::schema::ALIAS_ENTRY_KIND => {
+                        return Err(StoreError::AliasConflict);
+                    }
+                    Some(_) => {
+                        let current = existing_aliases
+                            .get(path)
+                            .expect("alias entry has alias metadata");
+                        if current != target {
+                            changed_paths.push(path.as_str());
+                        }
+                    }
+                    None => {
                         changed_paths.push(path.as_str());
+                        created_paths += 1;
                     }
                 }
-                None => {
-                    changed_paths.push(path.as_str());
-                    created_paths += 1;
-                }
             }
-        }
-        if changed_paths.is_empty() {
-            let (revision, tree_hash) = site_revision_locked(&mut tx, name)?;
-            let result = MutationResult {
-                created: false,
-                changed: false,
-                replayed: false,
-                files: requested.len(),
-                revision,
-                tree_hash: tree_hash.to_wire(),
-                undo: None,
-                sanitized: TokenCounts::default(),
-            };
+            if changed_paths.is_empty() {
+                let (revision, tree_hash) = site_revision_locked(tx, name)?;
+                let result = AliasMutationResult {
+                    aliases: load_requested_aliases_locked(tx, site_id, requested.keys())?,
+                    mutation: MutationResult::unchanged(requested.len(), revision, tree_hash),
+                };
+                store_alias_mutation(tx, options.idempotency, &fingerprint, &result, now)?;
+                return Ok(TxOutcome::Commit(result, Vec::new()));
+            }
+            let undo = snapshot_entry_deltas(
+                tx,
+                name,
+                UndoKind::Alias,
+                &format!("restore previous aliases in {name}"),
+                &changed_paths,
+                now,
+            )?;
+            for path in &changed_paths {
+                let target = &requested[*path];
+                ensure_entry(tx, site_id, path, database::schema::ALIAS_ENTRY_KIND)?;
+                diesel::insert_into(aliases::table)
+                    .values((
+                        aliases::site_id.eq(site_id),
+                        aliases::path.eq(*path),
+                        aliases::kind.eq(database::schema::ALIAS_ENTRY_KIND),
+                        aliases::canonical_target.eq(target),
+                        aliases::resolved_kind.eq(Option::<i64>::None),
+                        aliases::resolved_hash.eq(Option::<ContentHash>::None),
+                        aliases::resolved_size.eq(Option::<i64>::None),
+                        aliases::modified.eq(now),
+                    ))
+                    .on_conflict((aliases::site_id, aliases::path))
+                    .do_update()
+                    .set((
+                        aliases::canonical_target.eq(excluded(aliases::canonical_target)),
+                        aliases::resolved_kind.eq(Option::<i64>::None),
+                        aliases::resolved_hash.eq(Option::<ContentHash>::None),
+                        aliases::resolved_size.eq(Option::<i64>::None),
+                        aliases::modified.eq(now),
+                    ))
+                    .execute(&mut *tx)?;
+            }
+            bump_revision_and_touch_locked(tx, site_id, now)?;
+            record_site_event(
+                tx,
+                site_id,
+                StoredSiteEventKind::Publish,
+                changed_paths.len(),
+                now,
+            )?;
+            let alias_changes = changed_paths
+                .iter()
+                .map(|path| AliasChange::Alias(path))
+                .collect::<Vec<_>>();
+            refresh_aliases_locked(tx, site_id, &alias_changes)?;
+            refresh_expiry_for_changes_locked(tx, site_id, &changed_paths, now)?;
+            let tree_hash = regenerate_site(tx, &self.inner.blob_files, site_id, now)?;
+            let (revision, _) = site_revision_locked(tx, name)?;
+            prune_undo_locked(tx, now)?;
             let result = AliasMutationResult {
-                aliases: load_requested_aliases_locked(&mut tx, site_id, requested.keys())?,
-                mutation: result,
+                aliases: load_requested_aliases_locked(tx, site_id, requested.keys())?,
+                mutation: MutationResult::applied(changed_paths.len(), revision, tree_hash, undo)
+                    .with_created(created_paths == changed_paths.len()),
             };
-            store_alias_mutation(&mut tx, options.idempotency, &fingerprint, &result, now)?;
-            tx.commit()?;
-            return Ok(result);
-        }
-        let undo = snapshot_entry_deltas(
-            &mut tx,
-            name,
-            UndoKind::Alias,
-            &format!("restore previous aliases in {name}"),
-            &changed_paths,
-            now,
-        )?;
-        for path in &changed_paths {
-            let target = &requested[*path];
-            diesel::insert_into(site_entries::table)
-                .values((
-                    site_entries::site_id.eq(site_id),
-                    site_entries::path.eq(*path),
-                    site_entries::kind.eq(database::schema::ALIAS_ENTRY_KIND),
-                ))
-                .on_conflict_do_nothing()
-                .execute(&mut *tx)?;
-            diesel::insert_into(aliases::table)
-                .values((
-                    aliases::site_id.eq(site_id),
-                    aliases::path.eq(*path),
-                    aliases::kind.eq(database::schema::ALIAS_ENTRY_KIND),
-                    aliases::canonical_target.eq(target),
-                    aliases::resolved_kind.eq(Option::<i64>::None),
-                    aliases::resolved_hash.eq(Option::<ContentHash>::None),
-                    aliases::resolved_size.eq(Option::<i64>::None),
-                    aliases::modified.eq(now),
-                ))
-                .on_conflict((aliases::site_id, aliases::path))
-                .do_update()
-                .set((
-                    aliases::canonical_target.eq(excluded(aliases::canonical_target)),
-                    aliases::resolved_kind.eq(Option::<i64>::None),
-                    aliases::resolved_hash.eq(Option::<ContentHash>::None),
-                    aliases::resolved_size.eq(Option::<i64>::None),
-                    aliases::modified.eq(now),
-                ))
-                .execute(&mut *tx)?;
-        }
-        diesel::update(sites::table.find(site_id))
-            .set((
-                sites::updated.eq(now),
-                sites::content_revision.eq(sites::content_revision + 1),
-            ))
-            .execute(&mut *tx)?;
-        record_site_event(
-            &mut tx,
-            site_id,
-            StoredSiteEventKind::Publish,
-            changed_paths.len(),
-            now,
-        )?;
-        let alias_changes = changed_paths
-            .iter()
-            .map(|path| AliasChange::Alias(path))
-            .collect::<Vec<_>>();
-        refresh_aliases_locked(&mut tx, site_id, &alias_changes)?;
-        refresh_expiry_for_changes_locked(&mut tx, site_id, &changed_paths, now)?;
-        let tree_hash = regenerate_site(&mut tx, &self.inner.blob_files, site_id, now)?;
-        let (revision, _) = site_revision_locked(&mut tx, name)?;
-        prune_undo_locked(&mut tx, now)?;
-        let result = MutationResult {
-            created: created_paths == changed_paths.len(),
-            changed: true,
-            replayed: false,
-            files: changed_paths.len(),
-            revision,
-            tree_hash: tree_hash.to_wire(),
-            undo: Some(undo),
-            sanitized: TokenCounts::default(),
-        };
-        let result = AliasMutationResult {
-            aliases: load_requested_aliases_locked(&mut tx, site_id, requested.keys())?,
-            mutation: result,
-        };
-        store_alias_mutation(&mut tx, options.idempotency, &fingerprint, &result, now)?;
-        tx.commit()?;
-        Ok(result)
+            store_alias_mutation(tx, options.idempotency, &fingerprint, &result, now)?;
+            Ok(TxOutcome::Commit(result, Vec::new()))
+        })
     }
 
     pub fn alias(&self, name: &str, path: &str) -> Result<AliasEntry, StoreError> {
@@ -1283,66 +1208,5 @@ impl Store {
             .first::<AliasRow>(&mut *db)
             .map_err(map_sql)?;
         alias_entry(row)
-    }
-
-    #[cfg(test)]
-    pub fn aliases(&self, name: &str) -> Result<Vec<AliasEntry>, StoreError> {
-        let name = parse_site_name(name)?;
-        let mut db = self.inner.readers.get();
-        let site_id = site_id_locked(&mut db, name)?;
-        aliases::table
-            .filter(aliases::site_id.eq(site_id))
-            .select(AliasRow::as_select())
-            .order(aliases::path)
-            .load::<AliasRow>(&mut *db)?
-            .into_iter()
-            .map(alias_entry)
-            .collect()
-    }
-
-    #[cfg(test)]
-    pub fn alias_inventory(&self, name: &str) -> Result<AliasInventory, StoreError> {
-        let name = parse_site_name(name)?;
-        let mut db = self.inner.readers.get();
-        let mut snapshot = DbTransaction::begin(&mut db)?;
-        let (site_id, content_revision, tree_hash) = sites::table
-            .filter(sites::name.eq(name))
-            .select((sites::id, sites::content_revision, sites::tree_hash))
-            .first::<(i64, i64, TreeHash)>(&mut *snapshot)
-            .map_err(map_sql)?;
-        let aliases = aliases::table
-            .filter(aliases::site_id.eq(site_id))
-            .select(AliasRow::as_select())
-            .order(aliases::path)
-            .load::<AliasRow>(&mut *snapshot)?
-            .into_iter()
-            .map(alias_entry)
-            .collect::<Result<Vec<_>, _>>()?;
-        snapshot.commit()?;
-        Ok(AliasInventory {
-            site: name.to_string(),
-            content_revision: content_revision.cast_unsigned(),
-            tree_hash: tree_hash.to_wire(),
-            aliases,
-        })
-    }
-
-    #[cfg(test)]
-    pub fn alias_stats(&self, name: &str) -> Result<AliasStats, StoreError> {
-        let inventory = self.alias_inventory(name)?;
-        let aliases = u64::try_from(inventory.aliases.len()).expect("alias count fits in u64");
-        let resolved = u64::try_from(
-            inventory
-                .aliases
-                .iter()
-                .filter(|alias| alias.resolved_kind.is_some())
-                .count(),
-        )
-        .expect("resolved alias count fits in u64");
-        Ok(AliasStats {
-            aliases,
-            resolved,
-            dangling: aliases - resolved,
-        })
     }
 }

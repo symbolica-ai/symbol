@@ -75,15 +75,35 @@ mod expiry;
 #[allow(clippy::wildcard_imports)] // see the note in the child module
 use expiry::*;
 
+mod fingerprint;
+use fingerprint::Fingerprint;
+
+mod idempotency;
+use idempotency::{replay_record, store_record, validated_key};
+
 mod mutation;
 pub use mutation::validate_mutation_target;
 #[allow(clippy::wildcard_imports)] // see the note in the child module
 use mutation::*;
 
+mod rows;
+
 mod undo;
 #[allow(clippy::wildcard_imports)] // see the note in the child module
 use undo::*;
 
+mod queries;
+use queries::{
+    bump_revision_and_touch_locked, bump_revision_locked, count_files_locked, require_site_locked,
+};
+
+mod write;
+use write::{TxOutcome, finish_mutation};
+
+#[cfg(test)]
+mod copy_tests;
+#[cfg(test)]
+mod test_support;
 #[cfg(test)]
 mod tests;
 
@@ -248,20 +268,30 @@ enum PendingFinalName<'a> {
     Custom(&'a str),
 }
 
-fn ensure_file_entry(
+/// Inserts the `site_entries` row of `kind` for `path` unless it already has one.
+fn ensure_entry(
     db: &mut SqliteConnection,
     site_id: i64,
     path: &str,
+    kind: i64,
 ) -> Result<(), diesel::result::Error> {
     diesel::insert_into(site_entries::table)
         .values((
             site_entries::site_id.eq(site_id),
             site_entries::path.eq(path),
-            site_entries::kind.eq(database::schema::FILE_ENTRY_KIND),
+            site_entries::kind.eq(kind),
         ))
         .on_conflict_do_nothing()
         .execute(db)?;
     Ok(())
+}
+
+fn ensure_file_entry(
+    db: &mut SqliteConnection,
+    site_id: i64,
+    path: &str,
+) -> Result<(), diesel::result::Error> {
+    ensure_entry(db, site_id, path, database::schema::FILE_ENTRY_KIND)
 }
 
 #[cfg(test)]
@@ -723,21 +753,6 @@ impl Metrics {
 }
 
 impl Store {
-    #[cfg(test)]
-    pub fn new(root: PathBuf) -> Result<Self, StoreError> {
-        Self::with_options(
-            root,
-            "http://symbol".to_string(),
-            Arc::new(SystemClock),
-            DecayPolicy::default(),
-        )
-    }
-
-    #[cfg(test)]
-    pub fn with_public_url(root: PathBuf, public_url: String) -> Result<Self, StoreError> {
-        Self::with_expiry_defaults(root, public_url, DecayPolicy::default())
-    }
-
     pub fn with_expiry_defaults(
         root: PathBuf,
         public_url: String,
@@ -806,15 +821,6 @@ impl Store {
             .backfill_manifests()
             .map_err(|error| StoreError::startup("backfill manifests", error))?;
         Ok(store)
-    }
-
-    #[cfg(test)]
-    fn with_clock(
-        root: PathBuf,
-        public_url: String,
-        clock: Arc<dyn Clock>,
-    ) -> Result<Self, StoreError> {
-        Self::with_options(root, public_url, clock, DecayPolicy::default())
     }
 
     pub fn blocking_capacity(&self) -> usize {
@@ -936,29 +942,6 @@ impl Store {
             bytes,
             entries,
         })
-    }
-
-    #[cfg(test)]
-    pub fn list_files(&self, name: &str) -> Result<Vec<String>, StoreError> {
-        let name = parse_site_name(name)?;
-        let mut db = self.inner.readers.get();
-        if !site_exists_locked(&mut db, name)? {
-            return Err(StoreError::NotFound);
-        }
-        let site_id = site_id_locked(&mut db, name)?;
-        let mut paths = files::table
-            .filter(files::site_id.eq(site_id))
-            .select(files::path)
-            .order(files::path)
-            .load::<String>(&mut *db)?;
-        paths.extend(
-            allocated_entries::table
-                .filter(allocated_entries::site_id.eq(site_id))
-                .select(allocated_entries::path)
-                .load::<String>(&mut *db)?,
-        );
-        paths.sort_unstable();
-        Ok(paths)
     }
 
     pub fn list_dir(&self, name: &str, rel: &str) -> Result<DirList, StoreError> {
@@ -1137,59 +1120,60 @@ impl Store {
     ) -> Result<ManagementMutation, StoreError> {
         let name = parse_site_name(name)?;
         let now = self.now_millis();
-        let mut db = self.inner.writer.lock().unwrap();
-        let mut tx = DbTransaction::begin(&mut db)?;
-        prune_management_idempotency(&mut tx, now)?;
-        let fingerprint = format!("claim:{name}");
-        let site = sites::table
-            .filter(sites::name.eq(name))
-            .select(ManagementSiteRow::as_select())
-            .first::<ManagementSiteRow>(&mut *tx)
-            .map_err(map_sql)?;
-        let site_id = site.id;
-        let managed = site.management_status != 0;
-        let creator_kind = site.creator_kind;
-        let creator_hash = site.creator_hash;
-        let claim_hash = site.claim_hash;
-        let creator_matches = creator.is_some_and(|candidate| {
-            creator_kind == Some(candidate.kind as i64)
-                && creator_hash.as_deref() == Some(candidate.hash.as_slice())
-        });
-        let claim_matches = match (claim_hash.as_deref(), claim) {
-            (Some(hash), Some(candidate)) => {
-                claim_hash_from_blob(hash).is_ok_and(|expected| expected.verify(candidate))
-            }
-            _ => false,
-        };
-        if !creator_matches && !claim_matches {
-            return Err(StoreError::Forbidden);
-        }
-        if management_replay(&mut tx, request.idempotency, &fingerprint)? {
-            return Ok(ManagementMutation {
-                status: ManagementStatus { managed: true },
-                token: None,
-                replayed: true,
+        self.write_outcome(|tx| {
+            prune_management_idempotency(tx, now)?;
+            let fingerprint = format!("claim:{name}");
+            let site = sites::table
+                .filter(sites::name.eq(name))
+                .select(ManagementSiteRow::as_select())
+                .first::<ManagementSiteRow>(&mut *tx)
+                .map_err(map_sql)?;
+            let site_id = site.id;
+            let managed = site.management_status != 0;
+            let creator_kind = site.creator_kind;
+            let creator_hash = site.creator_hash;
+            let claim_hash = site.claim_hash;
+            let creator_matches = creator.is_some_and(|candidate| {
+                creator_kind == Some(candidate.kind as i64)
+                    && creator_hash.as_deref() == Some(candidate.hash.as_slice())
             });
-        }
-        if managed {
-            return Err(StoreError::AlreadyManaged);
-        }
-        let token = ManagementToken::generate()?;
-        diesel::update(sites::table.find(site_id))
-            .set((
-                sites::management_hash.eq(Some(token.hash().as_bytes().as_slice())),
-                sites::management_status.eq(1_i64),
+            let claim_matches = match (claim_hash.as_deref(), claim) {
+                (Some(hash), Some(candidate)) => {
+                    claim_hash_from_blob(hash).is_ok_and(|expected| expected.verify(candidate))
+                }
+                _ => false,
+            };
+            if !creator_matches && !claim_matches {
+                return Err(StoreError::Forbidden);
+            }
+            if management_replay(tx, request.idempotency, &fingerprint)? {
+                return Ok(TxOutcome::Rollback(ManagementMutation {
+                    status: ManagementStatus { managed: true },
+                    token: None,
+                    replayed: true,
+                }));
+            }
+            if managed {
+                return Err(StoreError::AlreadyManaged);
+            }
+            let token = ManagementToken::generate()?;
+            diesel::update(sites::table.find(site_id))
+                .set((
+                    sites::management_hash.eq(Some(token.hash().as_bytes().as_slice())),
+                    sites::management_status.eq(1_i64),
+                ))
+                .execute(&mut *tx)?;
+            record_management(tx, name, 1, now, request.audit_ip)?;
+            store_management_idempotency(tx, request.idempotency, &fingerprint, now)?;
+            regenerate_site(tx, &self.inner.blob_files, site_id, now)?;
+            Ok(TxOutcome::Commit(
+                ManagementMutation {
+                    status: ManagementStatus { managed: true },
+                    token: Some(token),
+                    replayed: false,
+                },
+                Vec::new(),
             ))
-            .execute(&mut *tx)?;
-        record_management(&mut tx, name, 1, now, request.audit_ip)?;
-        store_management_idempotency(&mut tx, request.idempotency, &fingerprint, now)?;
-        regenerate_site(&mut tx, &self.inner.blob_files, site_id, now)?;
-        tx.commit()?;
-        drop(db);
-        Ok(ManagementMutation {
-            status: ManagementStatus { managed: true },
-            token: Some(token),
-            replayed: false,
         })
     }
 
@@ -1203,62 +1187,63 @@ impl Store {
     ) -> Result<ManagementMutation, StoreError> {
         let name = parse_site_name(name)?;
         let now = self.now_millis();
-        let mut db = self.inner.writer.lock().unwrap();
-        let mut tx = DbTransaction::begin(&mut db)?;
-        prune_management_idempotency(&mut tx, now)?;
-        let fingerprint = format!("rotate:{name}");
-        let site = sites::table
-            .filter(sites::name.eq(name))
-            .select(ManagementSiteRow::as_select())
-            .first::<ManagementSiteRow>(&mut *tx)
-            .map_err(map_sql)?;
-        let site_id = site.id;
-        let managed = site.management_status != 0;
-        let expected_hash = site.management_hash;
-        let creator_kind = site.creator_kind;
-        let creator_hash = site.creator_hash;
-        let claim_hash = site.claim_hash;
-        if !managed {
-            return Err(StoreError::Forbidden);
-        }
-        let bearer_matches = match (expected_hash.as_deref(), bearer) {
-            (Some(hash), Some(candidate)) => {
-                management_hash_from_blob(hash).is_ok_and(|expected| expected.verify(candidate))
+        self.write_outcome(|tx| {
+            prune_management_idempotency(tx, now)?;
+            let fingerprint = format!("rotate:{name}");
+            let site = sites::table
+                .filter(sites::name.eq(name))
+                .select(ManagementSiteRow::as_select())
+                .first::<ManagementSiteRow>(&mut *tx)
+                .map_err(map_sql)?;
+            let site_id = site.id;
+            let managed = site.management_status != 0;
+            let expected_hash = site.management_hash;
+            let creator_kind = site.creator_kind;
+            let creator_hash = site.creator_hash;
+            let claim_hash = site.claim_hash;
+            if !managed {
+                return Err(StoreError::Forbidden);
             }
-            _ => false,
-        };
-        let creator_matches = creator.is_some_and(|candidate| {
-            creator_kind == Some(candidate.kind as i64)
-                && creator_hash.as_deref() == Some(candidate.hash.as_slice())
-        });
-        let claim_matches = match (claim_hash.as_deref(), claim) {
-            (Some(hash), Some(candidate)) => {
-                claim_hash_from_blob(hash).is_ok_and(|expected| expected.verify(candidate))
-            }
-            _ => false,
-        };
-        if !bearer_matches && !creator_matches && !claim_matches {
-            return Err(StoreError::Unauthorized);
-        }
-        if management_replay(&mut tx, request.idempotency, &fingerprint)? {
-            return Ok(ManagementMutation {
-                status: ManagementStatus { managed: true },
-                token: None,
-                replayed: true,
+            let bearer_matches = match (expected_hash.as_deref(), bearer) {
+                (Some(hash), Some(candidate)) => {
+                    management_hash_from_blob(hash).is_ok_and(|expected| expected.verify(candidate))
+                }
+                _ => false,
+            };
+            let creator_matches = creator.is_some_and(|candidate| {
+                creator_kind == Some(candidate.kind as i64)
+                    && creator_hash.as_deref() == Some(candidate.hash.as_slice())
             });
-        }
-        let token = ManagementToken::generate()?;
-        diesel::update(sites::table.find(site_id))
-            .set(sites::management_hash.eq(Some(token.hash().as_bytes().as_slice())))
-            .execute(&mut *tx)?;
-        record_management(&mut tx, name, 2, now, request.audit_ip)?;
-        store_management_idempotency(&mut tx, request.idempotency, &fingerprint, now)?;
-        tx.commit()?;
-        drop(db);
-        Ok(ManagementMutation {
-            status: ManagementStatus { managed: true },
-            token: Some(token),
-            replayed: false,
+            let claim_matches = match (claim_hash.as_deref(), claim) {
+                (Some(hash), Some(candidate)) => {
+                    claim_hash_from_blob(hash).is_ok_and(|expected| expected.verify(candidate))
+                }
+                _ => false,
+            };
+            if !bearer_matches && !creator_matches && !claim_matches {
+                return Err(StoreError::Unauthorized);
+            }
+            if management_replay(tx, request.idempotency, &fingerprint)? {
+                return Ok(TxOutcome::Rollback(ManagementMutation {
+                    status: ManagementStatus { managed: true },
+                    token: None,
+                    replayed: true,
+                }));
+            }
+            let token = ManagementToken::generate()?;
+            diesel::update(sites::table.find(site_id))
+                .set(sites::management_hash.eq(Some(token.hash().as_bytes().as_slice())))
+                .execute(&mut *tx)?;
+            record_management(tx, name, 2, now, request.audit_ip)?;
+            store_management_idempotency(tx, request.idempotency, &fingerprint, now)?;
+            Ok(TxOutcome::Commit(
+                ManagementMutation {
+                    status: ManagementStatus { managed: true },
+                    token: Some(token),
+                    replayed: false,
+                },
+                Vec::new(),
+            ))
         })
     }
 
@@ -1270,50 +1255,46 @@ impl Store {
     ) -> Result<ManagementStatus, StoreError> {
         let name = parse_site_name(name)?;
         let now = self.now_millis();
-        let mut db = self.inner.writer.lock().unwrap();
-        let mut tx = DbTransaction::begin(&mut db)?;
-        authorize_locked(&mut tx, name, bearer)?;
-        let site_id = site_id_locked(&mut tx, name)?;
-        diesel::update(sites::table.find(site_id))
-            .set((
-                sites::management_hash.eq::<Option<Vec<u8>>>(None),
-                sites::management_status.eq(0_i64),
-            ))
-            .execute(&mut *tx)?;
-        diesel::delete(management_tombstones::table.find(name)).execute(&mut *tx)?;
-        record_management(&mut tx, name, 3, now, audit_ip)?;
-        regenerate_site(&mut tx, &self.inner.blob_files, site_id, now)?;
-        tx.commit()?;
-        drop(db);
-        Ok(ManagementStatus { managed: false })
+        self.write_plain(|tx| {
+            authorize_locked(tx, name, bearer)?;
+            let site_id = site_id_locked(tx, name)?;
+            diesel::update(sites::table.find(site_id))
+                .set((
+                    sites::management_hash.eq::<Option<Vec<u8>>>(None),
+                    sites::management_status.eq(0_i64),
+                ))
+                .execute(&mut *tx)?;
+            diesel::delete(management_tombstones::table.find(name)).execute(&mut *tx)?;
+            record_management(tx, name, 3, now, audit_ip)?;
+            regenerate_site(tx, &self.inner.blob_files, site_id, now)?;
+            Ok(ManagementStatus { managed: false })
+        })
     }
 
     pub fn operator_claim(&self, name: &str) -> Result<ManagementToken, StoreError> {
         let name = parse_site_name(name)?;
         let token = ManagementToken::generate()?;
         let now = self.now_millis();
-        let mut db = self.inner.writer.lock().unwrap();
-        let mut tx = DbTransaction::begin(&mut db)?;
-        let (site_id, status) = sites::table
-            .filter(sites::name.eq(name))
-            .select((sites::id, sites::management_status))
-            .first::<(i64, i64)>(&mut *tx)
-            .map_err(map_sql)?;
-        let managed = status != 0;
-        if managed {
-            return Err(StoreError::AlreadyManaged);
-        }
-        diesel::update(sites::table.find(site_id))
-            .set((
-                sites::management_hash.eq(Some(token.hash().as_bytes().as_slice())),
-                sites::management_status.eq(1_i64),
-            ))
-            .execute(&mut *tx)?;
-        record_management(&mut tx, name, 4, now, None)?;
-        regenerate_site(&mut tx, &self.inner.blob_files, site_id, now)?;
-        tx.commit()?;
-        drop(db);
-        Ok(token)
+        self.write_plain(|tx| {
+            let (site_id, status) = sites::table
+                .filter(sites::name.eq(name))
+                .select((sites::id, sites::management_status))
+                .first::<(i64, i64)>(&mut *tx)
+                .map_err(map_sql)?;
+            let managed = status != 0;
+            if managed {
+                return Err(StoreError::AlreadyManaged);
+            }
+            diesel::update(sites::table.find(site_id))
+                .set((
+                    sites::management_hash.eq(Some(token.hash().as_bytes().as_slice())),
+                    sites::management_status.eq(1_i64),
+                ))
+                .execute(&mut *tx)?;
+            record_management(tx, name, 4, now, None)?;
+            regenerate_site(tx, &self.inner.blob_files, site_id, now)?;
+            Ok(token)
+        })
     }
 
     pub fn operator_rotate(
@@ -1324,17 +1305,15 @@ impl Store {
         let name = parse_site_name(name)?;
         let token = ManagementToken::generate()?;
         let now = self.now_millis();
-        let mut db = self.inner.writer.lock().unwrap();
-        let mut tx = DbTransaction::begin(&mut db)?;
-        authorize_locked(&mut tx, name, Some(current))?;
-        let site_id = site_id_locked(&mut tx, name)?;
-        diesel::update(sites::table.find(site_id))
-            .set(sites::management_hash.eq(Some(token.hash().as_bytes().as_slice())))
-            .execute(&mut *tx)?;
-        record_management(&mut tx, name, 5, now, None)?;
-        tx.commit()?;
-        drop(db);
-        Ok(token)
+        self.write_plain(|tx| {
+            authorize_locked(tx, name, Some(current))?;
+            let site_id = site_id_locked(tx, name)?;
+            diesel::update(sites::table.find(site_id))
+                .set(sites::management_hash.eq(Some(token.hash().as_bytes().as_slice())))
+                .execute(&mut *tx)?;
+            record_management(tx, name, 5, now, None)?;
+            Ok(token)
+        })
     }
 
     pub fn lookup(&self, name: &str, rel: &str) -> Result<Node, StoreError> {
@@ -1478,11 +1457,9 @@ impl Store {
                 if i64::try_from(bytes.len()).expect("blob size fits in i64") != size
                     || ContentHash::from(blake3::hash(&bytes)) != hash
                 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("corrupt SQLite blob {hash}"),
-                    )
-                    .into());
+                    return Err(StoreError::invalid_data(format!(
+                        "corrupt SQLite blob {hash}"
+                    )));
                 }
                 self.inner.blob_files.put_bytes(hash, &bytes)?;
             }
@@ -1542,8 +1519,8 @@ impl Store {
             path: String,
             hash: String,
         }
-        let parsed: DiskCatalog = serde_json::from_slice(&fs::read(path)?)
-            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        let parsed: DiskCatalog =
+            serde_json::from_slice(&fs::read(path)?).map_err(StoreError::invalid_data)?;
         for site in parsed.sites {
             let mut staged = Vec::new();
             for file in site.files {
@@ -1581,47 +1558,32 @@ impl Store {
 
     fn backfill_manifests(&self) -> Result<(), StoreError> {
         let now = self.now_millis();
-        let mut db = self.inner.writer.lock().unwrap();
-        let mut tx = DbTransaction::begin(&mut db)?;
-        let ids = sites::table
-            .select(sites::id)
-            .order(sites::id)
-            .load::<i64>(&mut *tx)?;
-        for site_id in ids {
-            let revision = sites::table
-                .find(site_id)
-                .select(sites::content_revision)
-                .first::<i64>(&mut *tx)?;
-            diesel::update(sites::table.find(site_id))
-                .set((
-                    sites::public_url.eq(&self.inner.public_url),
-                    sites::content_revision.eq(if revision == 0 { 1 } else { revision }),
-                ))
-                .execute(&mut *tx)?;
-            rebuild_aggregates_locked(&mut tx, site_id)?;
-            refresh_all_aliases_locked(&mut tx, site_id)?;
-            regenerate_site(&mut tx, &self.inner.blob_files, site_id, now)?;
-        }
-        tx.commit()?;
-        drop(db);
-        Ok(())
+        self.write_plain(|tx| {
+            let ids = sites::table
+                .select(sites::id)
+                .order(sites::id)
+                .load::<i64>(&mut *tx)?;
+            for site_id in ids {
+                let revision = sites::table
+                    .find(site_id)
+                    .select(sites::content_revision)
+                    .first::<i64>(&mut *tx)?;
+                diesel::update(sites::table.find(site_id))
+                    .set((
+                        sites::public_url.eq(&self.inner.public_url),
+                        sites::content_revision.eq(if revision == 0 { 1 } else { revision }),
+                    ))
+                    .execute(&mut *tx)?;
+                rebuild_aggregates_locked(tx, site_id)?;
+                refresh_all_aliases_locked(tx, site_id)?;
+                regenerate_site(tx, &self.inner.blob_files, site_id, now)?;
+            }
+            Ok(())
+        })
     }
 
     fn now_millis(&self) -> i64 {
         self.inner.clock.now_millis()
-    }
-
-    #[cfg(test)]
-    fn set_before_content_commit(&self, hook: impl FnOnce() + Send + 'static) {
-        *self.inner.before_content_commit.lock().unwrap() = Some(Box::new(hook));
-    }
-
-    #[cfg(test)]
-    fn run_before_content_commit(&self) {
-        let hook = self.inner.before_content_commit.lock().unwrap().take();
-        if let Some(hook) = hook {
-            hook();
-        }
     }
 
     #[cfg(not(test))]
@@ -1780,18 +1742,16 @@ fn run_migrations(db: &mut SqliteConnection) -> Result<(), StoreError> {
         .get_result::<IntegrityCheck>(db)?
         .integrity_check;
     if integrity != "ok" {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, integrity).into());
+        return Err(StoreError::invalid_data(integrity));
     }
     let foreign_key_violations =
         diesel::sql_query("SELECT COUNT(*) AS violation_count FROM pragma_foreign_key_check")
             .get_result::<ForeignKeyViolationCount>(db)?
             .violation_count;
     if foreign_key_violations != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{foreign_key_violations} foreign-key violations"),
-        )
-        .into());
+        return Err(StoreError::invalid_data(format!(
+            "{foreign_key_violations} foreign-key violations"
+        )));
     }
     Ok(())
 }
@@ -1805,9 +1765,9 @@ fn authorization_fingerprint(token: &ManagementToken) -> String {
 }
 
 fn management_hash_from_blob(bytes: &[u8]) -> Result<ManagementTokenHash, StoreError> {
-    let bytes: [u8; 32] = bytes.try_into().map_err(|_| {
-        io::Error::new(io::ErrorKind::InvalidData, "invalid stored management hash")
-    })?;
+    let bytes: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| StoreError::invalid_data("invalid stored management hash"))?;
     Ok(ManagementTokenHash::from_bytes(bytes))
 }
 
@@ -1844,7 +1804,7 @@ fn authorize_locked(
 fn claim_hash_from_blob(bytes: &[u8]) -> Result<ClaimTokenHash, StoreError> {
     let bytes: [u8; 32] = bytes
         .try_into()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid stored claim hash"))?;
+        .map_err(|_| StoreError::invalid_data("invalid stored claim hash"))?;
     Ok(ClaimTokenHash::from_bytes(bytes))
 }
 
@@ -2329,11 +2289,16 @@ fn pack_zip(files: &[ArchiveFile]) -> io::Result<Vec<u8>> {
         .map_err(io::Error::other)
 }
 
+/// Like [`normalize_rel`], but an empty path is an error rather than the site root.
+fn normalize_nonempty_rel(rel: &str) -> Result<String, StoreError> {
+    Ok(safe_rel_path(rel)?.to_string_lossy().replace('\\', "/"))
+}
+
 fn normalize_rel(rel: &str) -> Result<String, StoreError> {
     if rel.is_empty() {
         return Ok(String::new());
     }
-    Ok(safe_rel_path(rel)?.to_string_lossy().replace('\\', "/"))
+    normalize_nonempty_rel(rel)
 }
 
 fn system_now_millis() -> i64 {

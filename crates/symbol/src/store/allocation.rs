@@ -1,6 +1,7 @@
 // One slice of `store`: it shares the parent's imports and types rather
 // than re-listing ~90 names. `allow`, not `expect`, because clippy
 // reports an expectation on a `use` item as unfulfilled.
+use super::rows::{NewAllocatedEntry, insert_allocated_entry};
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
@@ -126,29 +127,17 @@ pub(super) fn normalize_media_type(media_type: &str) -> Result<String, StoreErro
 }
 
 pub(super) fn pending_fingerprint(input: &PendingFingerprint<'_>) -> String {
-    let hash_hex = input.hash.to_hex();
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"symbol-pending-allocation-v1\0");
-    for value in [
-        input.site,
-        input.folder,
-        hash_hex.as_str(),
-        input.media_type,
-    ] {
-        hasher.update(&(value.len() as u64).to_le_bytes());
-        hasher.update(value.as_bytes());
-    }
-    hasher.update(&input.content_size.to_le_bytes());
-    hash_file_expiry(&mut hasher, input.expiry);
-    hasher.update(input.authorization_hash.unwrap_or("").as_bytes());
-    for value in [
-        input.extension.unwrap_or(""),
-        input.expected_tree_hash.unwrap_or(""),
-    ] {
-        hasher.update(&(value.len() as u64).to_le_bytes());
-        hasher.update(value.as_bytes());
-    }
-    hasher.finalize().to_hex().to_string()
+    Fingerprint::new("symbol-pending-allocation-v1")
+        .len_prefixed(input.site)
+        .len_prefixed(input.folder)
+        .len_prefixed(&input.hash.to_hex())
+        .len_prefixed(input.media_type)
+        .u64_le(input.content_size)
+        .expiry(input.expiry)
+        .raw(input.authorization_hash.unwrap_or(""))
+        .len_prefixed(input.extension.unwrap_or(""))
+        .len_prefixed(input.expected_tree_hash.unwrap_or(""))
+        .finish()
 }
 
 pub(super) fn parse_pending_request_metadata(
@@ -169,8 +158,7 @@ pub(super) fn parse_pending_request_metadata(
             sanitized: TokenCounts::default(),
         });
     }
-    serde_json::from_str(value)
-        .map_err(|error| StoreError::Io(io::Error::new(io::ErrorKind::InvalidData, error)))
+    serde_json::from_str(value).map_err(StoreError::invalid_data)
 }
 
 pub(super) fn legacy_pending_fingerprint(
@@ -180,15 +168,13 @@ pub(super) fn legacy_pending_fingerprint(
     content_size: u64,
     media_type: &str,
 ) -> String {
-    let hash_hex = hash.to_hex();
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"symbol-pending-allocation-v1\0");
-    for value in [site, folder, hash_hex.as_str(), media_type] {
-        hasher.update(&(value.len() as u64).to_le_bytes());
-        hasher.update(value.as_bytes());
-    }
-    hasher.update(&content_size.to_le_bytes());
-    hasher.finalize().to_hex().to_string()
+    Fingerprint::new("symbol-pending-allocation-v1")
+        .len_prefixed(site)
+        .len_prefixed(folder)
+        .len_prefixed(&hash.to_hex())
+        .len_prefixed(media_type)
+        .u64_le(content_size)
+        .finish()
 }
 
 pub(super) fn cancellation_fingerprint(
@@ -198,48 +184,34 @@ pub(super) fn cancellation_fingerprint(
     expected_tree_hash: Option<&str>,
     authorization_hash: Option<&str>,
 ) -> String {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"symbol-allocation-cancellation-v1\0");
-    for value in [
-        site,
-        token,
-        folder,
-        expected_tree_hash.unwrap_or(""),
-        authorization_hash.unwrap_or(""),
-    ] {
-        hasher.update(&(value.len() as u64).to_le_bytes());
-        hasher.update(value.as_bytes());
-    }
-    hasher.finalize().to_hex().to_string()
+    Fingerprint::new("symbol-allocation-cancellation-v1")
+        .len_prefixed(site)
+        .len_prefixed(token)
+        .len_prefixed(folder)
+        .len_prefixed(expected_tree_hash.unwrap_or(""))
+        .len_prefixed(authorization_hash.unwrap_or(""))
+        .finish()
 }
 
 pub(super) fn pending_finalize_fingerprint(input: &PendingFinalizeFingerprint<'_>) -> String {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"symbol-pending-finalize-v1\0");
-    hasher.update(input.site.as_bytes());
-    hasher.update(&[0]);
-    hasher.update(input.token.as_bytes());
-    hasher.update(&[0]);
-    hasher.update(input.folder.unwrap_or("").as_bytes());
-    hasher.update(&[0]);
-    match input.final_name {
+    let fingerprint = Fingerprint::new("symbol-pending-finalize-v1")
+        .separated(input.site)
+        .separated(input.token)
+        .separated(input.folder.unwrap_or(""));
+    let fingerprint = match input.final_name {
         #[cfg(test)]
-        PendingFinalName::Generated(naming) => {
-            hasher.update(&[1]);
-            for value in [naming.prefix, naming.suffix, naming.extension.unwrap_or("")] {
-                hasher.update(&(value.len() as u64).to_le_bytes());
-                hasher.update(value.as_bytes());
-            }
-        }
-        PendingFinalName::Custom(basename) => {
-            hasher.update(&[2]);
-            hasher.update(basename.as_bytes());
-        }
-    }
-    hash_file_expiry(&mut hasher, input.expiry);
-    hasher.update(input.authorization_hash.unwrap_or("").as_bytes());
-    hasher.update(input.expected_tree_hash.unwrap_or("").as_bytes());
-    hasher.finalize().to_hex().to_string()
+        PendingFinalName::Generated(naming) => fingerprint
+            .tag(1)
+            .len_prefixed(naming.prefix)
+            .len_prefixed(naming.suffix)
+            .len_prefixed(naming.extension.unwrap_or("")),
+        PendingFinalName::Custom(basename) => fingerprint.tag(2).raw(basename),
+    };
+    fingerprint
+        .expiry(input.expiry)
+        .raw(input.authorization_hash.unwrap_or(""))
+        .raw(input.expected_tree_hash.unwrap_or(""))
+        .finish()
 }
 
 pub(super) fn allocated_metadata_locked(
@@ -387,27 +359,18 @@ pub(super) fn pending_allocation_replay(
     site_id: i64,
     now: i64,
 ) -> Result<Option<PendingAllocation>, StoreError> {
-    let Some(idempotency) = idempotency else {
+    let Some(key) = validated_key(idempotency)? else {
         return Ok(None);
     };
-    validate_idempotency_key(&idempotency.key)?;
-    let record = idempotency_records::table
-        .find(idempotency_key_hash(&idempotency.key))
-        .select((
-            idempotency_records::fingerprint,
-            idempotency_records::operation_kind,
-            idempotency_records::result_metadata,
-        ))
-        .first::<(String, i64, String)>(tx)
-        .optional()?;
-    let Some((stored_fingerprint, kind, metadata)) = record else {
+    let Some(mut result) = replay_record::<PendingAllocation>(
+        tx,
+        key,
+        IdempotencyKind::PendingAllocation,
+        Some(fingerprint),
+    )?
+    else {
         return Ok(None);
     };
-    if stored_fingerprint != fingerprint || kind != IdempotencyKind::PendingAllocation as i64 {
-        return Err(StoreError::IdempotencyConflict);
-    }
-    let mut result = serde_json::from_str::<PendingAllocation>(&metadata)
-        .map_err(|error| StoreError::Io(io::Error::new(io::ErrorKind::InvalidData, error)))?;
     let exists = pending_allocations::table
         .find(&result.token)
         .filter(pending_allocations::site_id.eq(site_id))
@@ -428,31 +391,19 @@ pub(super) fn cancellation_replay(
     idempotency: Option<&Idempotency>,
     fingerprint: &str,
 ) -> Result<Option<AllocationCancellation>, StoreError> {
-    let Some(idempotency) = idempotency else {
+    let Some(key) = validated_key(idempotency)? else {
         return Ok(None);
     };
-    validate_idempotency_key(&idempotency.key)?;
-    let record = idempotency_records::table
-        .find(idempotency_key_hash(&idempotency.key))
-        .select((
-            idempotency_records::fingerprint,
-            idempotency_records::operation_kind,
-            idempotency_records::result_metadata,
-        ))
-        .first::<(String, i64, String)>(tx)
-        .optional()?;
-    let Some((stored_fingerprint, stored_kind, metadata)) = record else {
-        return Ok(None);
-    };
-    if stored_fingerprint != fingerprint
-        || stored_kind != IdempotencyKind::AllocationCancellation as i64
-    {
-        return Err(StoreError::IdempotencyConflict);
+    let mut result = replay_record::<AllocationCancellation>(
+        tx,
+        key,
+        IdempotencyKind::AllocationCancellation,
+        Some(fingerprint),
+    )?;
+    if let Some(result) = &mut result {
+        result.replayed = true;
     }
-    let mut result = serde_json::from_str::<AllocationCancellation>(&metadata)
-        .map_err(|error| StoreError::Io(io::Error::new(io::ErrorKind::InvalidData, error)))?;
-    result.replayed = true;
-    Ok(Some(result))
+    Ok(result)
 }
 
 pub(super) fn store_cancellation(
@@ -462,22 +413,17 @@ pub(super) fn store_cancellation(
     result: &AllocationCancellation,
     now: i64,
 ) -> Result<(), StoreError> {
-    let Some(idempotency) = idempotency else {
+    let Some(key) = validated_key(idempotency)? else {
         return Ok(());
     };
-    validate_idempotency_key(&idempotency.key)?;
-    let metadata = serde_json::to_string(result)
-        .map_err(|error| StoreError::Io(io::Error::new(io::ErrorKind::InvalidData, error)))?;
-    diesel::insert_into(idempotency_records::table)
-        .values((
-            idempotency_records::key_hash.eq(idempotency_key_hash(&idempotency.key)),
-            idempotency_records::fingerprint.eq(fingerprint),
-            idempotency_records::operation_kind.eq(IdempotencyKind::AllocationCancellation as i64),
-            idempotency_records::result_metadata.eq(metadata),
-            idempotency_records::expires.eq(now + IDEMPOTENCY_RETENTION_MILLIS),
-        ))
-        .execute(tx)?;
-    Ok(())
+    store_record(
+        tx,
+        key,
+        IdempotencyKind::AllocationCancellation,
+        fingerprint,
+        result,
+        now,
+    )
 }
 
 pub(super) fn store_pending_allocation(
@@ -487,62 +433,40 @@ pub(super) fn store_pending_allocation(
     result: &PendingAllocation,
     now: i64,
 ) -> Result<(), StoreError> {
-    let Some(idempotency) = idempotency else {
+    let Some(key) = validated_key(idempotency)? else {
         return Ok(());
     };
-    validate_idempotency_key(&idempotency.key)?;
-    let metadata = serde_json::to_string(result)
-        .map_err(|error| StoreError::Io(io::Error::new(io::ErrorKind::InvalidData, error)))?;
-    diesel::insert_into(idempotency_records::table)
-        .values((
-            idempotency_records::key_hash.eq(idempotency_key_hash(&idempotency.key)),
-            idempotency_records::fingerprint.eq(fingerprint),
-            idempotency_records::operation_kind.eq(IdempotencyKind::PendingAllocation as i64),
-            idempotency_records::result_metadata.eq(metadata),
-            idempotency_records::expires.eq(now + IDEMPOTENCY_RETENTION_MILLIS),
-        ))
-        .execute(tx)?;
-    Ok(())
+    store_record(
+        tx,
+        key,
+        IdempotencyKind::PendingAllocation,
+        fingerprint,
+        result,
+        now,
+    )
 }
 
 pub(super) fn allocated_entry_mutation_fingerprint(
     input: &AllocatedEntryFingerprint<'_>,
 ) -> String {
-    let hash_hex = input.hash.to_hex();
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"symbol-allocated-entry-mutation-v2\0");
-    for value in [
-        input.name,
-        input.current_path.unwrap_or(""),
-        &input.destination.path,
-        hash_hex.as_str(),
-        &input.destination.prefix,
-        &input.destination.suffix,
-        input.destination.extension.as_deref().unwrap_or(""),
-        &input.destination.media_type,
-    ] {
-        hasher.update(&(value.len() as u64).to_le_bytes());
-        hasher.update(value.as_bytes());
-    }
-    hasher.update(&(input.destination.naming_mode as i64).to_le_bytes());
-    hasher.update(&(input.kind as i64).to_le_bytes());
-    hash_file_expiry(&mut hasher, input.expiry);
-    hasher.update(input.expected_tree_hash.unwrap_or("").as_bytes());
-    hasher.finalize().to_hex().to_string()
+    let destination = input.destination;
+    Fingerprint::new("symbol-allocated-entry-mutation-v2")
+        .len_prefixed(input.name)
+        .len_prefixed(input.current_path.unwrap_or(""))
+        .len_prefixed(&destination.path)
+        .len_prefixed(&input.hash.to_hex())
+        .len_prefixed(&destination.prefix)
+        .len_prefixed(&destination.suffix)
+        .len_prefixed(destination.extension.as_deref().unwrap_or(""))
+        .len_prefixed(&destination.media_type)
+        .i64_le(destination.naming_mode as i64)
+        .i64_le(input.kind as i64)
+        .expiry(input.expiry)
+        .raw(input.expected_tree_hash.unwrap_or(""))
+        .finish()
 }
 
 impl Store {
-    #[cfg(test)]
-    pub fn allocate_bytes(
-        &self,
-        name: &str,
-        bytes: &[u8],
-        spec: AllocationSpec<'_>,
-        options: FileMutationOptions<'_>,
-    ) -> Result<AllocatedFile, StoreError> {
-        self.allocate_source(name, AllocationSource::Bytes(bytes), spec, options)
-    }
-
     pub fn allocate_file(
         &self,
         name: &str,
@@ -572,61 +496,6 @@ impl Store {
             None,
             options,
             UndoKind::Allocate,
-        )
-    }
-
-    #[cfg(test)]
-    pub fn replace_allocated(
-        &self,
-        name: &str,
-        current_path: &str,
-        source: AllocationSource<'_>,
-        options: FileMutationOptions<'_>,
-    ) -> Result<AllocatedFile, StoreError> {
-        let current_path = normalize_rel(current_path)?;
-        let staged = self.stage_allocation_source(source, "")?;
-        let request_fingerprint = content_mutation_request_fingerprint(
-            name,
-            &current_path,
-            staged.hash,
-            None,
-            options.expected_tree_hash,
-            UndoKind::Replace,
-        );
-        if let Some(replay) = self.replay_content_request(name, options, &request_fingerprint)? {
-            return Ok(replay);
-        }
-        let metadata = self.allocated_metadata(name, &current_path)?;
-        let destination = relocated_destination(staged.hash, &current_path, &metadata)?;
-        self.run_before_content_commit();
-        self.commit_allocated(
-            name,
-            Some(&current_path),
-            &destination,
-            &staged,
-            None,
-            None,
-            options,
-            UndoKind::Replace,
-        )
-    }
-
-    #[cfg(test)]
-    pub fn propose_allocation(
-        &self,
-        name: &str,
-        source: AllocationSource<'_>,
-        spec: PendingAllocationSpec<'_>,
-        authorization: Option<&ManagementToken>,
-    ) -> Result<PendingAllocation, StoreError> {
-        self.propose_allocation_idempotent(
-            name,
-            source,
-            spec,
-            FileMutationOptions {
-                authorization,
-                ..FileMutationOptions::default()
-            },
         )
     }
 
@@ -661,106 +530,63 @@ impl Store {
         let now = self.now_millis();
         let expires = now + PENDING_RETENTION_MILLIS;
         self.run_before_content_commit();
-        let mut db = self.inner.writer.lock().unwrap();
-        let mut tx = DbTransaction::begin(&mut db)?;
-        authorize_locked(&mut tx, name, options.authorization)?;
-        let site_id = site_id_locked(&mut tx, name)?;
-        prune_idempotency_locked(&mut tx, now)?;
-        prune_pending_locked(&mut tx, now)?;
-        if let Some(replay) = pending_allocation_replay(
-            &mut tx,
-            options.idempotency,
-            &request_fingerprint,
-            site_id,
-            now,
-        )? {
-            tx.commit()?;
-            return Ok(replay);
-        }
-        check_tree_precondition(&mut tx, name, options.expected_tree_hash)?;
-        let token = undo_token()?;
-        self.materialize(&staged)?;
-        ensure_blob_locked(&mut tx, &staged)?;
-        let request_metadata = serde_json::to_string(&PendingRequestMetadata {
-            request_fingerprint: request_fingerprint.clone(),
-            expiry,
-            authorization_hash,
-            extension: extension.clone(),
-            expected_tree_hash: options.expected_tree_hash.map(str::to_string),
-            legacy_fingerprint: false,
-            sanitized: staged.sanitized,
+        self.write_plain(|tx| {
+            authorize_locked(tx, name, options.authorization)?;
+            let site_id = site_id_locked(tx, name)?;
+            prune_idempotency_locked(tx, now)?;
+            prune_pending_locked(tx, now)?;
+            if let Some(replay) = pending_allocation_replay(
+                tx,
+                options.idempotency,
+                &request_fingerprint,
+                site_id,
+                now,
+            )? {
+                return Ok(replay);
+            }
+            check_tree_precondition(tx, name, options.expected_tree_hash)?;
+            let token = undo_token()?;
+            self.materialize(&staged)?;
+            ensure_blob_locked(tx, &staged)?;
+            let request_metadata = serde_json::to_string(&PendingRequestMetadata {
+                request_fingerprint: request_fingerprint.clone(),
+                expiry,
+                authorization_hash,
+                extension: extension.clone(),
+                expected_tree_hash: options.expected_tree_hash.map(str::to_string),
+                legacy_fingerprint: false,
+                sanitized: staged.sanitized,
+            })
+            .map_err(StoreError::invalid_data)?;
+            diesel::insert_into(pending_allocations::table)
+                .values((
+                    pending_allocations::token.eq(&token),
+                    pending_allocations::site_id.eq(site_id),
+                    pending_allocations::folder.eq(&folder),
+                    pending_allocations::hash.eq(staged.hash),
+                    pending_allocations::size.eq(staged.size),
+                    pending_allocations::media_type.eq(&media_type),
+                    pending_allocations::request_fingerprint.eq(request_metadata),
+                    pending_allocations::created.eq(now),
+                    pending_allocations::expires.eq(expires),
+                ))
+                .execute(&mut *tx)?;
+            let (content_revision, tree_hash) = site_revision_locked(tx, name)?;
+            let result = PendingAllocation {
+                token,
+                folder,
+                hash: format!("blake3:{}", staged.hash.to_hex()),
+                size: staged.size.cast_unsigned(),
+                media_type,
+                extension,
+                expires_at: format_timestamp(expires),
+                tree_hash: tree_hash.to_wire(),
+                content_revision,
+                replayed: false,
+            };
+            store_pending_allocation(tx, options.idempotency, &request_fingerprint, &result, now)?;
+            Ok(result)
         })
-        .map_err(|error| StoreError::Io(io::Error::new(io::ErrorKind::InvalidData, error)))?;
-        diesel::insert_into(pending_allocations::table)
-            .values((
-                pending_allocations::token.eq(&token),
-                pending_allocations::site_id.eq(site_id),
-                pending_allocations::folder.eq(&folder),
-                pending_allocations::hash.eq(staged.hash),
-                pending_allocations::size.eq(staged.size),
-                pending_allocations::media_type.eq(&media_type),
-                pending_allocations::request_fingerprint.eq(request_metadata),
-                pending_allocations::created.eq(now),
-                pending_allocations::expires.eq(expires),
-            ))
-            .execute(&mut *tx)?;
-        let (content_revision, tree_hash) = site_revision_locked(&mut tx, name)?;
-        let result = PendingAllocation {
-            token,
-            folder,
-            hash: format!("blake3:{}", staged.hash.to_hex()),
-            size: staged.size.cast_unsigned(),
-            media_type,
-            extension,
-            expires_at: format_timestamp(expires),
-            tree_hash: tree_hash.to_wire(),
-            content_revision,
-            replayed: false,
-        };
-        store_pending_allocation(
-            &mut tx,
-            options.idempotency,
-            &request_fingerprint,
-            &result,
-            now,
-        )?;
-        tx.commit()?;
-        drop(db);
-        Ok(result)
-    }
-
-    #[cfg(test)]
-    pub fn finalize_allocation(
-        &self,
-        name: &str,
-        token: &str,
-        naming: AllocatedName<'_>,
-        options: FileMutationOptions<'_>,
-    ) -> Result<AllocatedFile, StoreError> {
-        self.finalize_pending(
-            name,
-            token,
-            None,
-            PendingFinalName::Generated(naming),
-            options,
-        )
-    }
-
-    #[cfg(test)]
-    pub fn finalize_allocation_custom(
-        &self,
-        name: &str,
-        token: &str,
-        basename: &str,
-        options: FileMutationOptions<'_>,
-    ) -> Result<AllocatedFile, StoreError> {
-        self.finalize_pending(
-            name,
-            token,
-            None,
-            PendingFinalName::Custom(basename),
-            options,
-        )
     }
 
     pub fn finalize_allocation_custom_in_folder(
@@ -791,165 +617,142 @@ impl Store {
     ) -> Result<AllocatedFile, StoreError> {
         let name = parse_site_name(name)?;
         let now = self.now_millis();
-        let mut db = self.inner.writer.lock().unwrap();
-        let mut tx = DbTransaction::begin(&mut db)?;
-        authorize_locked(&mut tx, name, options.authorization)?;
-        let expected_folder = expected_folder.map(normalize_folder).transpose()?;
-        let authorization_hash = options.authorization.map(authorization_fingerprint);
-        let finalize_fingerprint = pending_finalize_fingerprint(&PendingFinalizeFingerprint {
-            site: name,
-            token,
-            folder: expected_folder.as_deref(),
-            final_name,
-            expiry: options.expiry,
-            authorization_hash: authorization_hash.as_deref(),
-            expected_tree_hash: options.expected_tree_hash,
-        });
-        prune_idempotency_locked(&mut tx, now)?;
-        if let Some(replay) =
-            entry_mutation_replay(&mut tx, options.idempotency, &finalize_fingerprint)?
-        {
-            return Ok(replay);
-        }
-        check_tree_precondition(&mut tx, name, options.expected_tree_hash)?;
-        let site_id = site_id_locked(&mut tx, name)?;
-        let pending = pending_allocations::table
-            .find(token)
-            .filter(pending_allocations::site_id.eq(site_id))
-            .filter(pending_allocations::expires.gt(now))
-            .select((
-                pending_allocations::folder,
-                pending_allocations::hash,
-                pending_allocations::size,
-                pending_allocations::media_type,
-                pending_allocations::request_fingerprint,
-            ))
-            .first::<(String, ContentHash, i64, String, String)>(&mut *tx)
-            .optional()?
-            .map(|row| {
-                let request = parse_pending_request_metadata(&row.4)?;
-                Ok::<_, StoreError>(PendingMetadata {
-                    folder: row.0,
-                    hash: row.1,
-                    size: row.2,
-                    media_type: row.3,
-                    request_fingerprint: request.request_fingerprint,
-                    expiry: request.expiry,
-                    authorization_hash: request.authorization_hash,
-                    extension: request.extension,
-                    expected_tree_hash: request.expected_tree_hash,
-                    legacy_fingerprint: request.legacy_fingerprint,
-                    sanitized: request.sanitized,
-                })
-            })
-            .transpose()?
-            .ok_or(StoreError::InvalidPendingAllocation)?;
-        if expected_folder
-            .as_deref()
-            .is_some_and(|expected| expected != pending.folder)
-        {
-            return Err(StoreError::InvalidPendingAllocation);
-        }
-        let expected_pending_fingerprint = if pending.legacy_fingerprint {
-            legacy_pending_fingerprint(
-                name,
-                &pending.folder,
-                pending.hash,
-                pending.size.cast_unsigned(),
-                &pending.media_type,
-            )
-        } else {
-            pending_fingerprint(&PendingFingerprint {
+        self.write_outcome(|tx| {
+            authorize_locked(tx, name, options.authorization)?;
+            let expected_folder = expected_folder.map(normalize_folder).transpose()?;
+            let authorization_hash = options.authorization.map(authorization_fingerprint);
+            let finalize_fingerprint = pending_finalize_fingerprint(&PendingFinalizeFingerprint {
                 site: name,
-                folder: &pending.folder,
-                hash: pending.hash,
-                content_size: pending.size.cast_unsigned(),
-                media_type: &pending.media_type,
-                expiry: pending.expiry,
-                authorization_hash: pending.authorization_hash.as_deref(),
-                extension: pending.extension.as_deref(),
-                expected_tree_hash: pending.expected_tree_hash.as_deref(),
-            })
-        };
-        if pending.request_fingerprint != expected_pending_fingerprint {
-            return Err(StoreError::InvalidPendingAllocation);
-        }
-        if !pending.legacy_fingerprint && pending.authorization_hash != authorization_hash {
-            return Err(StoreError::Unauthorized);
-        }
-        if pending.expiry != FileExpiry::Preserve
-            && options.expiry != FileExpiry::Preserve
-            && options.expiry != pending.expiry
-        {
-            return Err(StoreError::IdempotencyConflict);
-        }
-        let options = FileMutationOptions {
-            expiry: validate_file_expiry(if pending.expiry == FileExpiry::Preserve {
-                options.expiry
-            } else {
-                pending.expiry
-            })?,
-            ..options
-        };
-        let destination = match final_name {
-            #[cfg(test)]
-            PendingFinalName::Generated(naming) => allocation_destination(
-                pending.hash,
-                AllocationSpec {
-                    folder: &pending.folder,
-                    naming,
-                    media_type: &pending.media_type,
-                },
-            )?,
-            PendingFinalName::Custom(basename) => {
-                custom_destination(&pending.folder, basename, &pending.media_type)?
+                token,
+                folder: expected_folder.as_deref(),
+                final_name,
+                expiry: options.expiry,
+                authorization_hash: authorization_hash.as_deref(),
+                expected_tree_hash: options.expected_tree_hash,
+            });
+            prune_idempotency_locked(tx, now)?;
+            if let Some(replay) =
+                entry_mutation_replay(tx, options.idempotency, &finalize_fingerprint)?
+            {
+                return Ok(TxOutcome::Rollback(replay));
             }
-        };
-        let staged = StagedFile {
-            path: destination.path.clone(),
-            size: pending.size,
-            hash: pending.hash,
-            source: StagedSource::File(self.inner.blob_files.path(pending.hash)),
-            sanitized: pending.sanitized,
-        };
-        let result = self.commit_allocated_locked(
-            &mut tx,
-            name,
-            None,
-            &destination,
-            &staged,
-            None,
-            options,
-            UndoKind::Allocate,
-            now,
-        )?;
-        store_entry_mutation(
-            &mut tx,
-            options.idempotency,
-            &finalize_fingerprint,
-            &result,
-            now,
-        )?;
-        diesel::delete(pending_allocations::table.find(token)).execute(&mut *tx)?;
-        let removed = gc_blobs(&mut tx, now)?;
-        tx.commit()?;
-        drop(db);
-        self.remove_blob_files(&removed);
-        Ok(result)
-    }
-
-    #[cfg(test)]
-    pub fn cancel_allocation(
-        &self,
-        name: &str,
-        token: &str,
-        authorization: Option<&ManagementToken>,
-    ) -> Result<(), StoreError> {
-        if self.cancel_allocation_in_folder(name, token, None, authorization)? {
-            Ok(())
-        } else {
-            Err(StoreError::InvalidPendingAllocation)
-        }
+            check_tree_precondition(tx, name, options.expected_tree_hash)?;
+            let site_id = site_id_locked(tx, name)?;
+            let pending = pending_allocations::table
+                .find(token)
+                .filter(pending_allocations::site_id.eq(site_id))
+                .filter(pending_allocations::expires.gt(now))
+                .select((
+                    pending_allocations::folder,
+                    pending_allocations::hash,
+                    pending_allocations::size,
+                    pending_allocations::media_type,
+                    pending_allocations::request_fingerprint,
+                ))
+                .first::<(String, ContentHash, i64, String, String)>(&mut *tx)
+                .optional()?
+                .map(|row| {
+                    let request = parse_pending_request_metadata(&row.4)?;
+                    Ok::<_, StoreError>(PendingMetadata {
+                        folder: row.0,
+                        hash: row.1,
+                        size: row.2,
+                        media_type: row.3,
+                        request_fingerprint: request.request_fingerprint,
+                        expiry: request.expiry,
+                        authorization_hash: request.authorization_hash,
+                        extension: request.extension,
+                        expected_tree_hash: request.expected_tree_hash,
+                        legacy_fingerprint: request.legacy_fingerprint,
+                        sanitized: request.sanitized,
+                    })
+                })
+                .transpose()?
+                .ok_or(StoreError::InvalidPendingAllocation)?;
+            if expected_folder
+                .as_deref()
+                .is_some_and(|expected| expected != pending.folder)
+            {
+                return Err(StoreError::InvalidPendingAllocation);
+            }
+            let expected_pending_fingerprint = if pending.legacy_fingerprint {
+                legacy_pending_fingerprint(
+                    name,
+                    &pending.folder,
+                    pending.hash,
+                    pending.size.cast_unsigned(),
+                    &pending.media_type,
+                )
+            } else {
+                pending_fingerprint(&PendingFingerprint {
+                    site: name,
+                    folder: &pending.folder,
+                    hash: pending.hash,
+                    content_size: pending.size.cast_unsigned(),
+                    media_type: &pending.media_type,
+                    expiry: pending.expiry,
+                    authorization_hash: pending.authorization_hash.as_deref(),
+                    extension: pending.extension.as_deref(),
+                    expected_tree_hash: pending.expected_tree_hash.as_deref(),
+                })
+            };
+            if pending.request_fingerprint != expected_pending_fingerprint {
+                return Err(StoreError::InvalidPendingAllocation);
+            }
+            if !pending.legacy_fingerprint && pending.authorization_hash != authorization_hash {
+                return Err(StoreError::Unauthorized);
+            }
+            if pending.expiry != FileExpiry::Preserve
+                && options.expiry != FileExpiry::Preserve
+                && options.expiry != pending.expiry
+            {
+                return Err(StoreError::IdempotencyConflict);
+            }
+            let options = FileMutationOptions {
+                expiry: validate_file_expiry(if pending.expiry == FileExpiry::Preserve {
+                    options.expiry
+                } else {
+                    pending.expiry
+                })?,
+                ..options
+            };
+            let destination = match final_name {
+                #[cfg(test)]
+                PendingFinalName::Generated(naming) => allocation_destination(
+                    pending.hash,
+                    AllocationSpec {
+                        folder: &pending.folder,
+                        naming,
+                        media_type: &pending.media_type,
+                    },
+                )?,
+                PendingFinalName::Custom(basename) => {
+                    custom_destination(&pending.folder, basename, &pending.media_type)?
+                }
+            };
+            let staged = StagedFile {
+                path: destination.path.clone(),
+                size: pending.size,
+                hash: pending.hash,
+                source: StagedSource::File(self.inner.blob_files.path(pending.hash)),
+                sanitized: pending.sanitized,
+            };
+            let result = self.commit_allocated_locked(
+                tx,
+                name,
+                None,
+                &destination,
+                &staged,
+                None,
+                options,
+                UndoKind::Allocate,
+                now,
+            )?;
+            store_entry_mutation(tx, options.idempotency, &finalize_fingerprint, &result, now)?;
+            diesel::delete(pending_allocations::table.find(token)).execute(&mut *tx)?;
+            let removed = gc_blobs(tx, now)?;
+            Ok(TxOutcome::Commit(result, removed))
+        })
     }
 
     pub fn cancel_allocation_idempotent_for_folder(
@@ -970,124 +773,53 @@ impl Store {
             authorization_hash.as_deref(),
         );
         let now = self.now_millis();
-        let mut db = self.inner.writer.lock().unwrap();
-        let mut tx = DbTransaction::begin(&mut db)?;
-        authorize_locked(&mut tx, name, options.authorization)?;
-        prune_idempotency_locked(&mut tx, now)?;
-        if let Some(replay) = cancellation_replay(&mut tx, options.idempotency, &fingerprint)? {
-            return Ok(replay);
-        }
-        check_tree_precondition(&mut tx, name, options.expected_tree_hash)?;
-        let site_id = site_id_locked(&mut tx, name)?;
-        let pending = pending_allocations::table
-            .find(token)
-            .select((
-                pending_allocations::site_id,
-                pending_allocations::folder,
-                pending_allocations::request_fingerprint,
-            ))
-            .first::<(i64, String, String)>(&mut *tx)
-            .optional()?
-            .ok_or(StoreError::InvalidPendingAllocation)?;
-        if pending.0 != site_id || pending.1 != folder {
-            return Err(StoreError::InvalidPendingAllocation);
-        }
-        let request = parse_pending_request_metadata(&pending.2)?;
-        if !request.legacy_fingerprint && request.authorization_hash != authorization_hash {
-            return Err(StoreError::Unauthorized);
-        }
-        let deleted = diesel::delete(
-            pending_allocations::table
+        self.write_outcome(|tx| {
+            authorize_locked(tx, name, options.authorization)?;
+            prune_idempotency_locked(tx, now)?;
+            if let Some(replay) = cancellation_replay(tx, options.idempotency, &fingerprint)? {
+                return Ok(TxOutcome::Rollback(replay));
+            }
+            check_tree_precondition(tx, name, options.expected_tree_hash)?;
+            let site_id = site_id_locked(tx, name)?;
+            let pending = pending_allocations::table
                 .find(token)
-                .filter(pending_allocations::site_id.eq(site_id)),
-        )
-        .execute(&mut *tx)?;
-        if deleted != 1 {
-            return Err(StoreError::InvalidPendingAllocation);
-        }
-        let (revision, tree_hash) = sites::table
-            .find(site_id)
-            .select((sites::content_revision, sites::tree_hash))
-            .first::<(i64, TreeHash)>(&mut *tx)?;
-        let result = AllocationCancellation {
-            replayed: false,
-            tree_hash: tree_hash.to_wire(),
-            content_revision: revision.cast_unsigned(),
-        };
-        store_cancellation(&mut tx, options.idempotency, &fingerprint, &result, now)?;
-        let removed = gc_blobs(&mut tx, now)?;
-        tx.commit()?;
-        drop(db);
-        self.remove_blob_files(&removed);
-        Ok(result)
-    }
-
-    #[cfg(test)]
-    pub(super) fn cancel_allocation_in_folder(
-        &self,
-        name: &str,
-        token: &str,
-        folder: Option<&str>,
-        authorization: Option<&ManagementToken>,
-    ) -> Result<bool, StoreError> {
-        let name = parse_site_name(name)?;
-        let folder = folder.map(normalize_folder).transpose()?;
-        let now = self.now_millis();
-        let mut db = self.inner.writer.lock().unwrap();
-        let mut tx = DbTransaction::begin(&mut db)?;
-        authorize_locked(&mut tx, name, authorization)?;
-        let site_id = site_id_locked(&mut tx, name)?;
-        let pending = pending_allocations::table
-            .find(token)
-            .select((
-                pending_allocations::site_id,
-                pending_allocations::folder,
-                pending_allocations::request_fingerprint,
-            ))
-            .first::<(i64, String, String)>(&mut *tx)
-            .optional()?;
-        let Some((stored_site_id, stored_folder, request_metadata)) = pending else {
-            return Ok(false);
-        };
-        if stored_site_id != site_id {
-            return Err(StoreError::InvalidPendingAllocation);
-        }
-        if folder
-            .as_deref()
-            .is_some_and(|expected| expected != stored_folder)
-        {
-            return Err(StoreError::InvalidPendingAllocation);
-        }
-        let request = parse_pending_request_metadata(&request_metadata)?;
-        if !request.legacy_fingerprint
-            && request.authorization_hash != authorization.map(authorization_fingerprint)
-        {
-            return Err(StoreError::Unauthorized);
-        }
-        diesel::delete(
-            pending_allocations::table
-                .find(token)
-                .filter(pending_allocations::site_id.eq(site_id)),
-        )
-        .execute(&mut *tx)?;
-        let removed = gc_blobs(&mut tx, now)?;
-        tx.commit()?;
-        drop(db);
-        self.remove_blob_files(&removed);
-        Ok(true)
-    }
-
-    #[cfg(test)]
-    pub fn prune_pending_allocations(&self) -> Result<usize, StoreError> {
-        let now = self.now_millis();
-        let mut db = self.inner.writer.lock().unwrap();
-        let mut tx = DbTransaction::begin(&mut db)?;
-        let removed_pending = prune_pending_locked(&mut tx, now)?;
-        let removed = gc_blobs(&mut tx, now)?;
-        tx.commit()?;
-        drop(db);
-        self.remove_blob_files(&removed);
-        Ok(removed_pending)
+                .select((
+                    pending_allocations::site_id,
+                    pending_allocations::folder,
+                    pending_allocations::request_fingerprint,
+                ))
+                .first::<(i64, String, String)>(&mut *tx)
+                .optional()?
+                .ok_or(StoreError::InvalidPendingAllocation)?;
+            if pending.0 != site_id || pending.1 != folder {
+                return Err(StoreError::InvalidPendingAllocation);
+            }
+            let request = parse_pending_request_metadata(&pending.2)?;
+            if !request.legacy_fingerprint && request.authorization_hash != authorization_hash {
+                return Err(StoreError::Unauthorized);
+            }
+            let deleted = diesel::delete(
+                pending_allocations::table
+                    .find(token)
+                    .filter(pending_allocations::site_id.eq(site_id)),
+            )
+            .execute(&mut *tx)?;
+            if deleted != 1 {
+                return Err(StoreError::InvalidPendingAllocation);
+            }
+            let (revision, tree_hash) = sites::table
+                .find(site_id)
+                .select((sites::content_revision, sites::tree_hash))
+                .first::<(i64, TreeHash)>(&mut *tx)?;
+            let result = AllocationCancellation {
+                replayed: false,
+                tree_hash: tree_hash.to_wire(),
+                content_revision: revision.cast_unsigned(),
+            };
+            store_cancellation(tx, options.idempotency, &fingerprint, &result, now)?;
+            let removed = gc_blobs(tx, now)?;
+            Ok(TxOutcome::Commit(result, removed))
+        })
     }
 
     pub(super) fn allocated_metadata(
@@ -1140,54 +872,51 @@ impl Store {
             );
             &computed_request_fingerprint
         };
-        let mut db = self.inner.writer.lock().unwrap();
-        let mut tx = DbTransaction::begin(&mut db)?;
-        authorize_locked(&mut tx, name, options.authorization)?;
-        prune_idempotency_locked(&mut tx, now)?;
-        if let Some(replay) = entry_mutation_replay(&mut tx, options.idempotency, &fingerprint)? {
-            return Ok(replay);
-        }
-        check_tree_precondition(&mut tx, name, options.expected_tree_hash)?;
-        let site_id = site_id_locked(&mut tx, name)?;
-        if let Some(current_path) = current_path {
-            reject_alias_write_locked(&mut tx, site_id, current_path, false)?;
-        }
-        reject_alias_write_locked(&mut tx, site_id, &destination.path, false)?;
-        let needs_materialization = validate_allocated_commit_locked(
-            &mut tx,
-            site_id,
-            current_path,
-            destination,
-            staged.hash,
-            expected_content_hash,
-        )?;
-        if needs_materialization {
-            self.materialize(staged)?;
-        }
-        let result = self.commit_allocated_locked(
-            &mut tx,
-            name,
-            current_path,
-            destination,
-            staged,
-            expected_content_hash,
-            options,
-            kind,
-            now,
-        )?;
-        store_entry_mutation_with_request(
-            &mut tx,
-            options.idempotency,
-            &fingerprint,
-            request_fingerprint,
-            &result,
-            now,
-        )?;
-        let removed = gc_blobs(&mut tx, now)?;
-        tx.commit()?;
-        drop(db);
-        self.remove_blob_files(&removed);
-        Ok(result)
+        self.write_outcome(|tx| {
+            authorize_locked(tx, name, options.authorization)?;
+            prune_idempotency_locked(tx, now)?;
+            if let Some(replay) = entry_mutation_replay(tx, options.idempotency, &fingerprint)? {
+                return Ok(TxOutcome::Rollback(replay));
+            }
+            check_tree_precondition(tx, name, options.expected_tree_hash)?;
+            let site_id = site_id_locked(tx, name)?;
+            if let Some(current_path) = current_path {
+                reject_alias_write_locked(tx, site_id, current_path, false)?;
+            }
+            reject_alias_write_locked(tx, site_id, &destination.path, false)?;
+            let needs_materialization = validate_allocated_commit_locked(
+                tx,
+                site_id,
+                current_path,
+                destination,
+                staged.hash,
+                expected_content_hash,
+            )?;
+            if needs_materialization {
+                self.materialize(staged)?;
+            }
+            let result = self.commit_allocated_locked(
+                tx,
+                name,
+                current_path,
+                destination,
+                staged,
+                expected_content_hash,
+                options,
+                kind,
+                now,
+            )?;
+            store_entry_mutation_with_request(
+                tx,
+                options.idempotency,
+                &fingerprint,
+                request_fingerprint,
+                &result,
+                now,
+            )?;
+            let removed = gc_blobs(tx, now)?;
+            Ok(TxOutcome::Commit(result, removed))
+        })
     }
 
     #[expect(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -1230,16 +959,10 @@ impl Store {
                     size: current_size.cast_unsigned(),
                     changed: false,
                     replayed: false,
-                    mutation: Some(MutationResult {
-                        created: false,
-                        changed: false,
-                        replayed: false,
-                        files: 1,
-                        revision,
-                        tree_hash: tree_hash.to_wire(),
-                        undo: None,
-                        sanitized: staged.sanitized,
-                    }),
+                    mutation: Some(
+                        MutationResult::unchanged(1, revision, tree_hash)
+                            .with_sanitized(staged.sanitized),
+                    ),
                 });
             }
         }
@@ -1297,16 +1020,10 @@ impl Store {
                     size: size.cast_unsigned(),
                     changed: true,
                     replayed: false,
-                    mutation: Some(MutationResult {
-                        created: false,
-                        changed: true,
-                        replayed: false,
-                        files: 1,
-                        revision,
-                        tree_hash: tree_hash.to_wire(),
-                        undo: Some(undo),
-                        sanitized: staged.sanitized,
-                    }),
+                    mutation: Some(
+                        MutationResult::applied(1, revision, tree_hash, undo)
+                            .with_sanitized(staged.sanitized),
+                    ),
                 });
             }
             let (revision, tree_hash) = site_revision_locked(tx, name)?;
@@ -1316,16 +1033,10 @@ impl Store {
                 size: size.cast_unsigned(),
                 changed: false,
                 replayed: false,
-                mutation: Some(MutationResult {
-                    created: false,
-                    changed: false,
-                    replayed: false,
-                    files: 1,
-                    revision,
-                    tree_hash: tree_hash.to_wire(),
-                    undo: None,
-                    sanitized: staged.sanitized,
-                }),
+                mutation: Some(
+                    MutationResult::unchanged(1, revision, tree_hash)
+                        .with_sanitized(staged.sanitized),
+                ),
             });
         }
         let mut changed_paths = Vec::with_capacity(2);
@@ -1360,28 +1071,21 @@ impl Store {
             adjust_aggregates_locked(tx, site_id, current_path, -previous_size, -1)?;
         }
         if reused_size.is_none() {
-            diesel::insert_into(site_entries::table)
-                .values((
-                    site_entries::site_id.eq(site_id),
-                    site_entries::path.eq(&destination.path),
-                    site_entries::kind.eq(database::schema::ALLOCATED_ENTRY_KIND),
-                ))
-                .execute(tx)?;
-            diesel::insert_into(allocated_entries::table)
-                .values((
-                    allocated_entries::site_id.eq(site_id),
-                    allocated_entries::path.eq(&destination.path),
-                    allocated_entries::kind.eq(database::schema::ALLOCATED_ENTRY_KIND),
-                    allocated_entries::hash.eq(staged.hash),
-                    allocated_entries::size.eq(staged.size),
-                    allocated_entries::naming_mode.eq(destination.naming_mode as i64),
-                    allocated_entries::prefix.eq(&destination.prefix),
-                    allocated_entries::suffix.eq(&destination.suffix),
-                    allocated_entries::extension.eq(&destination.extension),
-                    allocated_entries::media_type.eq(&destination.media_type),
-                    allocated_entries::modified.eq(now),
-                ))
-                .execute(tx)?;
+            insert_allocated_entry(
+                tx,
+                NewAllocatedEntry {
+                    site_id,
+                    path: &destination.path,
+                    hash: staged.hash,
+                    size: staged.size,
+                    naming_mode: destination.naming_mode as i64,
+                    prefix: destination.prefix.clone(),
+                    suffix: destination.suffix.clone(),
+                    extension: destination.extension.clone(),
+                    media_type: destination.media_type.clone(),
+                    modified: now,
+                },
+            )?;
             adjust_aggregates_locked(tx, site_id, &destination.path, staged.size, 1)?;
         }
         apply_file_expiry(
@@ -1400,16 +1104,11 @@ impl Store {
             size: reused_size.unwrap_or(staged.size).cast_unsigned(),
             changed: true,
             replayed: false,
-            mutation: Some(MutationResult {
-                created: current_path.is_none(),
-                changed: true,
-                replayed: false,
-                files: 1,
-                revision,
-                tree_hash: tree_hash.to_wire(),
-                undo: Some(undo),
-                sanitized: staged.sanitized,
-            }),
+            mutation: Some(
+                MutationResult::applied(1, revision, tree_hash, undo)
+                    .with_created(current_path.is_none())
+                    .with_sanitized(staged.sanitized),
+            ),
         })
     }
 
