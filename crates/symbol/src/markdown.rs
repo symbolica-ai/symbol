@@ -1276,17 +1276,7 @@ fn table_of_contents(headings: &[Heading]) -> Markup {
     for heading in headings.iter().filter(|heading| heading.level > 1) {
         let level = heading.level;
         match open.last() {
-            // The first entry, or one deeper than the current: nest inside the
-            // item that is still open.
-            None => {
-                list.push_str("<ul>");
-                open.push(level);
-            }
-            Some(&top) if level > top => {
-                list.push_str("<ul>");
-                open.push(level);
-            }
-            Some(_) => {
+            Some(&top) if level <= top => {
                 list.push_str("</li>");
                 while open.len() > 1 && open.last().is_some_and(|&top| level < top) {
                     list.push_str("</ul>");
@@ -1300,6 +1290,12 @@ fn table_of_contents(headings: &[Heading]) -> Markup {
                     }
                     list.push_str("</li>");
                 }
+            }
+            // The first entry, or one deeper than the current: nest inside the
+            // item that is still open.
+            _ => {
+                list.push_str("<ul>");
+                open.push(level);
             }
         }
         write!(
@@ -1487,6 +1483,13 @@ mod tests {
             .collect()
     }
 
+    fn assert_problem(found: &[String], expected: &str) {
+        assert!(
+            found.iter().any(|problem| problem.contains(expected)),
+            "{found:?}"
+        );
+    }
+
     #[test]
     fn a_clean_page_has_an_empty_hidden_notice() {
         let html =
@@ -1503,28 +1506,15 @@ mod tests {
         let found = problems(&page(
             "---\ntittle: Hi\nTheme: dark\nsmart-punctuation: true\nauthor: Sam\n---\nx",
         ));
-        assert!(
-            found
-                .iter()
-                .any(|p| p.contains("unknown option `tittle`; did you mean `title`?")),
-            "{found:?}"
+        assert_problem(&found, "unknown option `tittle`; did you mean `title`?");
+        assert_problem(&found, "`Theme`; did you mean `theme`?");
+        assert_problem(
+            &found,
+            "`smart-punctuation`; did you mean `smart_punctuation`?",
         );
-        assert!(
-            found
-                .iter()
-                .any(|p| p.contains("`Theme`; did you mean `theme`?")),
-            "{found:?}"
-        );
-        assert!(
-            found
-                .iter()
-                .any(|p| p.contains("`smart-punctuation`; did you mean `smart_punctuation`?")),
-            "{found:?}"
-        );
-        assert!(
-            found.iter().any(|p| p
-                .contains("unknown option `author`, ignored. Your own values go under `data`.")),
-            "{found:?}"
+        assert_problem(
+            &found,
+            "unknown option `author`, ignored. Your own values go under `data`.",
         );
         assert_eq!(found.len(), 4, "{found:?}");
     }
@@ -1534,12 +1524,7 @@ mod tests {
         let found = problems(&page(
             "---\ntitle: One\nnested: {title: fine}\ntitle: Two\n---\nx",
         ));
-        assert!(
-            found
-                .iter()
-                .any(|p| p.contains("`title` is set on line 2 and again on line 4")),
-            "{found:?}"
-        );
+        assert_problem(&found, "`title` is set on line 2 and again on line 4");
         assert!(
             !found.iter().any(|p| p.contains("line 3")),
             "nested keys are separate: {found:?}"
@@ -1549,40 +1534,19 @@ mod tests {
     #[test]
     fn parse_errors_point_at_file_lines() {
         let found = problems(&page("+++\ntitle = \"a\"\ntheme =\n+++\nx"));
-        assert!(
-            found
-                .iter()
-                .any(|p| p.starts_with("Front matter: TOML error on line 3")),
-            "{found:?}"
-        );
+        assert_problem(&found, "Front matter: TOML error on line 3");
         let found = problems(&page("+++\ntitle = \"a\"\ntitle = \"b\"\n+++\nx"));
-        assert!(
-            found.iter().any(|p| p.contains("duplicate key")),
-            "{found:?}"
-        );
+        assert_problem(&found, "duplicate key");
         let found = problems(&page("---\n- a\n- b\n---\nx"));
-        assert!(
-            found.iter().any(|p| p.contains("must be a mapping")),
-            "{found:?}"
-        );
+        assert_problem(&found, "must be a mapping");
     }
 
     #[test]
     fn unclosed_front_matter_is_reported_but_a_thematic_break_is_not() {
         let found = problems(&page("+++\ntitle = \"a\"\n\n# Body\n"));
-        assert!(
-            found
-                .iter()
-                .any(|p| p.contains("`+++` on line 1 is never closed")),
-            "{found:?}"
-        );
+        assert_problem(&found, "`+++` on line 1 is never closed");
         let found = problems(&page("---\ntitle: a\n\n# Body\n"));
-        assert!(
-            found
-                .iter()
-                .any(|p| p.contains("`---` on line 1 is never closed")),
-            "{found:?}"
-        );
+        assert_problem(&found, "`---` on line 1 is never closed");
         assert!(problems(&page("---\n\nJust a rule, then prose: with a colon.\n")).is_empty());
     }
 

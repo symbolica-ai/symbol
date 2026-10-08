@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashSet};
 #[cfg(test)]
 use std::io::Cursor;
 use std::io::{BufRead, BufReader, Read, Seek, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use flate2::read::GzDecoder;
@@ -221,12 +221,17 @@ pub fn write_payload(
     if is_junk(&rel, Some(bytes)) {
         return Err(UploadError::Junk);
     }
-    let path = dest.join(&rel);
+    std::fs::write(destination_path(dest, &rel)?, bytes)?;
+    Ok(1)
+}
+
+/// `dest/rel`, with its parent directories created.
+fn destination_path(dest: &Path, rel: &Path) -> Result<PathBuf, UploadError> {
+    let path = dest.join(rel);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, bytes)?;
-    Ok(1)
+    Ok(path)
 }
 
 pub fn write_payload_file(
@@ -241,11 +246,7 @@ pub fn write_payload_file(
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| kind.default_filename());
         let rel = safe_rel_path(name)?;
-        let path = dest.join(rel);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::copy(source, path)?;
+        std::fs::copy(source, destination_path(dest, &rel)?)?;
         return Ok(1);
     }
     match kind {
@@ -356,11 +357,7 @@ fn extract_gzip(dest: &Path, bytes: &[u8], filename: Option<&str>) -> Result<usi
     if is_junk(&rel, Some(&inner)) {
         return Err(UploadError::EmptyArchive);
     }
-    let path = dest.join(&rel);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, inner)?;
+    std::fs::write(destination_path(dest, &rel)?, inner)?;
     Ok(1)
 }
 
@@ -383,11 +380,7 @@ fn extract_gzip_reader(
     }
     let out_name = strip_gz_name(name).unwrap_or("file");
     let rel = safe_rel_path(out_name)?;
-    let path = dest.join(rel);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut output = std::fs::File::create(path)?;
+    let mut output = std::fs::File::create(destination_path(dest, &rel)?)?;
     let copied = std::io::copy(&mut reader.take(limits.max_extracted + 1), &mut output)?;
     if copied > limits.max_extracted {
         return Err(UploadError::TooLarge);
@@ -754,10 +747,8 @@ fn extract_zip(dest: &Path, bytes: &[u8]) -> Result<usize, UploadError> {
 }
 
 fn extract_zip_reader<R: Read + Seek>(dest: &Path, reader: R) -> Result<usize, UploadError> {
-    let limits = archive_limits();
+    let mut extraction = Extraction::new(dest);
     let mut archive = zip::ZipArchive::new(reader)?;
-    let mut files = 0usize;
-    let mut total = 0u64;
     for i in 0..archive.len() {
         let mut file = archive.by_index(i)?;
         if !file.is_file() {
@@ -771,31 +762,14 @@ fn extract_zip_reader<R: Read + Seek>(dest: &Path, reader: R) -> Result<usize, U
         }
         let rel = safe_rel_path(&enclosed.to_string_lossy())?;
         let size = file.size();
-        total = total.saturating_add(size);
-        if total > limits.max_extracted {
-            return Err(UploadError::TooLarge);
-        }
-        if !write_kept_file(dest, &rel, &mut file)? {
-            total = total.saturating_sub(size);
-            continue;
-        }
-        files += 1;
-        if files > limits.max_files {
-            return Err(UploadError::TooManyFiles);
-        }
+        extraction.extract(&rel, size, &mut file)?;
     }
-    if files == 0 {
-        return Err(UploadError::EmptyArchive);
-    }
-    strip_single_root(dest)?;
-    Ok(files)
+    extraction.finish()
 }
 
 fn extract_tar<R: Read>(dest: &Path, reader: R) -> Result<usize, UploadError> {
-    let limits = archive_limits();
+    let mut extraction = Extraction::new(dest);
     let mut archive = tar::Archive::new(reader);
-    let mut files = 0usize;
-    let mut total = 0u64;
     for entry in archive.entries()? {
         let mut entry = entry?;
         if !entry.header().entry_type().is_file() {
@@ -807,24 +781,58 @@ fn extract_tar<R: Read>(dest: &Path, reader: R) -> Result<usize, UploadError> {
         }
         let rel = safe_rel_path(&path.to_string_lossy())?;
         let size = entry.header().size()?;
-        total = total.saturating_add(size);
-        if total > limits.max_extracted {
+        extraction.extract(&rel, size, &mut entry)?;
+    }
+    extraction.finish()
+}
+
+/// The running totals of one archive extraction, checked against the limits.
+struct Extraction<'a> {
+    dest: &'a Path,
+    limits: ArchiveLimits,
+    files: usize,
+    total: u64,
+}
+
+impl<'a> Extraction<'a> {
+    fn new(dest: &'a Path) -> Self {
+        Self {
+            dest,
+            limits: archive_limits(),
+            files: 0,
+            total: 0,
+        }
+    }
+
+    /// Writes one member of `size` bytes to `rel`, unless it is an Apple fork.
+    fn extract<R: Read>(
+        &mut self,
+        rel: &Path,
+        size: u64,
+        reader: &mut R,
+    ) -> Result<(), UploadError> {
+        self.total = self.total.saturating_add(size);
+        if self.total > self.limits.max_extracted {
             return Err(UploadError::TooLarge);
         }
-        if !write_kept_file(dest, &rel, &mut entry)? {
-            total = total.saturating_sub(size);
-            continue;
+        if !write_kept_file(self.dest, rel, reader)? {
+            self.total = self.total.saturating_sub(size);
+            return Ok(());
         }
-        files += 1;
-        if files > limits.max_files {
+        self.files += 1;
+        if self.files > self.limits.max_files {
             return Err(UploadError::TooManyFiles);
         }
+        Ok(())
     }
-    if files == 0 {
-        return Err(UploadError::EmptyArchive);
+
+    fn finish(self) -> Result<usize, UploadError> {
+        if self.files == 0 {
+            return Err(UploadError::EmptyArchive);
+        }
+        strip_single_root(self.dest)?;
+        Ok(self.files)
     }
-    strip_single_root(dest)?;
-    Ok(files)
 }
 
 fn write_kept_file<R: Read>(dest: &Path, rel: &Path, reader: &mut R) -> Result<bool, UploadError> {
@@ -833,11 +841,7 @@ fn write_kept_file<R: Read>(dest: &Path, rel: &Path, reader: &mut R) -> Result<b
     if looks_like_apple_fork(&buf[..n]) {
         return Ok(false);
     }
-    let path = dest.join(rel);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut out = std::fs::File::create(path)?;
+    let mut out = std::fs::File::create(destination_path(dest, rel)?)?;
     if n > 0 {
         out.write_all(&buf[..n])?;
         std::io::copy(reader, &mut out)?;
@@ -875,6 +879,25 @@ fn strip_single_root(dest: &Path) -> Result<(), UploadError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A zip archive holding `entries`, in order, as plain files.
+    fn zip_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut buf = Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut buf);
+            let options = zip::write::SimpleFileOptions::default();
+            for (name, content) in entries {
+                zip.start_file(*name, options).unwrap();
+                zip.write_all(content).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        buf.into_inner()
+    }
+
+    fn write_zip(path: &Path, entries: &[(&str, &[u8])]) {
+        std::fs::write(path, zip_bytes(entries)).unwrap();
+    }
 
     #[test]
     fn archive_plans_preserve_safe_links_independent_of_member_order() {
@@ -1151,15 +1174,7 @@ mod tests {
     #[test]
     fn zip_is_unpacked() {
         let dir = tempfile::tempdir().unwrap();
-        let mut buf = Cursor::new(Vec::new());
-        {
-            let mut zip = zip::ZipWriter::new(&mut buf);
-            let opts = zip::write::SimpleFileOptions::default();
-            zip.start_file("index.html", opts).unwrap();
-            std::io::Write::write_all(&mut zip, b"<h1>z</h1>").unwrap();
-            zip.finish().unwrap();
-        }
-        let bytes = buf.into_inner();
+        let bytes = zip_bytes(&[("index.html", b"<h1>z</h1>")]);
         write_payload(dir.path(), &bytes, Kind::Zip, Some("site.zip"), true).unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.path().join("index.html")).unwrap(),
@@ -1172,14 +1187,7 @@ mod tests {
     fn spooled_zip_is_unpacked_without_loading_archive_bytes() {
         let dir = tempfile::tempdir().unwrap();
         let archive_path = dir.path().join("upload.zip");
-        {
-            let file = std::fs::File::create(&archive_path).unwrap();
-            let mut zip = zip::ZipWriter::new(file);
-            zip.start_file("site/index.html", zip::write::SimpleFileOptions::default())
-                .unwrap();
-            zip.write_all(b"streamed").unwrap();
-            zip.finish().unwrap();
-        }
+        write_zip(&archive_path, &[("site/index.html", b"streamed")]);
         let output = dir.path().join("output");
         std::fs::create_dir(&output).unwrap();
         assert_eq!(
@@ -1196,27 +1204,16 @@ mod tests {
     #[test]
     fn zip_skips_junk() {
         let dir = tempfile::tempdir().unwrap();
-        let mut buf = Cursor::new(Vec::new());
-        {
-            let mut zip = zip::ZipWriter::new(&mut buf);
-            let opts = zip::write::SimpleFileOptions::default();
-            zip.start_file("index.html", opts).unwrap();
-            std::io::Write::write_all(&mut zip, b"<h1>ok</h1>").unwrap();
-            zip.start_file("._index.html", opts).unwrap();
-            std::io::Write::write_all(&mut zip, &[0x00, 0x05, 0x16, 0x07, 0, 2, 0, 0]).unwrap();
-            zip.start_file("._.", opts).unwrap();
-            std::io::Write::write_all(&mut zip, &[0x00, 0x05, 0x16, 0x07, 0, 2, 0, 0]).unwrap();
-            zip.start_file(".DS_Store", opts).unwrap();
-            std::io::Write::write_all(&mut zip, b"ds").unwrap();
-            zip.start_file("__MACOSX/._index.html", opts).unwrap();
-            std::io::Write::write_all(&mut zip, &[0x00, 0x05, 0x16, 0x07]).unwrap();
-            zip.start_file("desktop.ini", opts).unwrap();
-            std::io::Write::write_all(&mut zip, b"[.ShellClassInfo]").unwrap();
-            zip.start_file("keep.bin", opts).unwrap();
-            std::io::Write::write_all(&mut zip, &[0x00, 0x05, 0x16, 0x07, 0, 2, 0, 0]).unwrap();
-            zip.finish().unwrap();
-        }
-        let bytes = buf.into_inner();
+        let apple = [0x00, 0x05, 0x16, 0x07, 0, 2, 0, 0];
+        let bytes = zip_bytes(&[
+            ("index.html", b"<h1>ok</h1>"),
+            ("._index.html", &apple),
+            ("._.", &apple),
+            (".DS_Store", b"ds"),
+            ("__MACOSX/._index.html", &[0x00, 0x05, 0x16, 0x07]),
+            ("desktop.ini", b"[.ShellClassInfo]"),
+            ("keep.bin", &apple),
+        ]);
         write_payload(dir.path(), &bytes, Kind::Zip, Some("site.zip"), true).unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.path().join("index.html")).unwrap(),
@@ -1233,15 +1230,7 @@ mod tests {
     #[test]
     fn zip_slip_rejected() {
         let dir = tempfile::tempdir().unwrap();
-        let mut buf = Cursor::new(Vec::new());
-        {
-            let mut zip = zip::ZipWriter::new(&mut buf);
-            let opts = zip::write::SimpleFileOptions::default();
-            zip.start_file("../evil.txt", opts).unwrap();
-            std::io::Write::write_all(&mut zip, b"nope").unwrap();
-            zip.finish().unwrap();
-        }
-        let bytes = buf.into_inner();
+        let bytes = zip_bytes(&[("../evil.txt", b"nope")]);
         let err = extract_zip(dir.path(), &bytes).unwrap_err();
         assert!(matches!(err, UploadError::Path(_) | UploadError::Zip(_)));
         assert!(!dir.path().join("evil.txt").exists());
@@ -1292,28 +1281,14 @@ mod tests {
         let archive_path = directory.path().join("site.zip");
         let management =
             "sym_mgmt_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        {
-            let file = std::fs::File::create(&archive_path).unwrap();
-            let mut zip = zip::ZipWriter::new(file);
-            zip.start_file("index.html", zip::write::SimpleFileOptions::default())
-                .unwrap();
-            zip.write_all(management.as_bytes()).unwrap();
-            zip.finish().unwrap();
-        }
+        write_zip(&archive_path, &[("index.html", management.as_bytes())]);
         assert!(matches!(
             reject_secrets_in_opaque_archive(&archive_path, Kind::Zip),
             Err(UploadError::OpaqueSecret)
         ));
 
         let clean_path = directory.path().join("clean.zip");
-        {
-            let file = std::fs::File::create(&clean_path).unwrap();
-            let mut zip = zip::ZipWriter::new(file);
-            zip.start_file("index.html", zip::write::SimpleFileOptions::default())
-                .unwrap();
-            zip.write_all(b"clean").unwrap();
-            zip.finish().unwrap();
-        }
+        write_zip(&clean_path, &[("index.html", b"clean")]);
         reject_secrets_in_opaque_archive(&clean_path, Kind::Zip).unwrap();
     }
 }

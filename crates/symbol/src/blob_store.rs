@@ -46,10 +46,7 @@ impl BlobFiles {
         if target.is_file() {
             return Ok(());
         }
-        let parent = target.parent().expect("quarantine blob path has parent");
-        fs::create_dir_all(parent)?;
-        fs::rename(source, &target)?;
-        File::open(parent)?.sync_all()
+        move_durably(&source, &target)
     }
 
     pub fn restore(&self, live: &HashSet<ContentHash>) -> io::Result<()> {
@@ -62,10 +59,7 @@ impl BlobFiles {
             if !source.is_file() {
                 continue;
             }
-            let parent = target.parent().expect("blob path has parent");
-            fs::create_dir_all(parent)?;
-            fs::rename(source, &target)?;
-            File::open(parent)?.sync_all()?;
+            move_durably(&source, &target)?;
         }
         Ok(())
     }
@@ -130,11 +124,17 @@ impl BlobFiles {
             .join(".quarantine")
             .join("corrupt")
             .join(format!("{}-{nonce}", hash.to_hex()));
-        let parent = target.parent().expect("corrupt quarantine path has parent");
-        fs::create_dir_all(parent)?;
-        fs::rename(source, &target)?;
-        File::open(parent)?.sync_all()
+        move_durably(source, &target)
     }
+}
+
+/// Renames `source` to `target`, creating its directory, and syncs that
+/// directory so the move survives a crash.
+fn move_durably(source: &Path, target: &Path) -> io::Result<()> {
+    let parent = target.parent().expect("blob path has parent");
+    fs::create_dir_all(parent)?;
+    fs::rename(source, target)?;
+    File::open(parent)?.sync_all()
 }
 
 /// Split a hash into the two-character directory prefix and the remainder.
