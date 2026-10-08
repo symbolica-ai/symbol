@@ -823,9 +823,7 @@ pub(super) fn finish_partial_expiry_locked(
         diesel::delete(sites::table.find(site_id)).execute(tx)?;
         return Ok(());
     }
-    diesel::update(sites::table.find(site_id))
-        .set(sites::content_revision.eq(sites::content_revision + 1))
-        .execute(tx)?;
+    bump_revision_locked(tx, site_id)?;
     refresh_aliases_locked(tx, site_id, &[AliasChange::Subtree(changed_path)])?;
     refresh_expiry_for_changes_locked(tx, site_id, &[changed_path], now)?;
     regenerate_site(tx, blobs, site_id, now)?;
@@ -892,16 +890,6 @@ pub(super) const fn expiry_mode_name(mode: ExpiryMode) -> &'static str {
 }
 
 impl Store {
-    #[cfg(test)]
-    pub fn set_expiry(
-        &self,
-        name: &str,
-        rel: &str,
-        policy: Option<ExpiryPolicy>,
-    ) -> Result<ExpiryMutation, StoreError> {
-        self.set_expiry_secured(name, rel, policy, None)
-    }
-
     pub fn set_expiry_secured(
         &self,
         name: &str,
@@ -913,53 +901,52 @@ impl Store {
         let rel = normalize_rel(rel)?;
         let policy = policy.map(ExpiryPolicy::validate).transpose()?;
         let now = self.now_millis();
-        let mut db = self.inner.writer.lock().unwrap();
-        let mut tx = DbTransaction::begin(&mut db)?;
-        authorize_locked(&mut tx, name, authorization)?;
-        let site_id = site_id_locked(&mut tx, name)?;
-        reject_expiry_below_alias_locked(&mut tx, site_id, &rel)?;
-        let kind = expiry_target_kind_locked(&mut tx, name, &rel)?;
-        let previous = expiry_policies::table
-            .find((site_id, rel.as_str()))
-            .select(expiry_policies::site_id)
-            .first::<i64>(&mut *tx)
-            .optional()?
-            .is_some();
-        let undo = if previous || policy.is_some() {
-            Some(snapshot_site_with_description(
-                &mut tx,
-                name,
-                UndoKind::Expiry,
-                &format!(
-                    "restore previous expiry policy for {}",
-                    expiry_display_path(name, &rel)
-                ),
-                now,
-            )?)
-        } else {
-            None
-        };
-        if let Some(policy) = policy {
-            let size = expiry_target_size_locked(&mut tx, site_id, &rel, kind)?;
-            store_expiry_policy_locked(
-                &mut tx,
-                ExpiryPolicyWrite {
-                    site_id,
-                    path: &rel,
-                    kind,
-                    policy,
-                    size,
+        let undo = self.write_plain(|tx| {
+            authorize_locked(tx, name, authorization)?;
+            let site_id = site_id_locked(tx, name)?;
+            reject_expiry_below_alias_locked(tx, site_id, &rel)?;
+            let kind = expiry_target_kind_locked(tx, name, &rel)?;
+            let previous = expiry_policies::table
+                .find((site_id, rel.as_str()))
+                .select(expiry_policies::site_id)
+                .first::<i64>(&mut *tx)
+                .optional()?
+                .is_some();
+            let undo = if previous || policy.is_some() {
+                Some(snapshot_site_with_description(
+                    tx,
+                    name,
+                    UndoKind::Expiry,
+                    &format!(
+                        "restore previous expiry policy for {}",
+                        expiry_display_path(name, &rel)
+                    ),
                     now,
-                },
-            )?;
-        } else {
-            diesel::delete(expiry_policies::table.find((site_id, rel.as_str())))
-                .execute(&mut *tx)?;
-        }
-        regenerate_site(&mut tx, &self.inner.blob_files, site_id, now)?;
-        prune_undo_locked(&mut tx, now)?;
-        tx.commit()?;
-        drop(db);
+                )?)
+            } else {
+                None
+            };
+            if let Some(policy) = policy {
+                let size = expiry_target_size_locked(tx, site_id, &rel, kind)?;
+                store_expiry_policy_locked(
+                    tx,
+                    ExpiryPolicyWrite {
+                        site_id,
+                        path: &rel,
+                        kind,
+                        policy,
+                        size,
+                        now,
+                    },
+                )?;
+            } else {
+                diesel::delete(expiry_policies::table.find((site_id, rel.as_str())))
+                    .execute(&mut *tx)?;
+            }
+            regenerate_site(tx, &self.inner.blob_files, site_id, now)?;
+            prune_undo_locked(tx, now)?;
+            Ok(undo)
+        })?;
         let report = self.expiry_report(name, &rel)?;
         Ok(ExpiryMutation { report, undo })
     }
@@ -1023,156 +1010,152 @@ impl Store {
     #[expect(clippy::too_many_lines)]
     pub fn sweep_expired(&self) -> Result<usize, StoreError> {
         let now = self.now_millis();
-        let mut db = self.inner.writer.lock().unwrap();
-        let mut tx = DbTransaction::begin(&mut db)?;
-        let due = expiry_policies::table
-            .inner_join(sites::table)
-            .filter(expiry_policies::own_deadline.le(now))
-            .select((
-                sites::name,
-                expiry_policies::path,
-                expiry_policies::target_kind,
-            ))
-            .order((
-                sites::id,
-                expiry_policies::target_kind,
-                expiry_policies::path,
-            ))
-            .load::<(String, String, i64)>(&mut *tx)?;
-        let mut swept_sites = HashSet::new();
-        let mut removed_targets = 0;
-        for (name, path, raw_kind) in due {
-            if !site_exists_locked(&mut tx, &name)? {
-                continue;
-            }
-            let kind = ExpiryTargetKind::try_from(raw_kind)?;
-            let site_id = site_id_locked(&mut tx, &name)?;
-            let deadline = expiry_policies::table
-                .find((site_id, path.as_str()))
-                .select(expiry_policies::own_deadline)
-                .first::<Option<i64>>(&mut *tx)
-                .optional()?
-                .flatten();
-            let still_due = deadline.is_some_and(|deadline| deadline <= now);
-            if !still_due {
-                continue;
-            }
-            if swept_sites.insert(name.clone()) {
-                snapshot_site_with_description(
-                    &mut tx,
-                    &name,
-                    UndoKind::ExpireSweep,
-                    &format!("restore expired content in {name}"),
-                    now,
-                )?;
-            }
-            let exact_alias = !path.is_empty()
-                && site_entries::table
-                    .find((site_id, path.as_str()))
-                    .select(site_entries::kind)
-                    .first::<i64>(&mut *tx)
-                    .optional()?
-                    == Some(database::schema::ALIAS_ENTRY_KIND);
-            if exact_alias {
-                diesel::delete(site_entries::table.find((site_id, path.as_str())))
-                    .execute(&mut *tx)?;
-                diesel::delete(expiry_policies::table.find((site_id, path.as_str())))
-                    .execute(&mut *tx)?;
-                finish_partial_expiry_locked(&mut tx, &self.inner.blob_files, site_id, &path, now)?;
-                removed_targets += 1;
-                continue;
-            }
-            match kind {
-                ExpiryTargetKind::Site => {
-                    retain_management_tombstone(&mut tx, &name, now)?;
-                    diesel::delete(sites::table.find(site_id)).execute(&mut *tx)?;
+        self.write(|tx| {
+            let due = expiry_policies::table
+                .inner_join(sites::table)
+                .filter(expiry_policies::own_deadline.le(now))
+                .select((
+                    sites::name,
+                    expiry_policies::path,
+                    expiry_policies::target_kind,
+                ))
+                .order((
+                    sites::id,
+                    expiry_policies::target_kind,
+                    expiry_policies::path,
+                ))
+                .load::<(String, String, i64)>(&mut *tx)?;
+            let mut swept_sites = HashSet::new();
+            let mut removed_targets = 0;
+            for (name, path, raw_kind) in due {
+                if !site_exists_locked(tx, &name)? {
+                    continue;
                 }
-                ExpiryTargetKind::File => {
-                    let entry_kind = site_entries::table
-                        .find((site_id, path.as_str()))
-                        .select(site_entries::kind)
-                        .first::<i64>(&mut *tx)?;
-                    let size =
-                        i64::try_from(entry_size_locked(&mut tx, site_id, &path, entry_kind)?)
-                            .expect("stored size fits in i64");
-                    diesel::delete(site_entries::table.find((site_id, path.as_str())))
-                        .execute(&mut *tx)?;
-                    adjust_aggregates_locked(&mut tx, site_id, &path, -size, -1)?;
-                    diesel::delete(expiry_policies::table.find((site_id, path.as_str())))
-                        .execute(&mut *tx)?;
-                    finish_partial_expiry_locked(
-                        &mut tx,
-                        &self.inner.blob_files,
-                        site_id,
-                        &path,
+                let kind = ExpiryTargetKind::try_from(raw_kind)?;
+                let site_id = site_id_locked(tx, &name)?;
+                let deadline = expiry_policies::table
+                    .find((site_id, path.as_str()))
+                    .select(expiry_policies::own_deadline)
+                    .first::<Option<i64>>(&mut *tx)
+                    .optional()?
+                    .flatten();
+                let still_due = deadline.is_some_and(|deadline| deadline <= now);
+                if !still_due {
+                    continue;
+                }
+                if swept_sites.insert(name.clone()) {
+                    snapshot_site_with_description(
+                        tx,
+                        &name,
+                        UndoKind::ExpireSweep,
+                        &format!("restore expired content in {name}"),
                         now,
                     )?;
                 }
-                ExpiryTargetKind::Folder => {
-                    let alias_folder = site_entries::table
+                let exact_alias = !path.is_empty()
+                    && site_entries::table
                         .find((site_id, path.as_str()))
                         .select(site_entries::kind)
                         .first::<i64>(&mut *tx)
                         .optional()?
                         == Some(database::schema::ALIAS_ENTRY_KIND);
-                    if alias_folder {
+                if exact_alias {
+                    diesel::delete(site_entries::table.find((site_id, path.as_str())))
+                        .execute(&mut *tx)?;
+                    diesel::delete(expiry_policies::table.find((site_id, path.as_str())))
+                        .execute(&mut *tx)?;
+                    finish_partial_expiry_locked(tx, &self.inner.blob_files, site_id, &path, now)?;
+                    removed_targets += 1;
+                    continue;
+                }
+                match kind {
+                    ExpiryTargetKind::Site => {
+                        retain_management_tombstone(tx, &name, now)?;
+                        diesel::delete(sites::table.find(site_id)).execute(&mut *tx)?;
+                    }
+                    ExpiryTargetKind::File => {
+                        let entry_kind = site_entries::table
+                            .find((site_id, path.as_str()))
+                            .select(site_entries::kind)
+                            .first::<i64>(&mut *tx)?;
+                        let size =
+                            i64::try_from(entry_size_locked(tx, site_id, &path, entry_kind)?)
+                                .expect("stored size fits in i64");
                         diesel::delete(site_entries::table.find((site_id, path.as_str())))
                             .execute(&mut *tx)?;
+                        adjust_aggregates_locked(tx, site_id, &path, -size, -1)?;
                         diesel::delete(expiry_policies::table.find((site_id, path.as_str())))
                             .execute(&mut *tx)?;
-                    } else {
-                        let (start, end) = descendant_bounds(&path);
-                        let removed_files = files::table
-                            .filter(files::site_id.eq(site_id))
-                            .filter(files::path.ge(&start))
-                            .filter(files::path.lt(&end))
-                            .select((files::path, files::size))
-                            .load::<(String, i64)>(&mut *tx)?;
-                        let removed_allocated = allocated_entries::table
-                            .filter(allocated_entries::site_id.eq(site_id))
-                            .filter(allocated_entries::path.ge(&start))
-                            .filter(allocated_entries::path.lt(&end))
-                            .select((allocated_entries::path, allocated_entries::size))
-                            .load::<(String, i64)>(&mut *tx)?;
-                        diesel::delete(
-                            site_entries::table
-                                .filter(site_entries::site_id.eq(site_id))
-                                .filter(site_entries::path.ge(&start))
-                                .filter(site_entries::path.lt(&end)),
-                        )
-                        .execute(&mut *tx)?;
-                        for (removed_path, size) in
-                            removed_files.into_iter().chain(removed_allocated)
-                        {
-                            adjust_aggregates_locked(&mut tx, site_id, &removed_path, -size, -1)?;
-                        }
-                        diesel::delete(
-                            expiry_policies::table
-                                .filter(expiry_policies::site_id.eq(site_id))
-                                .filter(
-                                    expiry_policies::path.eq(&path).or(expiry_policies::path
-                                        .ge(&start)
-                                        .and(expiry_policies::path.lt(&end))),
-                                ),
-                        )
-                        .execute(&mut *tx)?;
+                        finish_partial_expiry_locked(
+                            tx,
+                            &self.inner.blob_files,
+                            site_id,
+                            &path,
+                            now,
+                        )?;
                     }
-                    finish_partial_expiry_locked(
-                        &mut tx,
-                        &self.inner.blob_files,
-                        site_id,
-                        &path,
-                        now,
-                    )?;
+                    ExpiryTargetKind::Folder => {
+                        let alias_folder = site_entries::table
+                            .find((site_id, path.as_str()))
+                            .select(site_entries::kind)
+                            .first::<i64>(&mut *tx)
+                            .optional()?
+                            == Some(database::schema::ALIAS_ENTRY_KIND);
+                        if alias_folder {
+                            diesel::delete(site_entries::table.find((site_id, path.as_str())))
+                                .execute(&mut *tx)?;
+                            diesel::delete(expiry_policies::table.find((site_id, path.as_str())))
+                                .execute(&mut *tx)?;
+                        } else {
+                            let (start, end) = descendant_bounds(&path);
+                            let removed_files = files::table
+                                .filter(files::site_id.eq(site_id))
+                                .filter(files::path.ge(&start))
+                                .filter(files::path.lt(&end))
+                                .select((files::path, files::size))
+                                .load::<(String, i64)>(&mut *tx)?;
+                            let removed_allocated = allocated_entries::table
+                                .filter(allocated_entries::site_id.eq(site_id))
+                                .filter(allocated_entries::path.ge(&start))
+                                .filter(allocated_entries::path.lt(&end))
+                                .select((allocated_entries::path, allocated_entries::size))
+                                .load::<(String, i64)>(&mut *tx)?;
+                            diesel::delete(
+                                site_entries::table
+                                    .filter(site_entries::site_id.eq(site_id))
+                                    .filter(site_entries::path.ge(&start))
+                                    .filter(site_entries::path.lt(&end)),
+                            )
+                            .execute(&mut *tx)?;
+                            for (removed_path, size) in
+                                removed_files.into_iter().chain(removed_allocated)
+                            {
+                                adjust_aggregates_locked(tx, site_id, &removed_path, -size, -1)?;
+                            }
+                            diesel::delete(
+                                expiry_policies::table
+                                    .filter(expiry_policies::site_id.eq(site_id))
+                                    .filter(
+                                        expiry_policies::path.eq(&path).or(expiry_policies::path
+                                            .ge(&start)
+                                            .and(expiry_policies::path.lt(&end))),
+                                    ),
+                            )
+                            .execute(&mut *tx)?;
+                        }
+                        finish_partial_expiry_locked(
+                            tx,
+                            &self.inner.blob_files,
+                            site_id,
+                            &path,
+                            now,
+                        )?;
+                    }
                 }
+                removed_targets += 1;
             }
-            removed_targets += 1;
-        }
-        prune_undo_locked(&mut tx, now)?;
-        let removed = gc_blobs(&mut tx, now)?;
-        tx.commit()?;
-        drop(db);
-        self.remove_blob_files(&removed);
-        Ok(removed_targets)
+            let removed = finish_mutation(tx, now)?;
+            Ok((removed_targets, removed))
+        })
     }
 }
