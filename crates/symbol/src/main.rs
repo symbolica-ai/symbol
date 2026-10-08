@@ -18,6 +18,7 @@ mod contract_conformance;
 mod database;
 mod expiry;
 mod hash;
+mod html_charset;
 mod http_cache;
 mod markdown;
 mod markdown_cache;
@@ -2910,6 +2911,7 @@ async fn send_expiring_blob(
             .as_deref()
             .unwrap_or_else(|| inferred.essence_str()),
     );
+    let media_type = with_html_charset(media_type, hash, app).await;
     let mut response = send_blob(headers, &media_type, hash, app).await;
     let updated = app
         .run_store({
@@ -2931,9 +2933,10 @@ async fn send_expiring_blob(
 /// `mime_guess` returns a bare essence such as `text/markdown`, and an unlabeled
 /// text response leaves the browser to guess the encoding -- usually
 /// windows-1252, which turns UTF-8 accents and emoji into mojibake. HTML and XML
-/// are left alone: both declare their own encoding in-band (`<meta charset>`,
-/// `<?xml encoding?>`), and an HTTP charset would silently override an author's
-/// explicit declaration.
+/// are left alone here: both can declare their own encoding in-band
+/// (`<meta charset>`, `<?xml encoding?>`), and an HTTP charset would silently
+/// override an author's explicit declaration. XML without a declaration is
+/// UTF-8 by definition; HTML is decided per file by [`with_html_charset`].
 fn with_default_charset(media_type: &str) -> std::borrow::Cow<'_, str> {
     let mut parameters = media_type.split(';');
     let essence = parameters.next().unwrap_or_default().trim();
@@ -2952,6 +2955,40 @@ fn with_default_charset(media_type: &str) -> std::borrow::Cow<'_, str> {
         std::borrow::Cow::Owned(format!("{media_type}; charset=utf-8"))
     } else {
         std::borrow::Cow::Borrowed(media_type)
+    }
+}
+
+/// Adds `charset=utf-8` to bare `text/html` when the page declares no encoding
+/// of its own and is UTF-8 throughout. See [`html_charset`].
+///
+/// Anything that cannot be checked keeps the bare type, which is what it was
+/// served as before.
+async fn with_html_charset<'a>(
+    media_type: std::borrow::Cow<'a, str>,
+    hash: ContentHash,
+    app: &App,
+) -> std::borrow::Cow<'a, str> {
+    let mut parameters = media_type.split(';');
+    let bare_html = parameters
+        .next()
+        .is_some_and(|essence| essence.trim().eq_ignore_ascii_case("text/html"))
+        && parameters.all(|parameter| {
+            !parameter
+                .trim()
+                .get(..8)
+                .is_some_and(|name| name.eq_ignore_ascii_case("charset="))
+        });
+    if !bare_html {
+        return media_type;
+    }
+    let path = app.store.blob_path(hash);
+    let utf8 = tokio::task::spawn_blocking(move || html_charset::labels_as_utf8(hash, &path))
+        .await
+        .is_ok_and(|verdict| verdict.unwrap_or(false));
+    if utf8 {
+        std::borrow::Cow::Owned(format!("{media_type}; charset=utf-8"))
+    } else {
+        media_type
     }
 }
 
@@ -3454,6 +3491,12 @@ mod tests {
         store
             .put_file("hello", "page.html", b"<meta charset=utf-8>")
             .unwrap();
+        store
+            .put_file("hello", "plain.html", "<p>café ✓</p>".as_bytes())
+            .unwrap();
+        store
+            .put_file("hello", "legacy.html", b"<p>caf\xE9</p>")
+            .unwrap();
         let app = router(test_app(store));
 
         let response = app
@@ -3467,8 +3510,31 @@ mod tests {
             "text/markdown; charset=utf-8"
         );
 
+        // A page's own declaration is left to win.
         let response = app
+            .clone()
             .oneshot(Request::get("/hello/page").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "text/html");
+
+        // Declaring nothing and UTF-8 throughout: labelled, raw bytes too.
+        for path in ["/hello/plain", "/hello/plain.html/RAW"] {
+            let response = app
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.headers()[header::CONTENT_TYPE],
+                "text/html; charset=utf-8",
+                "{path}"
+            );
+        }
+
+        // Declaring nothing and not UTF-8: the browser still decides.
+        let response = app
+            .oneshot(Request::get("/hello/legacy").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(response.headers()[header::CONTENT_TYPE], "text/html");
