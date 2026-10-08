@@ -1611,9 +1611,14 @@ path that would only redirect. `PUT`, `DELETE`, `EXPIRE`, and `HASH` stay on
 the real path.
 
 Text types are served with `charset=utf-8` unless they already name a charset.
-`text/html` and `text/xml` are left unlabeled, because both declare their own
-encoding in-band and an HTTP charset would override an author's explicit
-`<meta charset>` or `<?xml encoding?>`.
+`text/xml` is left unlabeled: XML declares its encoding in-band and defaults to
+UTF-8. `text/html` is decided per file, because an HTTP charset overrides a
+page's own `<meta charset>`. A page that declares its encoding -- a UTF-16 byte
+order mark, or a `<meta>` naming a charset (`charset=` or `http-equiv`) in its
+first 1024 bytes, outside comments -- is served as bare `text/html` and its
+declaration wins. A page that declares nothing gets `charset=utf-8` when its
+bytes are valid UTF-8, and stays bare otherwise, leaving the browser to guess
+as before. The same rule applies to `RAW`.
 
 #### Markdown in browsers
 
