@@ -23,6 +23,11 @@ impl TokenCounts {
         self.management + self.claim
     }
 
+    const fn add(&mut self, other: Self) {
+        self.management += other.management;
+        self.claim += other.claim;
+    }
+
     const fn increment(&mut self, kind: TokenKind) {
         match kind {
             TokenKind::Management => self.management += 1,
@@ -84,19 +89,10 @@ pub fn redact_tokens(input: &[u8]) -> SanitizedBytes {
             continue;
         };
         let payload_start = cursor + prefix_len;
-        let payload_end = payload_start + TOKEN_HEX_LEN;
-        if payload_end > input.len()
-            || !input[payload_start..payload_end]
-                .iter()
-                .all(u8::is_ascii_hexdigit)
-            || input[payload_start..payload_end]
-                .iter()
-                .any(u8::is_ascii_uppercase)
-            || input.get(payload_end).is_some_and(u8::is_ascii_hexdigit)
-        {
+        let Some(payload_end) = token_payload_end(input, payload_start) else {
             cursor += 1;
             continue;
-        }
+        };
 
         output.extend_from_slice(&input[copied_through..payload_start]);
         output.extend(std::iter::repeat_n(b'*', TOKEN_HEX_LEN));
@@ -132,17 +128,7 @@ pub fn scan_tokens(input: &[u8], mut found: impl FnMut(TokenKind, usize)) -> Tok
             cursor += 1;
             continue;
         };
-        let payload_start = cursor + prefix_len;
-        let payload_end = payload_start + TOKEN_HEX_LEN;
-        if payload_end <= input.len()
-            && input[payload_start..payload_end]
-                .iter()
-                .all(u8::is_ascii_hexdigit)
-            && !input[payload_start..payload_end]
-                .iter()
-                .any(u8::is_ascii_uppercase)
-            && !input.get(payload_end).is_some_and(u8::is_ascii_hexdigit)
-        {
+        if let Some(payload_end) = token_payload_end(input, cursor + prefix_len) {
             counts.increment(kind);
             found(kind, cursor);
             cursor = payload_end;
@@ -239,8 +225,7 @@ fn scan_reader(mut reader: impl Read, mut output: Option<impl Write>) -> io::Res
             continue;
         }
         let sanitized = redact_tokens(&pending);
-        counts.management += sanitized.counts.management;
-        counts.claim += sanitized.counts.claim;
+        counts.add(sanitized.counts);
         let split = sanitized.as_bytes().len() - TOKEN_WINDOW;
         if let Some(writer) = output.as_mut() {
             writer.write_all(&sanitized.as_bytes()[..split])?;
@@ -248,8 +233,7 @@ fn scan_reader(mut reader: impl Read, mut output: Option<impl Write>) -> io::Res
         pending = sanitized.as_bytes()[split..].to_vec();
     }
     let sanitized = redact_tokens(&pending);
-    counts.management += sanitized.counts.management;
-    counts.claim += sanitized.counts.claim;
+    counts.add(sanitized.counts);
     if let Some(writer) = output.as_mut() {
         writer.write_all(sanitized.as_bytes())?;
     }
@@ -296,6 +280,18 @@ fn sanitized_path(path: &Path) -> PathBuf {
     let mut temporary = path.as_os_str().to_owned();
     temporary.push(".symbol-sanitized");
     PathBuf::from(temporary)
+}
+
+/// Where a token whose payload starts at `start` ends, if the payload is
+/// exactly [`TOKEN_HEX_LEN`] lowercase hex digits and no further hex digit
+/// follows it.
+fn token_payload_end(input: &[u8], start: usize) -> Option<usize> {
+    let end = start + TOKEN_HEX_LEN;
+    let payload = input.get(start..end)?;
+    (payload.iter().all(u8::is_ascii_hexdigit)
+        && !payload.iter().any(u8::is_ascii_uppercase)
+        && !input.get(end).is_some_and(u8::is_ascii_hexdigit))
+    .then_some(end)
 }
 
 fn token_prefix_at(bytes: &[u8]) -> Option<(TokenKind, usize)> {

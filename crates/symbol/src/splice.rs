@@ -181,12 +181,7 @@ fn parse_header_descriptors(
             return Err(ProtocolError::HeaderLimit);
         }
         let descriptor = parse_header_descriptor(encoded)?;
-        total_insert = total_insert
-            .checked_add(descriptor.insert)
-            .ok_or(ProtocolError::PayloadTooLarge)?;
-        if total_insert > maximum_insert_bytes {
-            return Err(ProtocolError::PayloadTooLarge);
-        }
+        total_insert = add_insertion(total_insert, descriptor.insert, maximum_insert_bytes)?;
         descriptors.push(descriptor);
     }
     Ok(descriptors)
@@ -268,12 +263,7 @@ where
         let offset = u64::from_be_bytes(row[0..8].try_into().expect("eight-byte offset"));
         let delete = u64::from_be_bytes(row[8..16].try_into().expect("eight-byte deletion"));
         let insert = u64::from_be_bytes(row[16..24].try_into().expect("eight-byte insertion"));
-        total_insert = total_insert
-            .checked_add(insert)
-            .ok_or(ProtocolError::PayloadTooLarge)?;
-        if total_insert > maximum_insert_bytes {
-            return Err(ProtocolError::PayloadTooLarge);
-        }
+        total_insert = add_insertion(total_insert, insert, maximum_insert_bytes)?;
         descriptors.push(Descriptor {
             offset,
             delete,
@@ -281,6 +271,14 @@ where
         });
     }
     Ok(descriptors)
+}
+
+/// `total` plus one more insertion, which must keep the sum within `maximum`.
+fn add_insertion(total: u64, insert: u64, maximum: u64) -> Result<u64, ProtocolError> {
+    total
+        .checked_add(insert)
+        .filter(|total| *total <= maximum)
+        .ok_or(ProtocolError::PayloadTooLarge)
 }
 
 fn frame_read_error(error: ProtocolError) -> ProtocolError {
@@ -303,12 +301,7 @@ where
     let mut total = 0_u64;
     let mut splices = Vec::with_capacity(descriptors.len());
     for (index, descriptor) in descriptors.iter().enumerate() {
-        total = total
-            .checked_add(descriptor.insert)
-            .ok_or(ProtocolError::PayloadTooLarge)?;
-        if total > maximum_insert_bytes {
-            return Err(ProtocolError::PayloadTooLarge);
-        }
+        total = add_insertion(total, descriptor.insert, maximum_insert_bytes)?;
         let insert = if descriptor.insert == 0 {
             None
         } else {
@@ -467,6 +460,22 @@ mod tests {
         bytes
     }
 
+    /// Parses `bytes` as a v1 frame, spooling insertions under `root/name`.
+    async fn parse_frame(
+        root: &Path,
+        name: &str,
+        bytes: Vec<u8>,
+    ) -> Result<ParsedSplices, ProtocolError> {
+        parse(
+            Format::FrameV1,
+            &HeaderMap::new(),
+            Body::from(bytes),
+            root.join(name),
+            1024,
+        )
+        .await
+    }
+
     #[tokio::test]
     async fn repeated_and_combined_headers_stream_exact_insertions() {
         let root = tempfile::tempdir().unwrap();
@@ -576,43 +585,24 @@ mod tests {
     #[tokio::test]
     async fn frame_v1_validates_magic_flags_counts_lengths_and_trailing_bytes() {
         let root = tempfile::tempdir().unwrap();
-        let headers = HeaderMap::new();
-        let parsed = parse(
-            Format::FrameV1,
-            &headers,
-            Body::from(frame(&[(0, 0, 2), (2, 1, 1)], b"abc")),
-            root.path().join("valid"),
-            1024,
-        )
-        .await
-        .unwrap();
+        let root = root.path();
+        let parsed = parse_frame(root, "valid", frame(&[(0, 0, 2), (2, 1, 1)], b"abc"))
+            .await
+            .unwrap();
         assert_eq!(parsed.count(), 2);
 
         for count in [MAX_FRAME_DESCRIPTORS - 1, MAX_FRAME_DESCRIPTORS] {
             let descriptors = vec![(0, 0, 0); count];
-            let parsed = parse(
-                Format::FrameV1,
-                &headers,
-                Body::from(frame(&descriptors, b"")),
-                root.path().join(format!("boundary-{count}")),
-                1024,
-            )
-            .await
-            .unwrap();
+            let parsed = parse_frame(root, &format!("boundary-{count}"), frame(&descriptors, b""))
+                .await
+                .unwrap();
             assert_eq!(parsed.count(), count);
         }
 
         let mut flags = frame(&[(0, 0, 0)], b"");
         flags[15] = 1;
         assert!(matches!(
-            parse(
-                Format::FrameV1,
-                &headers,
-                Body::from(flags),
-                root.path().join("flags"),
-                1024,
-            )
-            .await,
+            parse_frame(root, "flags", flags).await,
             Err(ProtocolError::MalformedFrame)
         ));
 
@@ -624,37 +614,16 @@ mod tests {
         );
         count.extend_from_slice(&0_u32.to_be_bytes());
         assert!(matches!(
-            parse(
-                Format::FrameV1,
-                &headers,
-                Body::from(count),
-                root.path().join("count"),
-                1024,
-            )
-            .await,
+            parse_frame(root, "count", count).await,
             Err(ProtocolError::FrameLimit)
         ));
 
         assert!(matches!(
-            parse(
-                Format::FrameV1,
-                &headers,
-                Body::from(frame(&[(0, 0, 2)], b"x")),
-                root.path().join("short"),
-                1024,
-            )
-            .await,
+            parse_frame(root, "short", frame(&[(0, 0, 2)], b"x")).await,
             Err(ProtocolError::PayloadLength)
         ));
         assert!(matches!(
-            parse(
-                Format::FrameV1,
-                &headers,
-                Body::from(frame(&[(0, 0, 1)], b"xy")),
-                root.path().join("trailing"),
-                1024,
-            )
-            .await,
+            parse_frame(root, "trailing", frame(&[(0, 0, 1)], b"xy")).await,
             Err(ProtocolError::PayloadLength)
         ));
     }

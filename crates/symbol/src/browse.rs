@@ -31,23 +31,19 @@ pub fn sites(headers: &HeaderMap, uri: &Uri, query: &ListingQuery, mut list: Sit
         };
     }
     if wants_json(headers) {
-        let mut entries = vec![ListingEntry {
-            kind: ListingKind::Builtin,
-            name: "API".to_string(),
-            files: None,
-            bytes: 0,
-            target: None,
-            target_kind: None,
-            dangling: None,
-        }];
-        entries.extend(list.entries.iter().map(|entry| ListingEntry {
-            kind: ListingKind::Site,
-            name: entry.name.clone(),
-            files: Some(entry.files),
-            bytes: entry.bytes,
-            target: None,
-            target_kind: None,
-            dangling: None,
+        let mut entries = vec![listing_entry(
+            ListingKind::Builtin,
+            "API".to_string(),
+            None,
+            0,
+        )];
+        entries.extend(list.entries.iter().map(|entry| {
+            listing_entry(
+                ListingKind::Site,
+                entry.name.clone(),
+                Some(entry.files),
+                entry.bytes,
+            )
         }));
         return json_response(
             headers,
@@ -60,16 +56,41 @@ pub fn sites(headers: &HeaderMap, uri: &Uri, query: &ListingQuery, mut list: Sit
             },
         );
     }
-    let flavor = page::negotiate(headers);
-    match flavor {
+    negotiated_response(
+        headers,
+        || render_sites_plain(list),
+        || render_sites_html(list, sort),
+    )
+}
+
+const fn listing_entry(
+    kind: ListingKind,
+    name: String,
+    files: Option<u64>,
+    bytes: u64,
+) -> ListingEntry {
+    ListingEntry {
+        kind,
+        name,
+        files,
+        bytes,
+        target: None,
+        target_kind: None,
+        dangling: None,
+    }
+}
+
+/// The plain-text or HTML rendering of a listing, whichever the client prefers.
+fn negotiated_response(
+    headers: &HeaderMap,
+    plain: impl FnOnce() -> String,
+    html: impl FnOnce() -> String,
+) -> Response {
+    match page::negotiate(headers) {
         page::Flavor::Plain | page::Flavor::Man => {
-            let body = render_sites_plain(list);
-            cached_response(headers, body, "text/plain; charset=utf-8")
+            cached_response(headers, plain(), "text/plain; charset=utf-8")
         }
-        page::Flavor::Html => {
-            let body = render_sites_html(list, sort);
-            cached_response(headers, body, "text/html; charset=utf-8")
-        }
+        page::Flavor::Html => cached_response(headers, html(), "text/html; charset=utf-8"),
     }
 }
 
@@ -96,17 +117,13 @@ pub fn listing(
         let mut entries = list
             .entries
             .iter()
-            .map(|entry| ListingEntry {
-                kind: match entry.kind {
+            .map(|entry| {
+                let kind = match entry.kind {
                     EntryKind::Directory => ListingKind::Directory,
                     EntryKind::File => ListingKind::File,
-                },
-                name: entry.name.clone(),
-                files: (entry.kind == EntryKind::Directory).then_some(entry.files),
-                bytes: entry.bytes,
-                target: None,
-                target_kind: None,
-                dangling: None,
+                };
+                let files = (entry.kind == EntryKind::Directory).then_some(entry.files);
+                listing_entry(kind, entry.name.clone(), files, entry.bytes)
             })
             .collect::<Vec<_>>();
         entries.extend(list.aliases.iter().filter_map(|alias| {
@@ -134,17 +151,11 @@ pub fn listing(
             },
         );
     }
-    let flavor = page::negotiate(headers);
-    match flavor {
-        page::Flavor::Plain | page::Flavor::Man => {
-            let body = render_plain(site, rel, list);
-            cached_response(headers, body, "text/plain; charset=utf-8")
-        }
-        page::Flavor::Html => {
-            let body = render_html(site, rel, list, files_view, sort);
-            cached_response(headers, body, "text/html; charset=utf-8")
-        }
-    }
+    negotiated_response(
+        headers,
+        || render_plain(site, rel, list),
+        || render_html(site, rel, list, files_view, sort),
+    )
 }
 
 fn render_sites_plain(list: &SiteList) -> String {
@@ -1248,27 +1259,31 @@ mod tests {
     /// 2025-01-02T03:04:05Z.
     const JAN_2: i64 = 1_735_787_045_000;
 
+    fn site_ent(name: &str, files: u64, bytes: u64, modified: i64) -> SiteEnt {
+        SiteEnt {
+            name: name.to_string(),
+            files,
+            bytes,
+            modified,
+        }
+    }
+
+    /// A site list whose totals are the sums over `entries`.
+    fn site_list(entries: Vec<SiteEnt>) -> SiteList {
+        SiteList {
+            files: entries.iter().map(|entry| entry.files).sum(),
+            alias_count: 0,
+            bytes: entries.iter().map(|entry| entry.bytes).sum(),
+            entries,
+        }
+    }
+
     #[test]
     fn plain_site_sizes_align_ones_places_and_units() {
-        let list = SiteList {
-            files: 11,
-            alias_count: 0,
-            bytes: 4_194_304,
-            entries: vec![
-                SiteEnt {
-                    name: "hello".to_string(),
-                    files: 8,
-                    bytes: 3_774_464,
-                    modified: OCT_6,
-                },
-                SiteEnt {
-                    name: "notes".to_string(),
-                    files: 3,
-                    bytes: 419_840,
-                    modified: SEP_30,
-                },
-            ],
-        };
+        let list = site_list(vec![
+            site_ent("hello", 8, 3_774_464, OCT_6),
+            site_ent("notes", 3, 419_840, SEP_30),
+        ]);
         assert_eq!(
             render_sites_plain(&list),
             concat!(
@@ -1479,17 +1494,7 @@ mod tests {
         assert!(lines.contains(&"directory\t7\t1\tzeta\t\t2025-01-02T03:04:05Z"));
         assert!(lines.contains(&"alias\t\t\tlatest\tb.txt\t2026-10-06T14:03:12Z"));
 
-        let sites = SiteList {
-            files: 1,
-            alias_count: 0,
-            bytes: 1,
-            entries: vec![SiteEnt {
-                name: "hello".to_string(),
-                files: 1,
-                bytes: 1,
-                modified: OCT_6,
-            }],
-        };
+        let sites = site_list(vec![site_ent("hello", 1, 1, OCT_6)]);
         let body = sites_tsv(
             &sites,
             Paging::parse(&query("")).unwrap(),
@@ -1506,17 +1511,7 @@ mod tests {
 
     #[tokio::test]
     async fn files_responses_negotiate_json_and_html() {
-        let list = SiteList {
-            files: 1,
-            alias_count: 0,
-            bytes: 512,
-            entries: vec![SiteEnt {
-                name: "hello".to_string(),
-                files: 1,
-                bytes: 512,
-                modified: OCT_6,
-            }],
-        };
+        let list = site_list(vec![site_ent("hello", 1, 512, OCT_6)]);
         let response = sites(
             &accept("application/json"),
             &Uri::from_static("/FILES"),
@@ -1548,17 +1543,7 @@ mod tests {
 
     #[test]
     fn listing_etag_revalidates_and_changes_with_content() {
-        let mut list = SiteList {
-            files: 1,
-            alias_count: 0,
-            bytes: 5,
-            entries: vec![SiteEnt {
-                name: "hello".to_string(),
-                files: 1,
-                bytes: 5,
-                modified: OCT_6,
-            }],
-        };
+        let mut list = site_list(vec![site_ent("hello", 1, 5, OCT_6)]);
         let response = sites(
             &HeaderMap::new(),
             &Uri::from_static("/FILES"),

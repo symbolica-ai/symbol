@@ -51,65 +51,96 @@ pub enum TokenParseError {
     InvalidEncoding,
 }
 
-impl ManagementToken {
-    /// Generates a token using the operating system's cryptographic random source.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the operating system cannot provide random bytes.
-    pub fn generate() -> Result<Self, getrandom::Error> {
-        random_bytes().map(Self)
-    }
+/// Implements the parse, encode, hash, verify and redacted-`Debug` surface that
+/// every token kind shares; only the type names, prefix and hash context differ.
+macro_rules! impl_token {
+    ($token:ident, $hash:ident, $label:literal, $prefix:expr, $context:expr) => {
+        impl $token {
+            /// Generates a token using the operating system's cryptographic random source.
+            ///
+            /// # Errors
+            ///
+            /// Returns an error when the operating system cannot provide random bytes.
+            pub fn generate() -> Result<Self, getrandom::Error> {
+                random_bytes().map(Self)
+            }
 
-    /// Parses a canonical management token.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for a wrong prefix, wrong payload length, or non-lowercase-hex payload.
-    pub fn parse(encoded: &str) -> Result<Self, TokenParseError> {
-        parse_payload(encoded, MANAGEMENT_TOKEN_PREFIX).map(Self)
-    }
+            #[doc = concat!("Parses a canonical ", $label, " token.")]
+            ///
+            /// # Errors
+            ///
+            /// Returns an error for a wrong prefix, wrong payload length, or non-lowercase-hex payload.
+            pub fn parse(encoded: &str) -> Result<Self, TokenParseError> {
+                parse_payload(encoded, $prefix).map(Self)
+            }
 
-    #[must_use]
-    pub fn encode(&self) -> String {
-        encode_token(MANAGEMENT_TOKEN_PREFIX, &self.0)
-    }
+            #[must_use]
+            pub fn encode(&self) -> String {
+                encode_token($prefix, &self.0)
+            }
 
-    #[must_use]
-    pub fn hash(&self) -> ManagementTokenHash {
-        ManagementTokenHash(blake3::derive_key(MANAGEMENT_HASH_CONTEXT, &self.0))
-    }
+            #[must_use]
+            pub fn hash(&self) -> $hash {
+                $hash(blake3::derive_key($context, &self.0))
+            }
+        }
+
+        impl $hash {
+            #[must_use]
+            pub fn verify(&self, candidate: &$token) -> bool {
+                self.0.ct_eq(&candidate.hash().0).into()
+            }
+
+            #[must_use]
+            pub const fn as_bytes(&self) -> &[u8; 32] {
+                &self.0
+            }
+
+            #[must_use]
+            pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+                Self(bytes)
+            }
+        }
+
+        impl FromStr for $token {
+            type Err = TokenParseError;
+
+            fn from_str(encoded: &str) -> Result<Self, Self::Err> {
+                Self::parse(encoded)
+            }
+        }
+
+        impl fmt::Debug for $token {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter
+                    .debug_tuple(stringify!($token))
+                    .field(&Redacted)
+                    .finish()
+            }
+        }
+
+        impl fmt::Debug for $hash {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(concat!(stringify!($hash), "([REDACTED])"))
+            }
+        }
+    };
 }
 
-impl ClaimToken {
-    /// Generates a token using the operating system's cryptographic random source.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the operating system cannot provide random bytes.
-    pub fn generate() -> Result<Self, getrandom::Error> {
-        random_bytes().map(Self)
-    }
-
-    /// Parses a canonical claim token.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for a wrong prefix, wrong payload length, or non-lowercase-hex payload.
-    pub fn parse(encoded: &str) -> Result<Self, TokenParseError> {
-        parse_payload(encoded, CLAIM_TOKEN_PREFIX).map(Self)
-    }
-
-    #[must_use]
-    pub fn encode(&self) -> String {
-        encode_token(CLAIM_TOKEN_PREFIX, &self.0)
-    }
-
-    #[must_use]
-    pub fn hash(&self) -> ClaimTokenHash {
-        ClaimTokenHash(blake3::derive_key(CLAIM_HASH_CONTEXT, &self.0))
-    }
-}
+impl_token!(
+    ManagementToken,
+    ManagementTokenHash,
+    "management",
+    MANAGEMENT_TOKEN_PREFIX,
+    MANAGEMENT_HASH_CONTEXT
+);
+impl_token!(
+    ClaimToken,
+    ClaimTokenHash,
+    "claim",
+    CLAIM_TOKEN_PREFIX,
+    CLAIM_HASH_CONTEXT
+);
 
 #[cfg(test)]
 impl Token {
@@ -145,80 +176,12 @@ impl Token {
     }
 }
 
-impl ManagementTokenHash {
-    #[must_use]
-    pub fn verify(&self, candidate: &ManagementToken) -> bool {
-        self.0.ct_eq(&candidate.hash().0).into()
-    }
-
-    #[must_use]
-    pub const fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
-
-    #[must_use]
-    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
-        Self(bytes)
-    }
-}
-
-impl ClaimTokenHash {
-    #[must_use]
-    pub fn verify(&self, candidate: &ClaimToken) -> bool {
-        self.0.ct_eq(&candidate.hash().0).into()
-    }
-
-    #[must_use]
-    pub const fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
-
-    #[must_use]
-    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
-        Self(bytes)
-    }
-}
-
-impl FromStr for ManagementToken {
-    type Err = TokenParseError;
-
-    fn from_str(encoded: &str) -> Result<Self, Self::Err> {
-        Self::parse(encoded)
-    }
-}
-
-impl FromStr for ClaimToken {
-    type Err = TokenParseError;
-
-    fn from_str(encoded: &str) -> Result<Self, Self::Err> {
-        Self::parse(encoded)
-    }
-}
-
 #[cfg(test)]
 impl FromStr for Token {
     type Err = TokenParseError;
 
     fn from_str(encoded: &str) -> Result<Self, Self::Err> {
         Self::parse(encoded)
-    }
-}
-
-impl fmt::Debug for ManagementToken {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_tuple("ManagementToken")
-            .field(&Redacted)
-            .finish()
-    }
-}
-
-impl fmt::Debug for ClaimToken {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_tuple("ClaimToken")
-            .field(&Redacted)
-            .finish()
     }
 }
 
@@ -229,18 +192,6 @@ impl fmt::Debug for Token {
             Self::Management(token) => token.fmt(formatter),
             Self::Claim(token) => token.fmt(formatter),
         }
-    }
-}
-
-impl fmt::Debug for ManagementTokenHash {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("ManagementTokenHash([REDACTED])")
-    }
-}
-
-impl fmt::Debug for ClaimTokenHash {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("ClaimTokenHash([REDACTED])")
     }
 }
 
