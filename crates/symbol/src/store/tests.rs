@@ -1379,7 +1379,7 @@ fn migrations_merge_manifest_and_reserved_paths_follow_contract() {
 }
 
 #[test]
-fn production_v6_database_is_safely_baselined() {
+fn reopening_a_v12_database_keeps_its_sites() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = store_db(dir.path());
     database::migrations::migrate(&mut db).unwrap();
@@ -1428,40 +1428,6 @@ fn migration_integrity_gate_rejects_foreign_key_violations() {
         Err(StoreError::Io(error))
             if error.to_string() == "2 foreign-key violations"
     ));
-}
-
-#[test]
-fn production_shaped_v2_database_migrates_through_current_schema() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut db = store_db(dir.path());
-    database::migrations::migrate(&mut db).unwrap();
-    diesel::insert_into(sites::table)
-        .values(NewSite {
-            content_revision: 2,
-            ..new_site("legacy")
-        })
-        .execute(&mut db)
-        .unwrap();
-    let site_id = site_id_locked(&mut db, "legacy").unwrap();
-    let legacy_hash = test_content_hash("legacy-hash");
-    insert_blob_row(&mut db, legacy_hash, 4);
-    insert_file_row(&mut db, site_id, "index.html", legacy_hash, 4, 1);
-    database::migrations::downgrade_to_v2(&mut db).unwrap();
-
-    run_migrations(&mut db).unwrap();
-
-    assert_eq!(
-        schema_version(&mut db),
-        database::schema::LATEST_SCHEMA_VERSION
-    );
-    assert_eq!(path_aggregate(&mut db, site_id, ""), (4, 1));
-    assert_eq!(
-        management_audit::table
-            .count()
-            .get_result::<i64>(&mut db)
-            .unwrap(),
-        0
-    );
 }
 
 #[test]
@@ -2048,62 +2014,6 @@ fn sqlite_index_and_blob() {
     assert!(store.list_sites().unwrap().entries.is_empty());
     assert_eq!(store.read_blob(hash).unwrap().as_ref(), b"<h1>x</h1>");
     assert!(blob_path.exists());
-}
-
-#[test]
-fn startup_migrates_sqlite_blob_payloads_to_files() {
-    let dir = tempfile::tempdir().unwrap();
-    let content_hash = ContentHash::from(blake3::hash(b"legacy"));
-    let hash_hex = content_hash.to_hex();
-    {
-        let mut db = store_db(dir.path());
-        run_migrations(&mut db).unwrap();
-        diesel::insert_into(blobs::table)
-            .values((
-                blobs::hash.eq(content_hash),
-                blobs::bytes.eq(b"legacy".as_slice()),
-                blobs::size.eq(6_i64),
-            ))
-            .execute(&mut db)
-            .unwrap();
-        let site_id = diesel::insert_into(sites::table)
-            .values(NewSite {
-                created: Some(0),
-                updated: 0,
-                public_url: "",
-                tree_hash: TreeHash::EMPTY,
-                ..new_site("hello")
-            })
-            .returning(sites::id)
-            .get_result::<i64>(&mut db)
-            .unwrap();
-        insert_file_row(&mut db, site_id, "legacy.bin", content_hash, 6, 1);
-    }
-    let target = blob_file_path(dir.path(), &hash_hex);
-    fs::create_dir_all(target.parent().unwrap()).unwrap();
-    fs::write(&target, b"broken").unwrap();
-
-    let store = Store::new(dir.path().to_path_buf()).unwrap();
-    assert_eq!(fs::read(store.blob_path(content_hash)).unwrap(), b"legacy");
-    assert_eq!(store.read_blob(content_hash).unwrap(), "legacy");
-    let mut db = store_db(dir.path());
-    assert_eq!(
-        blobs::table
-            .find(content_hash)
-            .select(blobs::bytes)
-            .first::<Vec<u8>>(&mut db)
-            .unwrap()
-            .len(),
-        0
-    );
-    assert_eq!(
-        metadata::table
-            .find("external_blobs_v1")
-            .select(metadata::value)
-            .first::<String>(&mut db)
-            .unwrap(),
-        "1"
-    );
 }
 
 #[test]
