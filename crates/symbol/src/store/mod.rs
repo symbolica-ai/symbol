@@ -38,7 +38,7 @@ use crate::pathutil::{PathError, is_junk, is_noise_path, safe_rel_path};
 use crate::sanitize::{self, TokenCounts};
 use crate::schema::{
     aliases, allocated_entries, blobs, expiry_policies, files, idempotency_records,
-    management_audit, management_idempotency, management_tombstones, metadata, path_aggregates,
+    management_audit, management_idempotency, management_tombstones, path_aggregates,
     pending_allocations, site_entries, site_events, sites, undo_alias_deltas,
     undo_allocated_deltas, undo_expiry_policies, undo_file_deltas, undo_files, undo_names,
     undo_operations, undo_sites,
@@ -809,14 +809,8 @@ impl Store {
             }),
         };
         store
-            .migrate_sqlite_blobs()
-            .map_err(|error| StoreError::startup("migrate SQLite blobs", error))?;
-        store
             .restore_quarantined_blob_files()
             .map_err(|error| StoreError::startup("restore quarantined blobs", error))?;
-        store
-            .migrate_legacy()
-            .map_err(|error| StoreError::startup("migrate legacy sites", error))?;
         store
             .backfill_manifests()
             .map_err(|error| StoreError::startup("backfill manifests", error))?;
@@ -1428,134 +1422,6 @@ impl Store {
         Ok(())
     }
 
-    fn migrate_sqlite_blobs(&self) -> Result<(), StoreError> {
-        let mut db = self.inner.writer.lock().unwrap();
-        let migrated = metadata::table
-            .find("external_blobs_v1")
-            .select(metadata::key)
-            .first::<String>(&mut *db)
-            .optional()?
-            .is_some();
-        if migrated {
-            return Ok(());
-        }
-
-        {
-            // Read the index first and fetch payloads one at a time. Selecting
-            // `bytes` for every row at once would hold the entire legacy inline
-            // blob store in memory, which is exactly the size problem this
-            // migration exists to fix.
-            let index = blobs::table
-                .select((blobs::hash, blobs::size))
-                .order(blobs::hash)
-                .load::<(ContentHash, i64)>(&mut *db)?;
-            for (hash, size) in index {
-                let bytes = blobs::table
-                    .find(hash)
-                    .select(blobs::bytes)
-                    .first::<Vec<u8>>(&mut *db)?;
-                if i64::try_from(bytes.len()).expect("blob size fits in i64") != size
-                    || ContentHash::from(blake3::hash(&bytes)) != hash
-                {
-                    return Err(StoreError::invalid_data(format!(
-                        "corrupt SQLite blob {hash}"
-                    )));
-                }
-                self.inner.blob_files.put_bytes(hash, &bytes)?;
-            }
-        }
-
-        let mut tx = DbTransaction::begin(&mut db)?;
-        diesel::update(blobs::table)
-            .set(blobs::bytes.eq(Vec::<u8>::new()))
-            .execute(&mut *tx)?;
-        diesel::insert_into(metadata::table)
-            .values((
-                metadata::key.eq("external_blobs_v1"),
-                metadata::value.eq("1"),
-            ))
-            .execute(&mut *tx)?;
-        tx.commit()?;
-        if let Err(err) = db.batch_execute("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;") {
-            tracing::warn!(%err, "blob migration succeeded but database compaction failed");
-        }
-        drop(db);
-        Ok(())
-    }
-
-    fn migrate_legacy(&self) -> Result<(), StoreError> {
-        {
-            let mut db = self.inner.writer.lock().unwrap();
-            let n = sites::table.select(count_star()).first::<i64>(&mut *db)?;
-            drop(db);
-            if n > 0 {
-                return Ok(());
-            }
-        }
-        let catalog = self.inner.root.join("catalog.json");
-        if catalog.is_file() {
-            self.migrate_json(&catalog)?;
-            return Ok(());
-        }
-        let legacy = self.inner.root.join("sites");
-        if legacy.is_dir() {
-            self.migrate_tree(&legacy)?;
-        }
-        Ok(())
-    }
-
-    fn migrate_json(&self, path: &Path) -> Result<(), StoreError> {
-        #[derive(serde::Deserialize)]
-        struct DiskCatalog {
-            sites: Vec<DiskSite>,
-        }
-        #[derive(serde::Deserialize)]
-        struct DiskSite {
-            name: String,
-            files: Vec<DiskFile>,
-        }
-        #[derive(serde::Deserialize)]
-        struct DiskFile {
-            path: String,
-            hash: String,
-        }
-        let parsed: DiskCatalog =
-            serde_json::from_slice(&fs::read(path)?).map_err(StoreError::invalid_data)?;
-        for site in parsed.sites {
-            let mut staged = Vec::new();
-            for file in site.files {
-                let blob = self
-                    .inner
-                    .root
-                    .join("blobs")
-                    .join(&file.hash[..2])
-                    .join(&file.hash[2..]);
-                let bytes = fs::read(blob)?;
-                staged.push(stage_bytes(&file.path, &bytes));
-            }
-            self.commit_site(&site.name, &staged)?;
-        }
-        Ok(())
-    }
-
-    fn migrate_tree(&self, dir: &Path) -> Result<(), StoreError> {
-        for entry in fs::read_dir(dir)? {
-            let entry = entry?;
-            if !entry.file_type()?.is_dir() {
-                continue;
-            }
-            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-                continue;
-            };
-            if parse_site_name(&name).is_err() {
-                continue;
-            }
-            let staged = stage_dir(&entry.path())?;
-            self.commit_site(&name, &staged)?;
-        }
-        Ok(())
-    }
-
     fn backfill_manifests(&self) -> Result<(), StoreError> {
         let now = self.now_millis();
         self.write_plain(|tx| {
@@ -1727,17 +1593,7 @@ struct ExpiryPolicyWrite<'a> {
 }
 
 fn run_migrations(db: &mut SqliteConnection) -> Result<(), StoreError> {
-    let outcome = database::migrations::migrate(db)
-        .map_err(|error| StoreError::Migration(Box::new(error)))?;
-    if outcome.upgraded_from_v2 {
-        db.transaction::<_, StoreError, _>(|connection| {
-            let site_ids = sites::table.select(sites::id).load::<i64>(connection)?;
-            for site_id in site_ids {
-                rebuild_aggregates_locked(connection, site_id)?;
-            }
-            Ok(())
-        })?;
-    }
+    database::migrations::migrate(db).map_err(|error| StoreError::Migration(Box::new(error)))?;
     let integrity = diesel::sql_query("PRAGMA integrity_check")
         .get_result::<IntegrityCheck>(db)?
         .integrity_check;

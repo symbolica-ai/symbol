@@ -31,7 +31,6 @@ subtle = "2.6.1"
 symbol-contract = { path = "../symbol-contract" }
 diesel = { version = "2.3.12", features = ["sqlite", "returning_clauses_for_sqlite_3_35"] }
 libsqlite3-sys = { version = "0.38.2", features = ["bundled"] }
-sea-query = { version = "1.0.2", features = ["backend-sqlite", "derive"], default-features = false }
 pulldown-cmark = { version = "0.13.4", default-features = false, features = ["html"] }
 toml = "1.1.4"
 saphyr = { version = "0.1.0", default-features = false }
@@ -100,6 +99,8 @@ blake3 = "1"
 lightningcss = { version = "1.0.0-alpha.72", default-features = false }
 maud = "0.27.0"
 pulldown-cmark = "0.13.4"
+# No longer used by build.rs, but build-dependencies feed the API ledger's generator
+# fingerprint, so dropping this needs a ledger bump (`./api-version update`).
 sea-query = { version = "1.0.2", default-features = false, features = ["backend-sqlite", "derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

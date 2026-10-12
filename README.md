@@ -81,22 +81,24 @@ SQLite stores sites, paths, hashes, sizes, and other metadata in
 `SYMBOL_ROOT/blobs/`; transient uploads use `SYMBOL_ROOT/tmp/`.
 
 Startup enables WAL, normal synchronous mode, foreign keys, and a five-second
-SQLite busy timeout. The canonical schema and versioned migrations are typed
-Rust/SeaQuery definitions under `crates/symbol/src/database/`; `schema.sql` is
-their generated inspection snapshot and is never executed as migration input.
-Migrations run automatically through schema version 6, followed by an
-integrity check. Startup also:
+SQLite busy timeout. The schema is the hand-maintained SQL in
+`crates/symbol/src/database/schema.v12.sql`; `schema.sql` is a byte-identical
+inspection snapshot that the build checks and that is never executed. A fresh
+database is created at schema version 12, and each database records the hash of
+the schema it was created with, so startup fails if that text has drifted.
+Startup then runs an integrity check and:
 
-- migrates legacy inline SQLite BLOBs to external blob files and verifies
-  their size and Blake3 hash;
-- imports the legacy catalog when present;
+- restores blob files from quarantine after an interrupted deletion;
 - removes known OS metadata, rebuilds generated `symbol.toml` manifests,
   sweeps expired targets, prunes undo/idempotency records, and removes
   unreferenced blob files.
 
-Migration deliberately fails on unsupported schema versions, failed integrity,
-or pre-existing paths that now collide with reserved control names. Back up
-before upgrading; there is no downgrade migration.
+This build does not upgrade older databases: a database below schema version 12
+is refused at startup with an error. To upgrade one, first run a build at or
+before commit `5098872`, which migrates it to version 12, then switch to this
+build. Startup also fails on a version it does not know, a failed integrity
+check, or pre-existing paths that now collide with reserved control names.
+Back up before upgrading; there is no downgrade migration.
 
 ## Backup
 

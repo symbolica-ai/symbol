@@ -1537,10 +1537,6 @@ impl Store {
         })
     }
 
-    pub(super) fn commit_site(&self, name: &str, files: &[StagedFile]) -> Result<(), StoreError> {
-        self.merge_staged(name, files, UndoKind::Put).map(|_| ())
-    }
-
     #[expect(clippy::large_types_passed_by_value)]
     pub(super) fn publish_staged(
         &self,
@@ -1669,6 +1665,7 @@ impl Store {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn merge_staged(
         &self,
         name: &str,
