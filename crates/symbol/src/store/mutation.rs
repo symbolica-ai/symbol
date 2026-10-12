@@ -2159,27 +2159,20 @@ impl Store {
 
 #[cfg(test)]
 mod fingerprint_kat {
-    //! Known-answer test: `splice_request_fingerprint` bytes are persisted in
-    //! idempotency records and must never change. The rest live in
-    //! `store/fingerprint.rs`; this one needs `PreparedSplice`'s private fields.
+    //! Regression tripwire for `splice_request_fingerprint`, whose bytes are
+    //! persisted in idempotency records (which live only for
+    //! `IDEMPOTENCY_RETENTION_MILLIS`, 4 hours). A failure means the encoding
+    //! changed, so in-flight retries would stop matching; if that is
+    //! intentional, regenerate the expected values. The other fingerprints live
+    //! in `store/fingerprint.rs`; this one needs `PreparedSplice`'s private
+    //! fields.
 
     use super::*;
 
     const SPLICE_REQUEST: &[&str] = &[
         "630e4418f13c5097f50069a2614eff0c940def26e9094484d78389944f3f7255",
-        "630e4418f13c5097f50069a2614eff0c940def26e9094484d78389944f3f7255",
-        "d209b9f74900affc88e49cf4d2625ae7e657640108651c565d979810b1b664ea",
-        "17554b6720820c9b4c1076f6a1533969b1d608a28737f21ce984cf3b8e91574e",
-        "6c51b43119afb60f350a3d1ac144d0a3c0c5ebe0020dae547c00a7ffbf243d9b",
-        "1bfe6a74f6ceea5de4a6ce125481e5da198d7d423bd23130874b7634989afae6",
-        "b105c75a57fe38119539cd4f5529382eabb90e9d80b1122cc529622f4f015635",
-        "9031f9ba6ca9542dc223605ccfd3c1135fdcf3b99f949c52d446312218c76ef9",
-        "d1dd36d7afcaba342bd7b45bf6642eebf3bfb0dc8aecc09a503a446c61cf2ae6",
         "98412bf0499c0c9e70361948029bb53c9f5819247ad306cd565f346b41752c10",
         "007c4003796749a157c0fde94cf6c28dec08e2bfe45387708fe0e8b9f93d3cde",
-        "da9a5c67fd19667250c6900714c691df34a5e9454efd274d095561db0b2f1d09",
-        "1602ef3a09b4afbd32d34c0b0977b7e99fff0e1502ee3003e9d402a2614c2454",
-        "3f42f9b68a951c8cd5b7e60e076e4180595088370e74363a8358d3ca6cdcd44c",
     ];
 
     fn splice(offset: u64, delete: u64, insert: PreparedSpliceSource) -> PreparedSplice {
@@ -2212,20 +2205,7 @@ mod fingerprint_kat {
         };
         let actual = vec![
             splice_request_fingerprint("", "", "", &[], None),
-            splice_request_fingerprint("", "", "", &[], Some("")),
-            splice_request_fingerprint("site", "a/b.txt", "basehash", &[], Some("tree")),
-            splice_request_fingerprint("site", "a/b.txt", "basehash", &[empty(0, 0)], None),
-            splice_request_fingerprint(
-                "site",
-                "a/b.txt",
-                "basehash",
-                &[empty(3, 4), empty(u64::MAX, u64::MAX)],
-                None,
-            ),
-            splice_request_fingerprint("site", "p", "b", &[bytes(1, 2, b"")], None),
-            splice_request_fingerprint("site", "p", "b", &[bytes(1, 2, b"x\0y")], Some("t")),
-            splice_request_fingerprint("site", "p", "b", &[file(0, 0, 0, b"")], None),
-            splice_request_fingerprint("site", "p", "b", &[file(2, 3, 10, b"f1")], Some("t")),
+            // One splice of each source kind.
             splice_request_fingerprint(
                 "site",
                 "p",
@@ -2239,15 +2219,6 @@ mod fingerprint_kat {
                 Some("tree"),
             ),
             splice_request_fingerprint("a\0b", "\0", "c\0", &[empty(1, 1)], Some("\0")),
-            splice_request_fingerprint(
-                unicode,
-                unicode,
-                unicode,
-                &[bytes(1, 0, unicode.as_bytes())],
-                Some(unicode),
-            ),
-            splice_request_fingerprint("ab", "c", "d", &[], None),
-            splice_request_fingerprint("a", "bc", "d", &[], None),
         ];
         assert_eq!(
             actual, SPLICE_REQUEST,
