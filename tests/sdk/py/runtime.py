@@ -690,6 +690,231 @@ def test_retry_policy_applies_to_sync_and_async_transports() -> None:
     asyncio.run(check_async())
 
 
+JSON = (("Content-Type", "application/json"),)
+
+
+def search_hit(kind: str, path: str, *, site: str = "nlab") -> dict[str, object]:
+    directory = kind == "directory"
+    return {
+        "kind": kind,
+        "site": site,
+        "path": path,
+        "name": path.rpartition("/")[2],
+        "url": f"/{site}/{path}" + ("/" if directory else ""),
+        "files": 1 if directory else None,
+        "bytes": 14,
+        "modified": "2026-10-06T14:03:12Z" if directory else None,
+    }
+
+
+def search_payload(
+    hits: list[dict[str, object]],
+    *,
+    total: int | None = None,
+    page: int = 1,
+    limit: int = 50,
+    site: str | None = None,
+    path: str | None = None,
+) -> dict[str, object]:
+    return {
+        "query": "topos",
+        "site": site,
+        "path": path,
+        "total": len(hits) if total is None else total,
+        "page": page,
+        "limit": limit,
+        "results": hits,
+    }
+
+
+def test_search_sync_and_async() -> None:
+    backend = Backend()
+    symbol = api.Symbol(api.HttpClient.wrap(backend), origin="http://symbol")
+
+    backend.queue(
+        200,
+        search_payload(
+            [search_hit("directory", "topos"), search_hit("file", "a/topos.txt")]
+        ),
+        JSON,
+    )
+    results = symbol.search("topos")
+    assert isinstance(results, api.SearchResults)
+    assert (results.query, results.site, results.path) == ("topos", None, None)
+    assert (results.total, results.page, results.limit) == (2, 1, 50)
+    folder, file = results.results
+    assert isinstance(folder, api.SearchHit)
+    assert (folder.kind, folder.url, folder.files) == ("directory", "/nlab/topos/", 1)
+    assert folder.modified is not None and folder.modified.tzinfo is not None
+    assert (file.kind, file.name, file.files, file.modified) == (
+        "file",
+        "topos.txt",
+        None,
+        None,
+    )
+    request = backend.requests[-1]
+    assert (request.method, request.url) == ("GET", "http://symbol/SEARCH?q=topos")
+    assert ("Accept", "application/json") in request.headers
+
+    backend.queue(
+        200,
+        search_payload([], page=3, limit=10, site="my site", path="a b/"),
+        JSON,
+    )
+    scoped = symbol.site("my site").search("topos *.txt", path="a b", limit=10, page=3)
+    assert scoped.results == () and scoped.path == "a b/"
+    assert backend.requests[-1].url == (
+        "http://symbol/SEARCH?q=topos%20%2A.txt&site=my%20site&path=a%20b"
+        "&limit=10&page=3"
+    )
+
+    backend.queue(
+        200,
+        search_payload(
+            [search_hit("file", "1"), search_hit("file", "2")], total=3, limit=2
+        ),
+        JSON,
+    )
+    backend.queue(
+        200,
+        search_payload([search_hit("file", "3")], total=3, page=2, limit=2),
+        JSON,
+    )
+    hits = symbol.site("nlab").search_all("topos", limit=2)
+    assert len(backend.requests) == 2  # lazy until iterated
+    assert [hit.path for hit in hits] == ["1", "2", "3"]
+    assert [request.url for request in backend.requests[-2:]] == [
+        "http://symbol/SEARCH?q=topos&site=nlab&limit=2&page=1",
+        "http://symbol/SEARCH?q=topos&site=nlab&limit=2&page=2",
+    ]
+
+    for call in (
+        lambda: symbol.search("  "),
+        lambda: symbol.search("x", path="docs/"),
+        lambda: symbol.search("x", limit=0),
+        lambda: symbol.search("x", limit=1001),
+        lambda: symbol.site("nlab").search("x", page=0),
+        lambda: symbol.search_all(""),
+        lambda: symbol.search_all("x", path="docs"),
+        lambda: symbol.site("nlab").search_all("x", limit=0),
+    ):
+        try:
+            call()
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid search arguments were sent")
+    assert len(backend.requests) == 4
+
+    for payload in (
+        {**search_payload([]), "extra": 1},
+        search_payload([{**search_hit("file", "x"), "files": 2}]),
+        search_payload([{**search_hit("directory", "x"), "files": None}]),
+        search_payload([{**search_hit("file", "x"), "kind": "alias"}]),
+        search_payload([{**search_hit("file", "x"), "modified": "yesterday"}]),
+    ):
+        backend.queue(200, payload, JSON)
+        try:
+            symbol.search("topos")
+        except api.MalformedResponseError:
+            pass
+        else:
+            raise AssertionError(f"malformed search response was accepted: {payload}")
+
+    backend.queue(404, b"error: site not found\n", (("Content-Type", "text/plain"),))
+    try:
+        symbol.site("missing").search("topos")
+    except api.NotFoundError as error:
+        assert str(error) == "error: site not found"
+    else:
+        raise AssertionError("unknown search site was not typed")
+
+    backend.queue(503, b"retry")
+    backend.queue(200, search_payload([search_hit("file", "x")]), JSON)
+    try:
+        symbol.search("topos")
+    except api.ServerError as error:
+        retried = error.retry(api.RetryPolicy(max_attempts=1))
+        assert isinstance(retried, api.SearchResults)
+        assert retried.results[0].path == "x"
+    else:
+        raise AssertionError("search retry fixture did not fail")
+
+    class PagedAsyncBackend(AsyncBackend):
+        def __init__(self, pages: list[dict[str, object]]) -> None:
+            super().__init__(api.ApiResponse(500, IDENTITY, b"unused"))
+            self.pages = pages
+
+        async def request(self, request: api.AsyncApiRequest) -> api.ApiResponse:
+            self.requests.append(request)
+            if not self.pages:
+                return self.response
+            return api.ApiResponse(
+                200,
+                IDENTITY + JSON,
+                json.dumps(self.pages.pop(0), separators=(",", ":")).encode(),
+            )
+
+    async def check_async() -> None:
+        pages = [
+            search_payload(
+                [search_hit("directory", "a"), search_hit("file", "b")],
+                total=3,
+                limit=2,
+            ),
+            search_payload([search_hit("file", "c")], total=3, page=2, limit=2),
+        ]
+        async_backend = PagedAsyncBackend(pages)
+        async_symbol = api.Symbol(
+            api.AsyncHttpClient.wrap(async_backend), origin="http://symbol"
+        )
+        hits = [hit async for hit in async_symbol.search_all("topos", limit=2)]
+        assert [(hit.kind, hit.path) for hit in hits] == [
+            ("directory", "a"),
+            ("file", "b"),
+            ("file", "c"),
+        ]
+        assert [request.url for request in async_backend.requests] == [
+            "http://symbol/SEARCH?q=topos&limit=2&page=1",
+            "http://symbol/SEARCH?q=topos&limit=2&page=2",
+        ]
+
+        pages.append(search_payload([], site="nlab", path="docs/"))
+        scoped = await async_symbol.site("nlab").search("topos", path="docs")
+        assert (scoped.site, scoped.path, scoped.results) == ("nlab", "docs/", ())
+        assert async_backend.requests[-1].url == (
+            "http://symbol/SEARCH?q=topos&site=nlab&path=docs"
+        )
+
+        try:
+            await async_symbol.search("x", path="docs")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("async search sent a path without a site")
+        try:
+            async_symbol.site("nlab").search_all("x", limit=1001)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("async search_all accepted an invalid limit")
+        assert len(async_backend.requests) == 3
+
+        async_backend.response = api.ApiResponse(
+            400,
+            IDENTITY + (("Content-Type", "text/plain"),),
+            b"error: q must have at most 16 words\n",
+        )
+        try:
+            await async_symbol.search("topos")
+        except api.ValidationError as error:
+            assert "16 words" in str(error)
+        else:
+            raise AssertionError("async search validation error was not typed")
+
+    asyncio.run(check_async())
+
+
 def test_streaming_bodies_are_lazy_and_closeable() -> None:
     try:
         api._async_body(pathlib.Path("/sync-path-is-not-an-async-source"))
@@ -853,10 +1078,11 @@ def main() -> None:
     test_sync_async_public_method_parity()
     test_malformed_responses_and_typed_errors()
     test_retry_policy_applies_to_sync_and_async_transports()
+    test_search_sync_and_async()
     test_streaming_bodies_are_lazy_and_closeable()
     test_async_splice_insertions_never_read_synchronous_sources()
     asyncio.run(test_async_factory())
-    print("SDK Python runtime: 10 tests")
+    print("SDK Python runtime: 11 tests")
 
 
 if __name__ == "__main__":

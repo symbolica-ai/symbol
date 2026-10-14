@@ -17,6 +17,9 @@ import {
   MediaType,
   Operation,
   RetryPolicies,
+  type SearchHit,
+  type SearchResults,
+  type ServerError,
   type SiteCreationReceipt,
   type SpliceReceipt,
   type SymbolApiVersion,
@@ -56,6 +59,16 @@ const splice: Operation<SpliceReceipt> = site
     { offset: 0, deleteBytes: 0, insert: new Uint8Array([1]) },
     { baseHash: "a".repeat(64), format: "headers" },
   );
+const search: Operation<SearchResults> = client.search("topos", {
+  site: "hello",
+  path: "notes",
+  limit: 10,
+  page: 2,
+  signal: new AbortController().signal,
+});
+const siteSearch: Operation<SearchResults> = site.search("topos", { path: "notes", page: 1 });
+const searchHits: AsyncIterable<SearchHit> = client.searchAll("topos", { limit: 1000 });
+const siteSearchHits: AsyncIterable<SearchHit> = site.searchAll("topos", { path: "notes" });
 
 type _InventoryExact = Expect<NoOptional<FileInventory>>;
 type _StatsExact = Expect<NoOptional<SymbolStats>>;
@@ -65,6 +78,12 @@ type _SpliceExact = Expect<NoOptional<SpliceReceipt>>;
 type _ExpiryExact = Expect<NoOptional<ExpiryReport>>;
 type _ApiVersionExact = Expect<NoOptional<SymbolApiVersion>>;
 type _RawErrors = Expect<Equal<EndpointError<"file raw">, EndpointError<"site file">>>;
+type _SearchExact = Expect<NoOptional<SearchResults>>;
+type _SearchHitExact = Expect<NoOptional<SearchHit>>;
+type _SearchHitKinds = Expect<Equal<SearchHit["kind"], "directory" | "file">>;
+type _SearchErrors = Expect<
+  Equal<EndpointError<"search">, EndpointError<"site redirect"> | ServerError>
+>;
 
 const raw: Operation<DisposableResponse> = site
   .file("notes.md")
@@ -131,6 +150,22 @@ async function narrowing(): Promise<void> {
 
   const hosted = await site.file("config.json").json<{ enabled: boolean }>();
   hosted.enabled.valueOf();
+
+  const page = await search;
+  const next: number | null = page.nextPage;
+  const scope: string | null = page.path;
+  void next;
+  void scope;
+  for await (const hit of searchHits) {
+    hit.url.pathname.toUpperCase();
+    hit.modified?.toISOString();
+    if (hit.kind === "directory") {
+      hit.files.toFixed();
+    } else {
+      const none: null = hit.files;
+      void none;
+    }
+  }
 }
 
 const media = MediaType.application("problem+json", [["profile", "example"]]);
@@ -168,6 +203,14 @@ site.file("notes.md").rawUrl = new URL("http://127.0.0.1:4340/other/RAW");
 client.apiClient("api.rb");
 // @ts-expect-error manuals are a closed set.
 client.apiManual("ruby");
+// @ts-expect-error searchAll follows every page itself.
+client.searchAll("topos", { page: 2 });
+// @ts-expect-error site searches are fixed to their site.
+site.search("topos", { site: "other" });
+// @ts-expect-error search limits are numbers.
+client.search("topos", { limit: "10" });
+// @ts-expect-error search results are readonly.
+(stats as unknown as SearchResults).results = [];
 
 void inventory;
 void version;
@@ -179,5 +222,7 @@ void apiManual;
 void markdownGuide;
 void alias;
 void splice;
+void siteSearch;
+void siteSearchHits;
 void rawUrl;
 void narrowing;

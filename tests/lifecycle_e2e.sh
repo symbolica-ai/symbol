@@ -640,6 +640,51 @@ curl -fsSL "${BASE}/e2e-replace/symbol.toml" >/dev/null ||
   fail "one undo restores B after replace"
 ok "put --replace prunes missing paths and one undo restores them"
 
+mkdir -p "${ROOT}/work/search-src/notes" "${ROOT}/work/search-src/topos"
+printf 'notes\n' >"${ROOT}/work/search-src/notes/Topos Notes.md"
+printf '<h1>topos</h1>\n' >"${ROOT}/work/search-src/topos/index.html"
+printf 'readme\n' >"${ROOT}/work/search-src/readme.txt"
+"${CLIENT}" put e2e-search "${ROOT}/work/search-src" >/dev/null
+found=$("${CLIENT}" search -s e2e-search topos) || fail "search finds live hits"
+[ "$(printf '%s\n' "${found}" | awk 'END{print NR}')" -eq 2 ] &&
+  printf '%s\n' "${found}" |
+    awk 'NR == 1 && index($0, "e2e-search/topos/ ") == 1 && index($0, "1 files") { hit=1 } END { exit !hit }' &&
+  contains "${found}" 'e2e-search/notes/Topos Notes.md' ||
+  fail "search prints live hits as SITE/PATH columns"
+linked=$("${CLIENT}" search -l -s e2e-search/notes TOPOS) ||
+  fail "search -s SITE/DIR finds live hits"
+[ "$(printf '%s\n' "${linked}" | awk 'END{print NR}')" -eq 1 ] &&
+  contains "${linked}" "${BASE}/e2e-search/notes/Topos Notes.md" ||
+  fail "search -l -s SITE/DIR prints the live URL"
+paged=$("${CLIENT}" search -s e2e-search --limit 1 topos 2>"${ROOT}/work/search.err") ||
+  fail "search --limit pages live hits"
+[ "$(printf '%s\n' "${paged}" | awk 'END{print NR}')" -eq 1 ] &&
+  contains "$(cat "${ROOT}/work/search.err")" \
+    'page 1 of 2 (2 matches): symbol search -s e2e-search --limit 1 topos -p 2 for more' ||
+  fail "search --limit reads the live Entry-Count"
+json=$("${CLIENT}" search --json -s e2e-search topos) || fail "search --json finds live hits"
+printf '%s' "${json}" |
+  python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["total"] == 2 and len(d["results"]) == 2, d' ||
+  fail "search --json writes the live results document"
+if "${CLIENT}" search -s e2e-search zzz-nothing >/dev/null 2>&1; then
+  fail "search with no live hits exits 1"
+else
+  [ "$?" -eq 1 ] || fail "search with no live hits exits 1"
+fi
+if "${CLIENT}" search -s e2e-search a b c d e f g h i j k l m n o p q >/dev/null 2>"${ROOT}/work/search.err"; then
+  fail "search reports a live 400"
+else
+  [ "$?" -eq 2 ] && [ "$(cat "${ROOT}/work/search.err")" = 'error: q must have at most 16 words' ] ||
+    fail "search reports a live 400"
+fi
+if "${CLIENT}" search -s e2e-no-such-site topos >/dev/null 2>"${ROOT}/work/search.err"; then
+  fail "search reports a live 404"
+else
+  [ "$?" -eq 2 ] && [ "$(cat "${ROOT}/work/search.err")" = 'error: site not found' ] ||
+    fail "search reports a live 404"
+fi
+ok "search finds, scopes, pages, and reports errors against the live server"
+
 "${CLIENT}" rm e2e-remix >/dev/null
 "${ROOT}/bin/symbol" -t "$(cat "${ROOT}/work/e2e-managed-remix/.symbol-token")" \
   rm e2e-managed-remix >/dev/null
@@ -657,12 +702,13 @@ ok "put --replace prunes missing paths and one undo restores them"
 "${CLIENT}" rm e2e-drop-explicit >/dev/null
 "${CLIENT}" rm e2e-named-drop >/dev/null
 "${CLIENT}" rm e2e-replace >/dev/null
+"${CLIENT}" rm e2e-search >/dev/null
 
 left=$(curl -fsSL -H 'Accept: application/json' "${BASE}/FILES")
 for name in e2e-main e2e-moved e2e-remix e2e-secure "${explicit_name}" "${implicit_name}" \
   "${dropped_put_name}" "${dropped_copy_name}" "${restarted_put_name}" \
   "${restarted_copy_name}" e2e-drop-explicit e2e-named-drop e2e-managed-loss \
-  e2e-claim e2e-rooted e2e-replace; do
+  e2e-claim e2e-rooted e2e-replace e2e-search; do
   contains "${left}" "\"name\":\"${name}\"" && fail "cleanup removes all test sites"
 done
 ok "cleanup removes all test sites"

@@ -140,6 +140,9 @@ pub const STATS: &str = "/STATS";
 pub const STATS_SLASH: &str = "/STATS/";
 pub const FILES: &str = "/FILES";
 pub const FILES_SLASH: &str = "/FILES/";
+pub const SEARCH: &str = "/SEARCH";
+pub const SEARCH_SLASH: &str = "/SEARCH/";
+pub const SEARCH_DESCRIPTOR: &str = "/SEARCH/opensearch.xml";
 pub const INSTALL: &str = "/install.sh";
 pub const INSTALL_HASH: &str = "/install.sh/HASH";
 pub const CLIENT: &str = "/symbol.sh";
@@ -231,6 +234,7 @@ pub enum WireSchema {
     AllocationCancellationReceipt,
     FileReplaceReceipt,
     SpliceReceipt,
+    SearchResults,
     Error,
 }
 
@@ -671,6 +675,40 @@ pub static ENDPOINTS: &[EndpointContract] = &[
             not_modified().error(),
             err(500).retry_after(),
         ],
+    },
+    EndpointContract {
+        name: "search",
+        method: "GET",
+        head: true,
+        path: "/SEARCH[/]",
+        request_headers: &["Accept"],
+        summary_headers: &[
+            "Content-Type",
+            "Cache-Control",
+            "Entry-Count",
+            "Link",
+            "Vary",
+        ],
+        outcomes: &[
+            json(
+                200,
+                WireSchema::SearchResults,
+                &["Content-Type", "Cache-Control", "Entry-Count"],
+            )
+            .optional(&["Link"]),
+            err(400),
+            err(404),
+            err(500).retry_after(),
+        ],
+    },
+    EndpointContract {
+        name: "search descriptor",
+        method: "GET",
+        head: true,
+        path: "/SEARCH/opensearch.xml",
+        request_headers: &[],
+        summary_headers: SUMMARY_CONTENT_TYPE_CACHE,
+        outcomes: &[binary(200, WireSchema::Asset, CONTENT_TYPE_CACHE)],
     },
     EndpointContract {
         name: "site redirect",
@@ -1576,6 +1614,45 @@ pub struct Listing {
     pub aliases: u64,
     pub bytes: u64,
     pub entries: Vec<ListingEntry>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchHitKind {
+    Directory,
+    File,
+}
+
+/// One file or folder whose name matched a search.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SearchHit {
+    pub kind: SearchHitKind,
+    pub site: String,
+    /// Site-relative, without a trailing slash.
+    pub path: String,
+    /// The last path segment.
+    pub name: String,
+    /// Where the entry is served: `/{site}/{path}` for a file, and the
+    /// directory URL, with its trailing slash, for a folder.
+    pub url: String,
+    /// Files below a folder; `null` for a file.
+    pub files: Option<u64>,
+    pub bytes: u64,
+    /// When the content last changed (a folder: its newest file), UTC RFC 3339.
+    pub modified: Option<String>,
+}
+
+/// One page of name-search results.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SearchResults {
+    pub query: String,
+    pub site: Option<String>,
+    /// The directory searched below, ending in `/`.
+    pub path: Option<String>,
+    pub total: u64,
+    pub page: u64,
+    pub limit: u64,
+    pub results: Vec<SearchHit>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]

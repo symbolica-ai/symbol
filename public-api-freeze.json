@@ -46,7 +46,9 @@
       "file raw",
       "file replace",
       "file splice",
-      "render asset"
+      "render asset",
+      "search",
+      "search descriptor"
     ],
     "endpoint_contracts": [
       {
@@ -158,6 +160,26 @@
         "error_statuses": [304, 404],
         "request_headers": ["If-None-Match"],
         "response_headers": ["Cache-Control", "Content-Type", "ETag"]
+      },
+      {
+        "name": "search",
+        "method": "GET",
+        "head": true,
+        "path": "/SEARCH[/]",
+        "success_statuses": [200],
+        "error_statuses": [400, 404, 500],
+        "request_headers": ["Accept"],
+        "response_headers": ["Content-Type", "Cache-Control", "Entry-Count", "Link", "Vary"]
+      },
+      {
+        "name": "search descriptor",
+        "method": "GET",
+        "head": true,
+        "path": "/SEARCH/opensearch.xml",
+        "success_statuses": [200],
+        "error_statuses": [],
+        "request_headers": [],
+        "response_headers": ["Content-Type", "Cache-Control"]
       }
     ],
     "global_response_headers": [
@@ -185,6 +207,9 @@
       "/API/SH",
       "/API/TS",
       "/API/VERSION",
+      "/SEARCH",
+      "/SEARCH/",
+      "/SEARCH/opensearch.xml",
       "/api.d.ts",
       "/api.d.ts/HASH",
       "/api.global.js",
@@ -246,7 +271,8 @@
     ],
     "shell_commands": [
       "alias",
-      "raw"
+      "raw",
+      "search"
     ],
     "sdk_assets": [
       "api.d.ts",

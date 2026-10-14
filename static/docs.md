@@ -4,7 +4,8 @@ tiny static web hosting on ${host}.
 give it an HTML file, a folder, or an archive; get back a URL.
 there are no accounts and reads are ordinary HTTP.
 
-see [${host}/FILES](${host}/FILES) for everything currently hosted.
+see [${host}/FILES](${host}/FILES) for everything currently hosted, or
+[${host}/SEARCH](${host}/SEARCH) to find a file or folder by name.
 
 ## with curl
 
