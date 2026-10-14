@@ -158,6 +158,7 @@ usage:
   symbol manage [NAME ACTION]
   symbol recover
   symbol ls [-l] [-m|-S] [-r] [-R] [-p PAGE] [--limit N|--all] [--json] [NAME [PATH]]
+  symbol search [-l] [-s SITE[/DIR]] [-p PAGE] [--limit N|--all] [--json] QUERY...
   symbol rm NAME [PATH]
   symbol url NAME
   symbol api [--json]
@@ -342,6 +343,23 @@ reverses the order. folders always come before files.
 in a terminal, 50 entries a page: -p 2 shows the next, --limit N sets
 the page size, --all shows everything. piped output is never paged.
 -l adds URLs. --json writes the server listing or inventory document.
+EOF
+      ;;
+    search) cat <<'EOF'
+symbol search: find files and folders by name
+usage: symbol search [-l] [-s SITE[/DIR]] [-p PAGE] [--limit N | --all]
+                     [--json] [--] QUERY...
+
+every word must match, ignoring case. a word matches part of a name; a
+word with * or ? matches the whole name; a word with / matches the whole
+path. -s searches one site, or one directory of it. best matches come
+first, each with its folder file count, size, and UTC change time.
+
+in a terminal, 50 matches a page: -p 2 shows the next, --limit N sets
+the page size, --all shows everything. piped output is never paged.
+-l prints URLs. --json writes the server results for one page.
+-- ends the flags, so a query can start with -.
+exits 0 with matches, 1 with none, and 2 on errors.
 EOF
       ;;
     rm) cat <<'EOF'
@@ -764,6 +782,55 @@ list_page() {
   fi
 }
 
+# Quotes one word for a command line the user can paste back.
+shell_word() {
+  case "$1" in
+    ''|*[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_./:=@%+,-]*)
+      printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+      ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+# search exits like grep: 0 with matches, 1 with none, 2 on any error.
+SEARCH_ROWS=
+search_exit() {
+  [ -z "${SEARCH_ROWS}" ] || rm -f "${SEARCH_ROWS}"
+  SEARCH_ROWS=
+  http_cleanup
+  exit "$1"
+}
+
+search_error() {
+  printf 'error: %s\n' "$*" >&2
+  search_exit 2
+}
+
+# Fetches one page of search results and appends it to SEARCH_ROWS as a
+# directory listing whose names are SITE/PATH, so print_entries lays hits out
+# exactly as ls lays out entries. Sets SEARCH_TOTAL from Entry-Count.
+#   search_fetch URL_PATH LIMIT PAGE WITH_HEADER
+search_fetch() {
+  http_request GET "${HOST}$1&limit=$2&page=$3" \
+    -H 'Accept: text/tab-separated-values' || search_exit 2
+  SEARCH_TOTAL=$(header_value Entry-Count)
+  case "${SEARCH_TOTAL}" in
+    ''|*[!0123456789]*)
+      search_error "${HOST} did not return search results; it may predate this client"
+      ;;
+  esac
+  LC_ALL=C awk -F '\t' -v OFS='\t' -v header="$4" '
+    NR == 1 {
+      if ($0 != "kind\tsite\tpath\tfiles\tbytes\tmodified") exit 1
+      if (header) print "kind", "files", "bytes", "name", "target", "modified"
+      next
+    }
+    { print $1, $4, $5, $2 "/" $3, "", $6 }
+    END { if (NR == 0) exit 1 }
+  ' < "${HTTP_BODY}" >> "${SEARCH_ROWS}" ||
+    search_error "${HOST} returned search results this client cannot read"
+}
+
 die() {
   printf 'error: %s\n' "$*" >&2
   exit 1
@@ -1117,6 +1184,7 @@ expire expire
 manage manage
 recover recover
 ls ls list
+search search
 rm rm delete
 url url
 update update upgrade
@@ -3555,6 +3623,133 @@ case "${cmd}" in
           "${ls_page}" "symbol ls${ls_flags} ${name}${2:+ ${2}}"
       fi
     fi
+    ;;
+  search)
+    links=0
+    search_limit=
+    search_page=1
+    search_all=0
+    search_scope=
+    search_query=
+    search_words=
+    search_dash=0
+    search_limit_flag=
+    # Flags may come before or after the words, as with ls; -- ends them.
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        -l|--links) links=1; shift ;;
+        -a|--all) search_all=1; shift ;;
+        -s|--site)
+          [ "$#" -ge 2 ] || usage_error "$1 needs SITE or SITE/DIR"
+          search_scope=$2; shift 2 ;;
+        --site=*) search_scope=${1#--site=}; shift ;;
+        -p|--page)
+          [ "$#" -ge 2 ] || usage_error "$1 needs a page number"
+          search_page=$2; shift 2 ;;
+        --page=*) search_page=${1#--page=}; shift ;;
+        -n|--limit)
+          [ "$#" -ge 2 ] || usage_error "$1 needs a number of matches"
+          search_limit=$2; search_limit_flag=" --limit $2"; shift 2 ;;
+        --limit=*) search_limit=${1#--limit=}; search_limit_flag=" --limit ${search_limit}"; shift ;;
+        --)
+          shift
+          for search_word do
+            search_query="${search_query}${search_query:+ }${search_word}"
+            search_words="${search_words} $(shell_word "${search_word}")"
+            case "${search_word}" in -*) search_dash=1 ;; esac
+          done
+          set --
+          ;;
+        -?*) usage_error "unknown flag: $1" ;;
+        *)
+          search_query="${search_query}${search_query:+ }$1"
+          search_words="${search_words} $(shell_word "$1")"
+          shift
+          ;;
+      esac
+    done
+    search_query=$(printf '%s' "${search_query}" | tr '\t\r\n' '   ')
+    case "${search_query}" in
+      *[!\ ]*) ;;
+      *) usage_error "usage: symbol search [-s SITE[/DIR]] QUERY..." ;;
+    esac
+    for search_number in "${search_page}" "${search_limit:-1}"; do
+      case "${search_number}" in
+        ''|*[!0123456789]*|0*) usage_error "page and limit must be whole numbers from 1" ;;
+      esac
+    done
+    search_url="/SEARCH?q=$(urlencode_path "${search_query}")"
+    search_flags=
+    [ "${links}" -eq 0 ] || search_flags=" -l"
+    if [ -n "${search_scope}" ]; then
+      search_site=${search_scope%%/*}
+      is_site_name "${search_site}" || usage_error "invalid site name: ${search_site}"
+      search_url="${search_url}&site=${search_site}"
+      search_dir=
+      case "${search_scope}" in */*) search_dir=${search_scope#*/} ;; esac
+      search_dir=${search_dir%/}
+      [ -z "${search_dir}" ] || search_url="${search_url}&path=$(urlencode_path "${search_dir}")/"
+      search_flags="${search_flags} -s $(shell_word "${search_scope}")"
+    fi
+    search_flags="${search_flags}${search_limit_flag}"
+    if [ "${JSON_OUTPUT}" -eq 1 ]; then
+      [ "${search_all}" -eq 0 ] || usage_error "--json writes one page; choose it with --limit and -p"
+      search_limit=${search_limit:-50}
+      http_request GET "${HOST}${search_url}&limit=${search_limit}&page=${search_page}" \
+        -H 'Accept: application/json' || search_exit 2
+      cat "${HTTP_BODY}"
+      printf '\n'
+      SEARCH_TOTAL=$(header_value Entry-Count)
+      [ "${SEARCH_TOTAL:-0}" -gt "$(( (search_page - 1) * search_limit ))" ] || search_exit 1
+      search_exit 0
+    fi
+    # Like ls: page only for a person. A pipe gets every match, a page of the
+    # server's maximum at a time.
+    if [ "${search_all}" -eq 1 ]; then
+      search_limit=
+    elif [ -z "${search_limit}" ] && [ -t 1 ]; then
+      search_limit=50
+    fi
+    if [ -z "${search_limit}" ] && [ "${search_page}" -ne 1 ]; then
+      usage_error "-p needs a limit; output is not a terminal, so pass --limit"
+    fi
+    SEARCH_ROWS=$(mktemp) || exit 1
+    if [ -n "${search_limit}" ]; then
+      search_fetch "${search_url}" "${search_limit}" "${search_page}" 1
+    else
+      search_at=1
+      while :; do
+        search_fetch "${search_url}" 1000 "${search_at}" "$(( search_at == 1 ))"
+        [ "$(( search_at * 1000 ))" -lt "${SEARCH_TOTAL}" ] || break
+        search_at=$(( search_at + 1 ))
+      done
+    fi
+    search_hits=$(awk 'END { print NR - 1 }' "${SEARCH_ROWS}")
+    # search_fetch checked every page, so the printer fails only when the
+    # reader goes away, as with `symbol search x | head`.
+    if [ "${search_hits}" -gt 0 ]; then
+      print_entries "${HOST}" "${links}" 1 < "${SEARCH_ROWS}" || search_exit 2
+    fi
+    if [ -n "${search_limit}" ]; then
+      search_pages=$(( (SEARCH_TOTAL + search_limit - 1) / search_limit ))
+      if [ "${search_pages}" -gt 1 ]; then
+        if [ "${search_page}" -lt "${search_pages}" ]; then
+          search_next="-p $(( search_page + 1 ))"
+          if [ "${search_dash}" -eq 1 ]; then
+            search_next="symbol search${search_flags} ${search_next} --${search_words}"
+          else
+            search_next="symbol search${search_flags}${search_words} ${search_next}"
+          fi
+          printf '\npage %s of %s (%s matches): %s for more, --all for everything\n' \
+            "${search_page}" "${search_pages}" "${SEARCH_TOTAL}" "${search_next}" >&2
+        else
+          printf '\npage %s of %s (%s matches)\n' \
+            "${search_page}" "${search_pages}" "${SEARCH_TOTAL}" >&2
+        fi
+      fi
+    fi
+    [ "${search_hits}" -gt 0 ] || search_exit 1
+    search_exit 0
     ;;
   get)
     [ "$#" -ge 1 ] && [ "$#" -le 2 ] || usage_error "usage: symbol get NAME [ARCHIVE]"

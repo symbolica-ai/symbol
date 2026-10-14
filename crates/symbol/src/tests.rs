@@ -2188,3 +2188,130 @@ async fn generated_sdk_assets_and_hashes_are_served_from_the_binary() {
     assert_eq!(version["commit"], API_COMMIT);
     assert_eq!(version["dirty"], API_DIRTY == "true");
 }
+
+#[tokio::test]
+async fn search_finds_names_across_sites_in_every_representation() {
+    let (_root, store) = temp_store();
+    put_text_files(
+        &store,
+        "nlab",
+        &[
+            ("topos/index.html", "<h1>topos</h1>"),
+            ("topos-theory/index.html", "<h1>theory</h1>"),
+            ("pagefind/fragment/topos_1.pf", "x"),
+            ("files/Notes.PDF", "pdf"),
+        ],
+    );
+    put_text_files(&store, "other", &[("topos.txt", "t")]);
+    let app = app_router(&store);
+    let json = [("accept", "application/json")];
+
+    let response = get_with(&app, "/SEARCH?q=topos", &json).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["entry-count"], "4");
+    assert_eq!(response.headers()["cache-control"], "no-cache");
+    let results: serde_json::Value = body_json(response).await;
+    let urls: Vec<&str> = results["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|hit| hit["url"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        urls,
+        [
+            "/nlab/topos/",
+            "/other/topos.txt",
+            "/nlab/topos-theory/",
+            "/nlab/pagefind/fragment/topos_1.pf"
+        ]
+    );
+    assert_eq!(results["results"][0]["kind"], "directory");
+    assert_eq!(results["results"][0]["files"], 1);
+    assert_eq!(results["results"][1]["files"], serde_json::Value::Null);
+    assert_eq!(results["total"], 4);
+
+    // Scoped to a site and directory, paged, and as TSV.
+    let response = get_with(
+        &app,
+        "/SEARCH?q=*.pdf&site=nlab&path=files",
+        &[("accept", "text/tab-separated-values")],
+    )
+    .await;
+    let tsv = body_string(response).await;
+    let mut lines = tsv.lines();
+    assert_eq!(
+        lines.next(),
+        Some("kind\tsite\tpath\tfiles\tbytes\tmodified")
+    );
+    assert!(
+        lines
+            .next()
+            .unwrap()
+            .starts_with("file\tnlab\tfiles/Notes.PDF\t\t3\t20")
+    );
+    assert_eq!(lines.next(), None);
+
+    let response = get_with(&app, "/SEARCH?q=topos&limit=1&page=2", &json).await;
+    assert_eq!(
+        response.headers()["link"],
+        "</SEARCH?q=topos&limit=1&page=1>; rel=\"prev\", </SEARCH?q=topos&limit=1&page=3>; rel=\"next\""
+    );
+    let page: serde_json::Value = body_json(response).await;
+    assert_eq!(page["results"][0]["url"], "/other/topos.txt");
+
+    // Plain text for curl, HTML with the form and marked matches for browsers.
+    let plain =
+        body_string(get_with(&app, "/SEARCH?q=theory", &[("user-agent", "curl/8")]).await).await;
+    assert!(plain.starts_with("nlab/topos-theory/"), "{plain}");
+    assert!(plain.ends_with("1 match\n"), "{plain}");
+    let html =
+        body_string(get_with(&app, "/SEARCH?q=theory", &[("accept", "text/html")]).await).await;
+    assert!(
+        html.contains("<form class=\"search\" role=\"search\""),
+        "{html}"
+    );
+    assert!(html.contains("topos-<mark>theory</mark>"), "{html}");
+    assert!(
+        html.contains("<option value=\"other\">other</option>"),
+        "{html}"
+    );
+    let empty_page = get_with(&app, "/SEARCH", &[("accept", "text/html")]).await;
+    assert_eq!(empty_page.status(), StatusCode::OK);
+
+    // Deletes show at once; there is no index to go stale.
+    store.delete_file("other", "topos.txt").unwrap();
+    let response = get_with(&app, "/SEARCH?q=topos.txt", &json).await;
+    assert_eq!(response.headers()["entry-count"], "0");
+
+    for (uri, status) in [
+        ("/SEARCH", StatusCode::BAD_REQUEST),
+        ("/SEARCH?q=x&path=a", StatusCode::BAD_REQUEST),
+        ("/SEARCH?q=x&limit=0", StatusCode::BAD_REQUEST),
+        ("/SEARCH?q=x&site=Bad_Name", StatusCode::BAD_REQUEST),
+        ("/SEARCH?q=x&site=missing", StatusCode::NOT_FOUND),
+    ] {
+        let response = get_with(&app, uri, &json).await;
+        assert_eq!(response.status(), status, "{uri}");
+        assert_contract_status("search", status);
+    }
+}
+
+#[tokio::test]
+async fn listings_offer_a_scoped_search_box_and_a_descriptor() {
+    let (_root, store) = temp_store();
+    put_text_files(&store, "hello", &[("docs/a.txt", "a")]);
+    let app = app_router(&store);
+    let html = [("accept", "text/html")];
+    let listing = body_string(get_with(&app, "/hello/FILES/docs/", &html).await).await;
+    assert!(listing.contains("<input type=\"hidden\" name=\"site\" value=\"hello\">"));
+    assert!(listing.contains("<input type=\"hidden\" name=\"path\" value=\"docs/\">"));
+    assert!(listing.contains("href=\"/SEARCH/opensearch.xml\""));
+    let sites = body_string(get_with(&app, "/FILES", &html).await).await;
+    assert!(sites.contains("placeholder=\"search all sites\""));
+    let descriptor = body_string(get_with(&app, "/SEARCH/opensearch.xml", &[]).await).await;
+    assert!(
+        descriptor.contains("/SEARCH?q={searchTerms}\""),
+        "{descriptor}"
+    );
+}

@@ -88,6 +88,9 @@ use mutation::*;
 
 mod rows;
 
+mod search;
+pub use search::{SearchCandidate, normalize_search_prefix};
+
 mod undo;
 #[allow(clippy::wildcard_imports)] // see the note in the child module
 use undo::*;

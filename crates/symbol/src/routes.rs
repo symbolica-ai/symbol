@@ -28,6 +28,7 @@ use crate::mutation_http;
 use crate::publish::{
     delete_file, delete_site, put_file, put_site, put_site_unnamed, redirect_site,
 };
+use crate::search;
 use crate::serve::{
     browse_path, browse_root, render_asset, serve_immutable_blob, serve_index, serve_path,
 };
@@ -62,6 +63,9 @@ pub fn router(app: App) -> Router {
         .route(contract::CLIENT, get(symbol_sh))
         .route(contract::CLIENT_HASH, get(symbol_sh_hash))
         .merge(api_router())
+        .route(contract::SEARCH, get(search::search))
+        .route(contract::SEARCH_SLASH, get(search::search))
+        .route(contract::SEARCH_DESCRIPTOR, get(search::opensearch))
         .route(contract::FILES, get(list_sites))
         .route(contract::FILES_SLASH, get(list_sites))
         .route(

@@ -98,6 +98,11 @@ try {
             path: "/ts-workflow/FILES",
             headers: { accept: "application/json" },
         },
+        ...[1, 2, 3].map((page) => ({
+            operation: "search",
+            path: `/SEARCH?q=*&limit=2&page=${page}`,
+            headers: { accept: "application/json" },
+        })),
     );
     const mockOutput = JSON.parse((await run(
         process.execPath,
@@ -107,6 +112,7 @@ try {
     assert.equal(mockOutput.sites, 1);
     assert.equal(mockOutput.putStatus, 201);
     assert.equal(mockOutput.archiveSize > 0, true);
+    assert.deepEqual(mockOutput.searchKinds, ["directory", "file", "file", "file", "file"]);
     await mock.stop();
     console.log("ok 5 - compiled TypeScript workflow passes matching mock");
 
@@ -124,6 +130,7 @@ try {
         assert.equal(realOutput.putStatus, 201);
         assert.equal(realOutput.archiveSize > 0, true);
         assert.equal(realOutput.inventoryFiles, 1);
+        assert.deepEqual(realOutput.searchKinds, ["file"]);
     } catch (error) {
         throw new Error(`${error instanceof Error ? error.message : String(error)}\n${server.log}`);
     } finally {

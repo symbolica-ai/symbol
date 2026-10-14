@@ -42,6 +42,9 @@ try {
   if (stats.sites !== 1 || statsOperation.attempts.length !== 2) throw new Error("browser retry failed");
   const put = await client.site("hello").put("browser");
   if (put.status !== 201 || put.site !== "hello") throw new Error("browser site PUT failed");
+  const hits = [];
+  for await (const hit of client.searchAll("topos")) hits.push(hit.url.href);
+  if (hits.join() !== location.origin + "/hello/topos/") throw new Error("browser search failed");
   const raw = await client.request("/stream");
   const reader = raw.body.getReader();
   await reader.read();
@@ -111,6 +114,20 @@ await fetch("/report", { method: "POST", body: result.textContent });
                 "Undo-Expires": "2026-08-26T16:00:00Z",
             });
             response.end(`ok hello ${location} (1 files, changed: true)\n`);
+        } else if (request.url === "/SEARCH?q=topos&page=1") {
+            response.writeHead(200, {
+                ...identity,
+                "Content-Type": "application/json",
+                "Cache-Control": "no-cache",
+                "Entry-Count": "1",
+            });
+            response.end(JSON.stringify({
+                query: "topos", site: null, path: null, total: 1, page: 1, limit: 50,
+                results: [{
+                    kind: "directory", site: "hello", path: "topos", name: "topos",
+                    url: "/hello/topos/", files: 1, bytes: 8, modified: null,
+                }],
+            }));
         } else if (request.url === "/stream") {
             response.writeHead(200, {
                 ...identity,

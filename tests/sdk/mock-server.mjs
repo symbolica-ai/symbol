@@ -222,6 +222,7 @@ export class MockServer {
             body,
             this.#requests,
             url.pathname,
+            url.searchParams,
         );
         const responseBody = normalizeBody(
             step.responseBody === null ? canonical.body : step.responseBody,
@@ -673,10 +674,11 @@ function validateFixture(fixture) {
     assert.match(fixture.source_hash, /^[0-9a-f]{64}$/);
     assert.match(fixture.build.commit, /^(?:unknown|[0-9a-fA-F]{7,64})$/);
     assert.equal(typeof fixture.build.dirty, "boolean");
-    // 41 client-facing operations plus `render asset`, the stylesheets, scripts
-    // and fonts rendered Markdown pages load. SDKs have no reason to call it.
-    assert.equal(fixture.operations.length, 42);
-    assert.equal(new Set(fixture.operations.map((operation) => operation.name)).size, 42);
+    // 42 client-facing operations plus `render asset`, the stylesheets, scripts
+    // and fonts rendered Markdown pages load, and `search descriptor`, the
+    // OpenSearch XML browsers fetch. SDKs have no reason to call either.
+    assert.equal(fixture.operations.length, 44);
+    assert.equal(new Set(fixture.operations.map((operation) => operation.name)).size, 44);
     for (const operation of fixture.operations) {
         assert.equal(operation.outcomes_exact, true, `${operation.name} outcomes must be exact`);
         for (const outcome of [...operation.success_outcomes, ...operation.error_outcomes]) {
@@ -880,6 +882,20 @@ function validateSchema(schema, value) {
                 "old_size", "new_size", "splices", ...MUTATION_FIELDS,
             ], schema);
             return;
+        case "search_results":
+            exactKeys(object, ["query", "site", "path", "total", "page", "limit", "results"], schema);
+            assert(Array.isArray(object.results));
+            assert(object.results.length <= object.limit);
+            object.results.forEach((hit) => {
+                exactKeys(hit, [
+                    "kind", "site", "path", "name", "url", "files", "bytes", "modified",
+                ], schema);
+                assert(["directory", "file"].includes(hit.kind));
+                assert.equal(hit.files === null, hit.kind === "file");
+                assert.equal(hit.url.endsWith("/"), hit.kind === "directory");
+                assert.equal(hit.name, hit.path.split("/").at(-1));
+            });
+            return;
         default:
             throw new Error(`JSON body used non-JSON schema ${schema}`);
     }
@@ -923,6 +939,7 @@ function canonicalOutcome(
     requestBody,
     requests,
     requestPath,
+    searchParams,
 ) {
     if (!operation.success_outcomes.some((outcome) => outcome.status === status)) {
         if (status === 416 && operation.name !== "file splice") {
@@ -996,6 +1013,16 @@ function canonicalOutcome(
                 ETag: quotedRawHash("1"),
                 "Cache-Control": "no-cache",
             }, listingFixture(operation.name === "site listing"));
+        case "search":
+            return searchOutcome(searchParams);
+        case "search descriptor":
+            return {
+                headers: {
+                    "Content-Type": "application/opensearchdescription+xml",
+                    "Cache-Control": "no-cache",
+                },
+                body: "<OpenSearchDescription/>\n",
+            };
         case "site redirect":
             return empty({ ...base, Location: "/hello/", "Content-Length": "0" });
         case "site index":
@@ -1382,6 +1409,84 @@ function allocationOutcome(base, requestHeaders, requestBody, status, requests) 
             ? { token: "undo-allocation", expires_at: "2026-08-26T16:00:00Z" }
             : null,
     });
+}
+
+// Pre-ranked the way the server ranks: exact name, name prefix, substring;
+// shallower first; folders before files.
+const SEARCH_FIXTURE = [
+    { kind: "directory", site: "hello", path: "topos", files: 1, bytes: 14 },
+    { kind: "file", site: "other", path: "topos.txt", files: null, bytes: 1 },
+    { kind: "file", site: "hello", path: "a b/Topos #1.txt", files: null, bytes: 3 },
+    { kind: "file", site: "hello", path: "topos/elementary-topos.md", files: null, bytes: 14 },
+    { kind: "file", site: "hello", path: "index.html", files: null, bytes: 8 },
+];
+
+function searchOutcome(parameters) {
+    const query = (parameters.get("q") ?? "").trim();
+    const site = parameters.get("site") || null;
+    const scope = (parameters.get("path") ?? "").replace(/^\/+|\/+$/g, "");
+    const path = scope === "" ? null : `${scope}/`;
+    const limit = Number(parameters.get("limit") ?? 50);
+    const page = Number(parameters.get("page") ?? 1);
+    assert(query !== "" && (site !== null || path === null), "mock search needs q, and site for path");
+    assert(Number.isSafeInteger(limit) && limit >= 1 && limit <= 1000, "mock search limit");
+    assert(Number.isSafeInteger(page) && page >= 1, "mock search page");
+    const words = query.toLowerCase().split(/\s+/);
+    const hits = SEARCH_FIXTURE.filter((entry) =>
+        (site === null || entry.site === site)
+        && (path === null || entry.path.startsWith(path))
+        && words.every((word) => searchWordMatches(word, entry))
+    );
+    const headers = {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-cache",
+        "Entry-Count": String(hits.length),
+    };
+    const pages = Math.max(1, Math.ceil(hits.length / limit));
+    const link = (target, rel) => {
+        const linked = new URLSearchParams(parameters);
+        linked.set("page", String(target));
+        return `</SEARCH?${linked}>; rel="${rel}"`;
+    };
+    const links = [
+        ...(page > 1 ? [link(Math.min(page - 1, pages), "prev")] : []),
+        ...(page < pages ? [link(page + 1, "next")] : []),
+    ];
+    if (links.length > 0) {
+        headers.Link = links.join(", ");
+    }
+    return json(headers, {
+        query,
+        site,
+        path,
+        total: hits.length,
+        page,
+        limit,
+        results: hits.slice((page - 1) * limit, page * limit).map((entry) => ({
+            kind: entry.kind,
+            site: entry.site,
+            path: entry.path,
+            name: entry.path.split("/").at(-1),
+            url: `/${[entry.site, ...entry.path.split("/")].map(encodeURIComponent).join("/")}`
+                + (entry.kind === "directory" ? "/" : ""),
+            files: entry.files,
+            bytes: entry.bytes,
+            modified: "2026-08-26T12:00:00Z",
+        })),
+    });
+}
+
+// A word matches the name, or the whole `/path` (`/path/` for folders) when it
+// contains a slash: as a glob when it has `*` or `?`, else as a substring.
+function searchWordMatches(word, entry) {
+    const subject = word.includes("/")
+        ? `/${entry.path}${entry.kind === "directory" ? "/" : ""}`
+        : entry.path.split("/").at(-1);
+    if (!/[*?]/.test(word)) {
+        return subject.toLowerCase().includes(word);
+    }
+    const pattern = word.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".");
+    return new RegExp(`^${pattern}$`, "i").test(subject);
 }
 
 function listingFixture(includeBuiltin = false) {

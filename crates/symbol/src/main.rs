@@ -38,6 +38,7 @@ mod response;
 mod routes;
 mod sanitize;
 mod schema;
+mod search;
 mod secrets;
 mod serve;
 mod splice;

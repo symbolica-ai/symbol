@@ -26,12 +26,13 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Final,
+    Literal,
     Protocol,
     Self,
     cast,
     overload,
 )
-from urllib.parse import quote, urljoin, urlsplit
+from urllib.parse import quote, urlencode, urljoin, urlsplit
 
 if TYPE_CHECKING:
     import aiohttp
@@ -1567,6 +1568,29 @@ class DirectoryListing:
 
 
 @dataclass(frozen=True, slots=True)
+class SearchHit:
+    kind: Literal["directory", "file"]
+    site: SiteName
+    path: SitePath
+    name: str
+    url: ResourceUrl
+    files: int | None
+    bytes: int
+    modified: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class SearchResults:
+    query: str
+    site: SiteName | None
+    path: SitePath | None
+    total: int
+    page: int
+    limit: int
+    results: tuple[SearchHit, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class ExpiryTarget:
     site: str
     path: str | None
@@ -1881,6 +1905,10 @@ def _number(value: object, response: ApiResponse) -> float:
 
 def _nullable_number(value: object, response: ApiResponse) -> float | None:
     return None if value is None else _number(value, response)
+
+
+def _nullable_string(value: object, response: ApiResponse) -> str | None:
+    return None if value is None else _string(value, response)
 
 
 def _boolean(value: object, response: ApiResponse) -> bool:
@@ -2802,6 +2830,38 @@ class _SymbolSync:
         )
         return _directory(response)
 
+    def search(
+        self,
+        query: str,
+        *,
+        site: SiteName | None = None,
+        path: SitePath | None = None,
+        limit: int | None = None,
+        page: int | None = None,
+    ) -> SearchResults:
+        url = _search_url(self.origin, query, site, path, limit, page)
+        return _run_typed_sync(
+            lambda: self._send(
+                HttpMethod.GET, url, headers=(("Accept", "application/json"),)
+            ),
+            _search_results,
+        )
+
+    def search_all(
+        self,
+        query: str,
+        *,
+        site: SiteName | None = None,
+        path: SitePath | None = None,
+        limit: int | None = None,
+    ) -> Iterator[SearchHit]:
+        _search_url(self.origin, query, site, path, limit, None)
+        return _search_pages(
+            lambda page: self.search(
+                query, site=site, path=path, limit=limit, page=page
+            )
+        )
+
     def site(self, name: str, token: str | None = None) -> SiteClient:
         return SiteClient(self, name, token if token is not None else self.token)
 
@@ -2830,6 +2890,23 @@ class SiteClient:
             headers=(("Accept", "application/json"),),
         )
         return _file_inventory(response)
+
+    def search(
+        self,
+        query: str,
+        *,
+        path: SitePath | None = None,
+        limit: int | None = None,
+        page: int | None = None,
+    ) -> SearchResults:
+        return self.symbol.search(
+            query, site=self.name, path=path, limit=limit, page=page
+        )
+
+    def search_all(
+        self, query: str, *, path: SitePath | None = None, limit: int | None = None
+    ) -> Iterator[SearchHit]:
+        return self.symbol.search_all(query, site=self.name, path=path, limit=limit)
 
     def archive(self, format: str = "tar.gz") -> ApiResponse:
         return self.symbol._send(
@@ -3558,6 +3635,38 @@ class _SymbolAsync:
         )
         return _directory(response)
 
+    async def search(
+        self,
+        query: str,
+        *,
+        site: SiteName | None = None,
+        path: SitePath | None = None,
+        limit: int | None = None,
+        page: int | None = None,
+    ) -> SearchResults:
+        url = _search_url(self.origin, query, site, path, limit, page)
+        return await _run_typed_async(
+            lambda: self._send(
+                HttpMethod.GET, url, headers=(("Accept", "application/json"),)
+            ),
+            _search_results,
+        )
+
+    def search_all(
+        self,
+        query: str,
+        *,
+        site: SiteName | None = None,
+        path: SitePath | None = None,
+        limit: int | None = None,
+    ) -> AsyncIterator[SearchHit]:
+        _search_url(self.origin, query, site, path, limit, None)
+        return _asearch_pages(
+            lambda page: self.search(
+                query, site=site, path=path, limit=limit, page=page
+            )
+        )
+
     async def close(self) -> None:
         await self.http.close()
 
@@ -3586,6 +3695,23 @@ class AsyncSiteClient:
             headers=(("Accept", "application/json"),),
         )
         return _file_inventory(response)
+
+    async def search(
+        self,
+        query: str,
+        *,
+        path: SitePath | None = None,
+        limit: int | None = None,
+        page: int | None = None,
+    ) -> SearchResults:
+        return await self.symbol.search(
+            query, site=self.name, path=path, limit=limit, page=page
+        )
+
+    def search_all(
+        self, query: str, *, path: SitePath | None = None, limit: int | None = None
+    ) -> AsyncIterator[SearchHit]:
+        return self.symbol.search_all(query, site=self.name, path=path, limit=limit)
 
     async def alias(
         self,
@@ -4253,6 +4379,101 @@ def _directory_entry(value: object, response: ApiResponse) -> DirectoryEntry:
             )
 
 
+def _search_url(
+    origin: str,
+    query: str,
+    site: SiteName | None,
+    path: SitePath | None,
+    limit: int | None,
+    page: int | None,
+) -> str:
+    if not query.strip():
+        raise ValueError("search query must not be blank")
+    if path is not None and site is None:
+        raise ValueError("search path needs a site")
+    if limit is not None and not 1 <= limit <= 1000:
+        raise ValueError("search limit must be from 1 to 1000")
+    if page is not None and page < 1:
+        raise ValueError("search page must be at least 1")
+    parameters = {"q": query, "site": site, "path": path, "limit": limit, "page": page}
+    encoded = urlencode(
+        {name: value for name, value in parameters.items() if value is not None},
+        quote_via=quote,
+    )
+    return f"{origin}/SEARCH?{encoded}"
+
+
+def _search_results(response: ApiResponse) -> SearchResults:
+    if response.status != 200:
+        _raise(response)
+    value = _exact_object(
+        _json_object(response),
+        ("query", "site", "path", "total", "page", "limit", "results"),
+        response,
+    )
+    return SearchResults(
+        query=_string(value["query"], response),
+        site=_nullable_string(value["site"], response),
+        path=_nullable_string(value["path"], response),
+        total=_integer(value["total"], response),
+        page=_integer(value["page"], response),
+        limit=_integer(value["limit"], response),
+        results=tuple(
+            _search_hit(item, response) for item in _array(value["results"], response)
+        ),
+    )
+
+
+def _search_hit(value: object, response: ApiResponse) -> SearchHit:
+    entry = _exact_object(
+        value,
+        ("kind", "site", "path", "name", "url", "files", "bytes", "modified"),
+        response,
+    )
+    match _string(entry["kind"], response), entry["files"]:
+        case "directory" as kind, files:
+            count: int | None = _integer(files, response)
+        case "file" as kind, None:
+            count = None
+        case _:
+            raise MalformedResponseError(response)
+    return SearchHit(
+        kind=kind,
+        site=_string(entry["site"], response),
+        path=_string(entry["path"], response),
+        name=_string(entry["name"], response),
+        url=_string(entry["url"], response),
+        files=count,
+        bytes=_integer(entry["bytes"], response),
+        modified=_date(entry["modified"], response),
+    )
+
+
+def _search_pages(
+    fetch: Callable[[int], SearchResults],
+) -> Iterator[SearchHit]:
+    page = 1
+    while True:
+        results = fetch(page)
+        yield from results.results
+        if not results.results or results.page * results.limit >= results.total:
+            return
+        page += 1
+
+
+async def _asearch_pages(
+    fetch: Callable[[int], Awaitable[SearchResults]],
+) -> AsyncIterator[SearchHit]:
+    page = 1
+    while True:
+        results = await fetch(page)
+        for hit in results.results:
+            yield hit
+        if not results.results or results.page * results.limit >= results.total:
+            return
+        page += 1
+
+
 __all__ = (
     "API_REVISION",
     "API_VERSION",
@@ -4342,6 +4563,8 @@ __all__ = (
     "RetryPolicies",
     "RetryPolicy",
     "RetryJitter",
+    "SearchHit",
+    "SearchResults",
     "ServingStats",
     "SizeDistribution",
     "Symbol",

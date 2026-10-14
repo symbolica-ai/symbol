@@ -82,6 +82,8 @@ export type EndpointName =
   | "api documentation"
   | "api version"
   | "site listing"
+  | "search"
+  | "search descriptor"
   | "site redirect"
   | "site index"
   | "site put"
@@ -138,6 +140,7 @@ interface EmbeddedOutcome {
     | "allocation_cancellation_receipt"
     | "file_replace_receipt"
     | "splice_receipt"
+    | "search_results"
     | "error";
   readonly required_headers: readonly string[];
   readonly optional_headers: readonly string[];
@@ -244,6 +247,16 @@ export interface FileGetOptions extends RequestOptions {
   readonly range?: string;
   readonly ifRange?: string;
   readonly ifNoneMatch?: string;
+}
+
+export interface SiteSearchOptions extends RequestOptions {
+  readonly path?: string;
+  readonly limit?: number;
+  readonly page?: number;
+}
+
+export interface SearchOptions extends SiteSearchOptions {
+  readonly site?: string;
 }
 
 export interface RetryPolicy {
@@ -788,6 +801,30 @@ export type CachedFileInventory =
       readonly response: Response;
     })
   | NotModified;
+
+interface SearchHitBase {
+  readonly site: string;
+  readonly path: string;
+  readonly name: string;
+  readonly url: URL;
+  readonly bytes: number;
+  readonly modified: Date | null;
+}
+
+export type SearchHit =
+  | (SearchHitBase & { readonly kind: "directory"; readonly files: number })
+  | (SearchHitBase & { readonly kind: "file"; readonly files: null });
+
+export interface SearchResults {
+  readonly query: string;
+  readonly site: string | null;
+  readonly path: string | null;
+  readonly total: number;
+  readonly page: number;
+  readonly limit: number;
+  readonly nextPage: number | null;
+  readonly results: readonly SearchHit[];
+}
 
 export interface SizeDistribution {
   readonly min: number | null;
@@ -1354,6 +1391,8 @@ export interface EndpointErrorMap {
   readonly "api documentation": NotFoundError;
   readonly "api version": never;
   readonly "site listing": ServerError;
+  readonly search: ValidationError | NotFoundError | ServerError;
+  readonly "search descriptor": never;
   readonly "site redirect": ValidationError | NotFoundError;
   readonly "site index": ReadProtocolError;
   readonly "site put": MutationProtocolError;
@@ -1859,6 +1898,14 @@ export class SymbolClient {
     });
   }
 
+  search(query: string, options: SearchOptions = {}): Operation<SearchResults> {
+    return searchOperation(this, searchParameters(query, options), options.page, options);
+  }
+
+  searchAll(query: string, options: Omit<SearchOptions, "page"> = {}): AsyncIterable<SearchHit> {
+    return searchHits(this, searchParameters(query, options), options);
+  }
+
   create(body: BodyInit, options: PublishOptions = {}): Operation<SiteCreationReceipt> {
     const idempotencyKey = effectiveIdempotencyKey(options.idempotencyKey);
     const headers = publishHeaders(options, stateFor(this).creatorClaim);
@@ -2056,6 +2103,28 @@ export class SiteClient {
       successStatuses: [200, 304],
       decode: decodeCachedFileInventory,
       dispose: null,
+    });
+  }
+
+  search(query: string, options: SiteSearchOptions = {}): Operation<SearchResults> {
+    return this.client.search(query, {
+      ...mergedOptions(this.defaults, options),
+      site: this.name,
+      path: options.path,
+      limit: options.limit,
+      page: options.page,
+    });
+  }
+
+  searchAll(
+    query: string,
+    options: Omit<SiteSearchOptions, "page"> = {},
+  ): AsyncIterable<SearchHit> {
+    return this.client.searchAll(query, {
+      ...mergedOptions(this.defaults, options),
+      site: this.name,
+      path: options.path,
+      limit: options.limit,
     });
   }
 
@@ -2973,6 +3042,77 @@ function requestOperation<T>(client: SymbolClient, plan: RequestPlan<T>): Operat
 
 function jsonOperation<T>(client: SymbolClient, plan: RequestPlan<T>): Operation<T> {
   return requestOperation(client, plan);
+}
+
+function searchParameters(query: string, options: Omit<SearchOptions, "page">): URLSearchParams {
+  if (typeof query !== "string" || query.trim() === "") {
+    throw new TypeError("search query must not be blank");
+  }
+  const parameters = new URLSearchParams({ q: query });
+  const path = options.path === undefined ? "" : normalizedPath(options.path, true);
+  if (options.site !== undefined) {
+    parameters.set("site", validateSiteName(options.site));
+  } else if (path !== "") {
+    throw new TypeError("search path needs a site");
+  }
+  if (path !== "") {
+    parameters.set("path", `${path}/`);
+  }
+  const limit = options.limit;
+  if (limit !== undefined) {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) {
+      throw new RangeError("search limit must be a whole number from 1 to 1000");
+    }
+    parameters.set("limit", String(limit));
+  }
+  return parameters;
+}
+
+function searchOperation(
+  client: SymbolClient,
+  parameters: URLSearchParams,
+  page: number | undefined,
+  options: RequestOptions,
+): Operation<SearchResults> {
+  const query = new URLSearchParams(parameters);
+  if (page !== undefined) {
+    if (!Number.isSafeInteger(page) || page < 1) {
+      throw new RangeError("search page must be a whole number of at least 1");
+    }
+    query.set("page", String(page));
+  }
+  const origin = stateFor(client).origin;
+  return jsonOperation(client, {
+    endpoint: "search",
+    path: `/SEARCH?${query.toString()}`,
+    method: "GET",
+    options,
+    headers: new Headers({ Accept: "application/json" }),
+    body: replayBody(null),
+    idempotencyKey: null,
+    sendIdempotencyKey: false,
+    retrySafe: true,
+    successStatuses: [200],
+    decode: async (response) => decodeSearchResults(response, origin),
+    dispose: null,
+  });
+}
+
+function searchHits(
+  client: SymbolClient,
+  parameters: URLSearchParams,
+  options: RequestOptions,
+): AsyncIterable<SearchHit> {
+  return {
+    async *[Symbol.asyncIterator]() {
+      let page: number | null = 1;
+      while (page !== null) {
+        const results: SearchResults = await searchOperation(client, parameters, page, options);
+        yield* results.results;
+        page = results.results.length === 0 ? null : results.nextPage;
+      }
+    },
+  };
 }
 
 async function executeRequest<T>(
@@ -4592,6 +4732,78 @@ async function decodeCachedDirectoryListing(response: Response): Promise<CachedD
     etag: quotedHashHeader(preserved, "ETag"),
     cacheControl: requiredHeader(preserved, "Cache-Control"),
     response: preserved,
+  });
+}
+
+async function decodeSearchResults(response: Response, origin: URL): Promise<SearchResults> {
+  if (requiredHeader(response, "Cache-Control") !== "no-cache") {
+    throw malformed(response, "unexpected Cache-Control policy");
+  }
+  const entryCount = unsignedHeader(response, "Entry-Count");
+  const value = exactRecord(
+    await jsonValue(response),
+    ["query", "site", "path", "total", "page", "limit", "results"],
+    "search results",
+  );
+  const total = unsigned(value.total, "search results.total");
+  const page = unsigned(value.page, "search results.page");
+  const limit = unsigned(value.limit, "search results.limit");
+  if (page < 1 || limit < 1) {
+    throw new TypeError("search results page and limit must be positive");
+  }
+  if (entryCount !== total) {
+    throw malformed(response, "Entry-Count disagrees with search results.total");
+  }
+  const site = nullableString(value.site, "search results.site");
+  const path = nullableString(value.path, "search results.path");
+  if (site !== null) {
+    validateSiteName(site);
+  }
+  if (path !== null && (site === null || !path.endsWith("/"))) {
+    throw new TypeError("search results.path must be a folder inside the searched site");
+  }
+  const results = array(value.results, "search results.results").map((entry, index) => {
+    const label = `search results.results[${index}]`;
+    const record = exactRecord(
+      entry,
+      ["kind", "site", "path", "name", "url", "files", "bytes", "modified"],
+      label,
+    );
+    const kind = enumValue(record.kind, ["directory", "file"] as const, `${label}.kind`);
+    const hitPath = relativePathValue(record.path, `${label}.path`);
+    const name = stringValue(record.name, `${label}.name`);
+    if (name !== hitPath.slice(hitPath.lastIndexOf("/") + 1)) {
+      throw new TypeError(`${label}.name must be the last path segment`);
+    }
+    const href = stringValue(record.url, `${label}.url`);
+    if (
+      !href.startsWith("/") ||
+      href.startsWith("//") ||
+      href.endsWith("/") !== (kind === "directory")
+    ) {
+      throw new TypeError(`${label}.url must be a root-relative ${kind} URL`);
+    }
+    const base = {
+      site: validateSiteName(stringValue(record.site, `${label}.site`)),
+      path: hitPath,
+      name,
+      url: new URL(href, origin),
+      bytes: unsigned(record.bytes, `${label}.bytes`),
+      modified: nullableDate(record.modified, `${label}.modified`),
+    };
+    return kind === "directory"
+      ? Object.freeze({ kind, ...base, files: unsigned(record.files, `${label}.files`) })
+      : Object.freeze({ kind, ...base, files: requireNull(record.files, `${label}.files`) });
+  });
+  return Object.freeze({
+    query: stringValue(value.query, "search results.query"),
+    site,
+    path,
+    total,
+    page,
+    limit,
+    nextPage: page < Math.ceil(total / limit) ? page + 1 : null,
+    results: Object.freeze(results),
   });
 }
 
