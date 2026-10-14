@@ -199,6 +199,25 @@ def execute_raw_http(example: HttpExample, managed_token: str, etag: str) -> Non
                 ("Authorization", f"Bearer {managed_token}"),
             ),
         )
+    elif example.request_line == "GET /SEARCH?q=topos&site=hello HTTP/1.1":
+        auth = (("Authorization", f"Bearer {managed_token}"),)
+        for fixture in ("topos/index.html", "topos/a.txt", "topos/b.txt", "files/topos.pdf"):
+            created = request("PUT", f"/hello/{fixture}", b"x", auth)
+            require_status("raw SEARCH fixture", created, 200)
+        observed = request(method, path, headers=(("Accept", "application/json"),))
+        require_status(example.request_line, observed, example.expected_status)
+        found = json.loads(observed.body)
+        hits = [(hit["kind"], hit["url"], hit["files"]) for hit in found["results"]]
+        if hits != [
+            ("directory", "/hello/topos/", 3),
+            ("file", "/hello/files/topos.pdf", None),
+        ] or observed.header("Entry-Count") != "2":
+            raise AssertionError(f"documented SEARCH returned {found}")
+        # Later examples send `If-Match` with the tree hash taken before this one.
+        for fixture in ("topos", "files/topos.pdf"):
+            removed = request("DELETE", f"/hello/{fixture}", headers=auth)
+            require_status("raw SEARCH cleanup", removed, 200)
+        return
     else:
         raise AssertionError(f"unmapped normative raw HTTP request: {example.request_line}")
     require_status(example.request_line, observed, example.expected_status)
@@ -213,6 +232,7 @@ def raw_http_examples() -> tuple[HttpExample, ...]:
         "REPLACE /hello/data.bin HTTP/1.1": 200,
         "GET /hello/notes.md/RAW HTTP/1.1": 200,
         "PATCH /hello/data.bin HTTP/1.1": 200,
+        "GET /SEARCH?q=topos&site=hello HTTP/1.1": 200,
     }
     found: list[HttpExample] = []
     for block in re.findall(r"```http\s*\n(.*?)\n```", API, re.DOTALL):

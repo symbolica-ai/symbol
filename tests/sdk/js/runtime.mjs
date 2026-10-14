@@ -78,7 +78,7 @@ test("media types and content formats are immutable and exact", async () => {
     }
 });
 
-test("all 41 installed endpoint mappings execute exact decoders", async () => {
+test("all 42 installed endpoint mappings execute exact decoders", async () => {
     const server = await startMockServer(artifacts.fixture);
     const hash = "a".repeat(64);
     server.expect(
@@ -106,6 +106,7 @@ test("all 41 installed endpoint mappings execute exact decoders", async () => {
             }),
         },
         { operation: "site listing", path: "/FILES", headers: { accept: "application/json" } },
+        { operation: "search", path: "/SEARCH?q=topos", headers: { accept: "application/json" } },
         { operation: "site redirect", path: "/hello" },
         { operation: "site index", path: "/hello/" },
         { operation: "site put", path: "/hello", body: "site" },
@@ -215,6 +216,7 @@ test("all 41 installed endpoint mappings execute exact decoders", async () => {
     assert.equal(version.identity.commit, esm.BUILD_COMMIT);
     assert.equal(version.identity.dirty, esm.BUILD_DIRTY);
     assert.equal((await client.sites()).entries[0].kind, "builtin");
+    assert.equal((await client.search("topos")).results[0].kind, "directory");
     assert.equal((await site.redirect()).status, 307);
     const index = await site.get();
     assert.equal(index.status, 200);
@@ -289,7 +291,134 @@ test("all 41 installed endpoint mappings execute exact decoders", async () => {
         sourceHash: esm.SOURCE_HASH,
     });
     await server.stop();
-    assert.equal(server.requests.length, 41);
+    assert.equal(server.requests.length, 42);
+});
+
+test("search validates usage, decodes ranked hits, and pages lazily", async () => {
+    const server = await startMockServer(artifacts.fixture);
+    const accept = { accept: "application/json" };
+    server.expect(
+        { operation: "search", path: "/SEARCH?q=topos", headers: accept },
+        {
+            operation: "search",
+            path: "/SEARCH?q=TOPOS+%231&site=hello&path=a+b%2F&limit=1&page=1",
+            headers: accept,
+        },
+        { operation: "search", path: "/SEARCH?q=topos&limit=2&page=1", headers: accept },
+        { operation: "search", path: "/SEARCH?q=topos&limit=2&page=2", headers: accept },
+        { operation: "search", path: "/SEARCH?q=topos&site=hello&limit=1&page=1", headers: accept },
+        { operation: "search", path: "/SEARCH?q=topos&page=9", headers: accept },
+        { operation: "search", path: "/SEARCH?q=topos&site=gone", status: 404 },
+        { operation: "search", path: "/SEARCH?q=topos", status: 500 },
+        { operation: "search", path: "/SEARCH?q=topos", headers: accept },
+        {
+            operation: "search",
+            path: "/SEARCH?q=topos",
+            responseHeaders: { "Entry-Count": "9" },
+        },
+        { operation: "search descriptor", path: "/SEARCH/opensearch.xml" },
+    );
+    const client = new esm.SymbolClient({ origin: server.origin });
+
+    for (const query of ["", "  \t", undefined]) {
+        assert.throws(() => client.search(query), TypeError);
+    }
+    assert.throws(() => client.search("topos", { path: "a" }), /search path needs a site/);
+    assert.throws(() => client.search("topos", { site: "BAD" }), TypeError);
+    assert.throws(() => client.search("topos", { site: "hello", path: "../x" }), TypeError);
+    for (const limit of [0, 1001, 1.5, Number.NaN]) {
+        assert.throws(() => client.search("topos", { limit }), RangeError);
+        assert.throws(() => client.searchAll("topos", { limit }), RangeError);
+    }
+    for (const page of [0, -1, 2.5]) {
+        assert.throws(() => client.search("topos", { page }), RangeError);
+    }
+    assert.throws(() => client.site("hello").search("topos", { limit: 0 }), RangeError);
+
+    const results = await client.search("topos");
+    assert.deepEqual(
+        { ...results, results: undefined },
+        {
+            query: "topos",
+            site: null,
+            path: null,
+            total: 4,
+            page: 1,
+            limit: 50,
+            nextPage: null,
+            results: undefined,
+        },
+    );
+    assert(Object.isFrozen(results) && Object.isFrozen(results.results));
+    const [folder, file] = results.results;
+    assert.equal(folder.kind, "directory");
+    assert.equal(folder.files, 1);
+    assert.equal(folder.url.href, `${server.origin}/hello/topos/`);
+    assert.equal(file.kind, "file");
+    assert.equal(file.files, null);
+    assert.equal(file.name, "topos.txt");
+    assert.equal(file.modified.toISOString(), "2026-08-26T12:00:00.000Z");
+    assert(Object.isFrozen(file));
+
+    await assert.rejects(
+        Promise.resolve(
+            client.site("hello", { signal: AbortSignal.abort(new Error("site default")) })
+                .search("topos"),
+        ),
+        /site default/,
+    );
+    const scoped = await client.site("hello").search("TOPOS #1", { path: "/a b/", limit: 1, page: 1 });
+    assert.equal(scoped.site, "hello");
+    assert.equal(scoped.path, "a b/");
+    assert.equal(scoped.results[0].path, "a b/Topos #1.txt");
+    assert.equal(scoped.results[0].url.pathname, "/hello/a%20b/Topos%20%231.txt");
+
+    const lazy = client.searchAll("topos", { limit: 2 });
+    assert.equal(server.requests.length, 2, "searchAll must not fetch before iteration");
+    const all = [];
+    for await (const hit of lazy) {
+        all.push(hit.path);
+    }
+    assert.deepEqual(all, ["topos", "topos.txt", "a b/Topos #1.txt", "topos/elementary-topos.md"]);
+
+    for await (const hit of client.site("hello").searchAll("topos", { limit: 1 })) {
+        assert.equal(hit.path, "topos");
+        break;
+    }
+
+    const past = await client.search("topos", { page: 9 });
+    assert.equal(past.results.length, 0);
+    assert.equal(past.total, 4);
+    assert.equal(past.nextPage, null);
+
+    await assert.rejects(
+        Promise.resolve(client.search("topos", { site: "gone" })),
+        esm.NotFoundError,
+    );
+
+    const retrying = new esm.SymbolClient({
+        origin: server.origin,
+        retryPolicy: {
+            ...esm.RetryPolicies.Default,
+            maxAttempts: 2,
+            initialDelayMs: 0,
+            maximumDelayMs: 0,
+            jitter: "none",
+        },
+    }).search("topos");
+    assert.equal((await retrying).total, 4);
+    assert.deepEqual(retrying.attempts.map((attempt) => attempt.status), [500, 200]);
+
+    await assert.rejects(
+        Promise.resolve(client.search("topos")),
+        (error) => error instanceof esm.MalformedResponseError && /Entry-Count/.test(error.body),
+    );
+
+    const descriptor = await client.request("/SEARCH/opensearch.xml");
+    assert.equal(await descriptor.text(), "<OpenSearchDescription/>\n");
+    await descriptor[Symbol.asyncDispose]();
+    await server.stop();
+    assert.equal(server.requests.length, 11);
 });
 
 test("segment encoding, credentials, naming, and custom allocation are exact", async () => {

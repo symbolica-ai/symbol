@@ -269,6 +269,7 @@ diesel::table! {
 diesel::joinable!(site_entries -> sites (site_id));
 diesel::joinable!(site_events -> sites (site_id));
 diesel::joinable!(files -> sites (site_id));
+diesel::joinable!(allocated_entries -> sites (site_id));
 diesel::joinable!(files -> blobs (hash));
 diesel::joinable!(expiry_policies -> sites (site_id));
 diesel::joinable!(path_aggregates -> sites (site_id));

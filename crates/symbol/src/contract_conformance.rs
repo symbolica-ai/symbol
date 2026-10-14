@@ -229,6 +229,28 @@ const SUCCESS_PROBES: &[Probe] = &[
     get("site listing", Site, "/FILES", 200, ETAG_NO_CACHE_HEADERS)
         .headers(&[("accept", "application/json")]),
     get(
+        "search",
+        Site,
+        "/SEARCH?q=app",
+        200,
+        &[
+            header_value("content-type", "application/json"),
+            header_value("cache-control", "no-cache"),
+            header_value("entry-count", "1"),
+        ],
+    )
+    .headers(&[("accept", "application/json")]),
+    get(
+        "search descriptor",
+        Empty,
+        "/SEARCH/opensearch.xml",
+        200,
+        &[
+            header_value("content-type", "application/opensearchdescription+xml"),
+            header_value("cache-control", "no-cache"),
+        ],
+    ),
+    get(
         "site redirect",
         Site,
         "/hello",
@@ -485,6 +507,14 @@ const SUCCESS_PROBES: &[Probe] = &[
 ];
 
 const ERROR_PROBES: &[Probe] = &[
+    get("search", Empty, "/SEARCH", 400, PLAIN_HEADER).headers(&[("accept", "application/json")]),
+    get(
+        "search",
+        Empty,
+        "/SEARCH?q=x&site=missing",
+        404,
+        PLAIN_HEADER,
+    ),
     Probe::new("unnamed put", Empty, "PUT", at("/"), 400, PLAIN_HEADER),
     get("site redirect", Empty, "/missing", 404, PLAIN_HEADER),
     get("site index", Empty, "/missing/", 404, PLAIN_HEADER),

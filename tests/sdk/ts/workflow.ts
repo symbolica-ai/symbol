@@ -17,6 +17,10 @@ const receipt = await symbol.site("ts-workflow").put("hello from TypeScript", {
 await using archive = await symbol.site("ts-workflow").archive();
 const archiveSize = (await archive.blob()).size;
 const inventory = await symbol.site("ts-workflow").files();
+const searchKinds: string[] = [];
+for await (const hit of symbol.searchAll("*", { limit: 2 })) {
+  searchKinds.push(hit.kind);
+}
 
 if (receipt.status !== 200 && receipt.status !== 201) {
   throw new Error("unexpected site PUT status");
@@ -34,5 +38,6 @@ console.log(
     putStatus: receipt.status,
     archiveSize,
     inventoryFiles: inventory.files.length,
+    searchKinds,
   }),
 );

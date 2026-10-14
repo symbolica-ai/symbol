@@ -230,6 +230,7 @@ fn render_sites_html(list: &SiteList, sort: Sort) -> String {
                 span { "sites" }
                 span { a href="/" { "docs" } }
             }
+            (crate::search::search_box(None, ""))
             .summary {
                 (list.files) " files · " (size_label(list.bytes)) " logical"
             }
@@ -286,7 +287,7 @@ fn sort_header(sort: Sort) -> Markup {
     }
 }
 
-fn date_cell(modified: Option<i64>) -> Markup {
+pub fn date_cell(modified: Option<i64>) -> Markup {
     html! {
         @if let Some(modified) = modified.and_then(known_time) {
             span.meta {
@@ -397,6 +398,7 @@ fn render_html(site: &str, rel: &str, list: &DirList, files_view: bool, sort: So
                     a href=(files_href) { "files" }
                 }
             }
+            (crate::search::search_box(Some(site), rel))
             .summary {
                 span { (list.files) " files · " (size_label(list.bytes)) " logical" }
                 @if see_site {
@@ -716,7 +718,7 @@ pub fn sort_sites(list: &mut SiteList, sort: Sort) {
 }
 
 /// `None` for the zero an entry can only carry if it was never stamped.
-const fn known_time(millis: i64) -> Option<i64> {
+pub const fn known_time(millis: i64) -> Option<i64> {
     if millis > 0 { Some(millis) } else { None }
 }
 
@@ -726,7 +728,7 @@ fn utc(millis: i64) -> time::OffsetDateTime {
 }
 
 /// `2026-10-06T14:03:12Z`: whole seconds, UTC.
-fn rfc3339(millis: i64) -> String {
+pub fn rfc3339(millis: i64) -> String {
     let time = utc(millis);
     format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
@@ -921,19 +923,7 @@ pub fn add_paging_headers(response: &mut Response, uri: &Uri, paging: Paging, to
         return;
     };
     let pages = total.div_ceil(limit).max(1);
-    let kept: Vec<&str> = uri
-        .query()
-        .unwrap_or("")
-        .split('&')
-        .filter(|pair| !pair.is_empty() && !pair.starts_with("page=") && *pair != "page")
-        .collect();
-    let link = |page: usize, rel: &str| {
-        let mut query = kept.join("&");
-        if !query.is_empty() {
-            query.push('&');
-        }
-        format!("<{}?{query}page={page}>; rel=\"{rel}\"", uri.path())
-    };
+    let link = |page: usize, rel: &str| format!("<{}>; rel=\"{rel}\"", page_href(uri, page));
     let mut links = Vec::new();
     if paging.page > 1 {
         links.push(link((paging.page - 1).min(pages), "prev"));
@@ -946,6 +936,22 @@ pub fn add_paging_headers(response: &mut Response, uri: &Uri, paging: Paging, to
     {
         headers.insert(header::LINK, value);
     }
+}
+
+/// The request's path and query with `page` set to `page`, every other
+/// parameter kept.
+pub fn page_href(uri: &Uri, page: usize) -> String {
+    let mut query = uri
+        .query()
+        .unwrap_or("")
+        .split('&')
+        .filter(|pair| !pair.is_empty() && !pair.starts_with("page=") && *pair != "page")
+        .collect::<Vec<_>>()
+        .join("&");
+    if !query.is_empty() {
+        query.push('&');
+    }
+    format!("{}?{query}page={page}", uri.path())
 }
 
 pub fn tsv_response(headers: &HeaderMap, uri: &Uri, page: TsvPage, paging: Paging) -> Response {
@@ -978,7 +984,7 @@ fn accepts(headers: &HeaderMap, media_type: &str) -> bool {
         })
 }
 
-fn wants_json(headers: &HeaderMap) -> bool {
+pub fn wants_json(headers: &HeaderMap) -> bool {
     headers
         .get(header::ACCEPT)
         .and_then(|value| value.to_str().ok())
@@ -1007,16 +1013,16 @@ fn cached_response(
 /// One line of a plain-text listing. `files` is blank for a file, `modified`
 /// for a total, and `suffix` follows the size, as in `0 B built-in`.
 #[derive(Default)]
-struct PlainRow<'a> {
-    name: &'a str,
-    files: Option<u64>,
-    bytes: u64,
-    modified: Option<i64>,
-    suffix: &'a str,
+pub struct PlainRow<'a> {
+    pub name: &'a str,
+    pub files: Option<u64>,
+    pub bytes: u64,
+    pub modified: Option<i64>,
+    pub suffix: &'a str,
 }
 
 impl PlainRow<'_> {
-    fn push(&self, out: &mut String, layout: ListingLayout) {
+    pub fn push(&self, out: &mut String, layout: ListingLayout) {
         let count = self.files.map_or_else(
             || " ".repeat(layout.count + 6),
             |files| format!("{files:>width$} files", width = layout.count),
@@ -1124,7 +1130,7 @@ fn entry_href(
     }
 }
 
-fn size_label(n: u64) -> String {
+pub fn size_label(n: u64) -> String {
     let size = HumanSize::new(n);
     if size.fraction.is_empty() {
         format!("{} {}", size.integer, size.unit)
@@ -1134,14 +1140,14 @@ fn size_label(n: u64) -> String {
 }
 
 #[derive(Clone)]
-struct HumanSize {
+pub struct HumanSize {
     integer: String,
     fraction: String,
     unit: &'static str,
 }
 
 impl HumanSize {
-    fn new(bytes: u64) -> Self {
+    pub fn new(bytes: u64) -> Self {
         let (divisor, unit) = if bytes < 1024 {
             (1, "B")
         } else if bytes < 1024 * 1024 {
@@ -1195,21 +1201,21 @@ impl HumanSize {
 }
 
 #[derive(Clone, Copy)]
-struct SizeLayout {
+pub struct SizeLayout {
     integer: usize,
     fraction: usize,
     unit: usize,
 }
 
 #[derive(Clone, Copy)]
-struct ListingLayout {
-    name: usize,
-    count: usize,
-    size: SizeLayout,
+pub struct ListingLayout {
+    pub name: usize,
+    pub count: usize,
+    pub size: SizeLayout,
 }
 
 impl SizeLayout {
-    fn from_sizes(sizes: &[HumanSize]) -> Self {
+    pub fn from_sizes(sizes: &[HumanSize]) -> Self {
         Self {
             integer: sizes
                 .iter()
@@ -1226,12 +1232,12 @@ impl SizeLayout {
     }
 }
 
-const fn digits(n: u64) -> usize {
+pub const fn digits(n: u64) -> usize {
     if n == 0 { 1 } else { n.ilog10() as usize + 1 }
 }
 
-const BASE_STYLE: &str = static_asset!("base.css");
-const STYLE: &str = static_asset!("browse.css");
+pub const BASE_STYLE: &str = static_asset!("base.css");
+pub const STYLE: &str = static_asset!("browse.css");
 
 #[cfg(test)]
 mod tests {

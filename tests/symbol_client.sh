@@ -259,6 +259,79 @@ for r in rows:
     ;;
 esac
 
+# Name search over a fixed set of hits, plus MOCK_SEARCH_MANY files in the
+# site bulk: every word must match the name (a glob with * or ?, a path with
+# /), and the hits page like the server's, as TSV or JSON.
+case "$method:$url_path" in
+  GET:*/SEARCH)
+    search_out=$(printf '%s\n' "$headers" | python3 -c '
+import fnmatch, json, os, sys, urllib.parse
+url = sys.argv[1]
+accept = sys.stdin.read()
+query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query, keep_blank_values=True)
+def arg(name, default=""):
+    return query.get(name, [default])[0]
+def fail(status, message):
+    print(status); print(""); print(""); print(message)
+    sys.exit(0)
+hits = [
+    ("directory", "hello", "topos", 2, 15, "2026-10-06T14:03:12Z"),
+    ("file", "hello", "topos/topos-intro.md", None, 5, "2026-10-06T14:03:12Z"),
+    ("file", "hello", "topos/index.html", None, 10, "2026-10-06T14:03:12Z"),
+    ("file", "hello", "notes/topos notes.txt", None, 10, "2026-10-06T14:03:12Z"),
+    ("file", "other", "topos.pdf", None, 2048, ""),
+]
+many = int(os.environ.get("MOCK_SEARCH_MANY") or 0)
+hits += [("file", "bulk", "item-%04d.txt" % i, None, i, "2026-10-06T14:03:12Z") for i in range(many)]
+words = arg("q").split()
+if not words:
+    fail(400, "error: q is required")
+if len(words) > 16:
+    fail(400, "error: q must have at most 16 words")
+site, prefix = arg("site"), arg("path")
+if site and site not in {h[1] for h in hits}:
+    fail(404, "error: site not found")
+limit, page = int(arg("limit", "50")), int(arg("page", "1"))
+if not 1 <= limit <= 1000:
+    fail(400, "error: limit must be a whole number from 1 to 1000")
+def matches(word, path, folder):
+    word = word.lower()
+    if "/" in word:
+        return word in ("/" + path + ("/" if folder else "")).lower()
+    name = path.rsplit("/", 1)[-1].lower()
+    if "*" in word or "?" in word:
+        return fnmatch.fnmatchcase(name, word)
+    return word in name
+found = [h for h in hits
+         if (not site or h[1] == site) and h[2].startswith(prefix)
+         and all(matches(w, h[2], h[0] == "directory") for w in words)]
+rows = found[(page - 1) * limit : page * limit]
+print(200)
+print(len(found))
+print("<%s&page=%d>; rel=\"next\"" % (url, page + 1) if page * limit < len(found) else "")
+if "application/json" in accept:
+    print(json.dumps({"query": " ".join(words), "site": site or None, "path": prefix or None,
+        "total": len(found), "page": page, "limit": limit, "results": [
+        {"kind": k, "site": s, "path": p, "name": p.rsplit("/", 1)[-1],
+         "url": "/%s/%s%s" % (s, urllib.parse.quote(p), "/" if k == "directory" else ""),
+         "files": f, "bytes": b, "modified": m or None} for k, s, p, f, b, m in rows]}))
+else:
+    print("kind\tsite\tpath\tfiles\tbytes\tmodified")
+    for h in rows:
+        print("\t".join("" if f is None else str(f) for f in h))
+' "$url")
+    status=$(printf '%s\n' "$search_out" | sed -n 1p)
+    files_count=$(printf '%s\n' "$search_out" | sed -n 2p)
+    files_link=$(printf '%s\n' "$search_out" | sed -n 3p)
+    body=$(printf '%s\n' "$search_out" | sed '1,3d')
+    case "$headers" in
+      *application/json*) ;;
+      *) body="${body}
+" ;;
+    esac
+    ;;
+esac
+
 if [ "$fail" = 1 ] && [ "$fail_status" = 1 ]; then
   printf 'curl: (22) The requested URL returned error: %s\n' "$status" >&2
   exit 22
@@ -336,6 +409,42 @@ finally:
 out, _ = proc.communicate()
 os.close(master)
 sys.stdout.buffer.write(out)
+raise SystemExit(proc.returncode)
+' "$@"
+}
+# Runs a command with stdout on a terminal, as a person sees it, and stderr
+# captured.
+with_stdout_tty() {
+  python3 -c '
+import os
+import pty
+import subprocess
+import sys
+
+master, slave = pty.openpty()
+try:
+    proc = subprocess.Popen(
+        sys.argv[1:],
+        stdin=subprocess.DEVNULL,
+        stdout=slave,
+        stderr=subprocess.PIPE,
+    )
+finally:
+    os.close(slave)
+chunks = []
+while True:
+    try:
+        data = os.read(master, 65536)
+    except OSError:
+        break
+    if not data:
+        break
+    chunks.append(data)
+err = proc.stderr.read()
+proc.wait()
+os.close(master)
+sys.stdout.buffer.write(b"".join(chunks).replace(b"\r\n", b"\n"))
+sys.stderr.buffer.write(err)
 raise SystemExit(proc.returncode)
 ' "$@"
 }
@@ -580,6 +689,155 @@ contains "${out}" '"path":"index.html"' &&
   python3 -c 'import json,sys; json.loads(sys.argv[1])' "${out}" &&
   ok 'ls --json prints parseable inventory JSON' ||
   not_ok 'ls --json prints parseable inventory JSON'
+
+: > "${LOG}"
+out=$("${CLIENT}" search topos 2>"${ROOT}/search-err")
+log=$(cat "${LOG}")
+[ "${out}" = 'hello/topos/                 2 files       15 B   2026-10-06 14:03Z
+hello/topos/topos-intro.md                  5 B   2026-10-06 14:03Z
+hello/notes/topos notes.txt                10 B   2026-10-06 14:03Z
+other/topos.pdf                        2.00 KiB' ] &&
+  [ ! -s "${ROOT}/search-err" ] &&
+  contains "${log}" 'URL=http://mock/SEARCH?q=topos&limit=1000&page=1' &&
+  contains "${log}" 'Accept: text/tab-separated-values' &&
+  ok 'search prints hits as SITE/PATH columns like ls' ||
+  not_ok 'search prints hits as SITE/PATH columns like ls'
+
+: > "${LOG}"
+out=$("${CLIENT}" search -s hello/notes/ Topos)
+log=$(cat "${LOG}")
+[ "${out}" = 'hello/notes/topos notes.txt  10 B   2026-10-06 14:03Z' ] &&
+  contains "${log}" 'URL=http://mock/SEARCH?q=Topos&site=hello&path=notes/&limit=1000&page=1' &&
+  ok 'search -s SITE/DIR scopes the search to a directory' ||
+  not_ok 'search -s SITE/DIR scopes the search to a directory'
+
+out=$("${CLIENT}" search topos -l -s hello)
+[ "${out}" = 'http://mock/hello/topos/                 2 files   15 B   2026-10-06 14:03Z
+http://mock/hello/topos/topos-intro.md              5 B   2026-10-06 14:03Z
+http://mock/hello/notes/topos notes.txt            10 B   2026-10-06 14:03Z' ] &&
+  ok 'search -l prints URLs the way ls -l does' ||
+  not_ok 'search -l prints URLs the way ls -l does'
+
+: > "${LOG}"
+if out=$("${CLIENT}" search '*.PDF' 'a&b c' 2>"${ROOT}/search-err"); then
+  not_ok 'search with no hits exits 1 quietly'
+elif [ "$?" -eq 1 ] && [ -z "${out}" ] && [ ! -s "${ROOT}/search-err" ] &&
+  contains "$(cat "${LOG}")" 'URL=http://mock/SEARCH?q=%2A.PDF%20a%26b%20c&limit=1000&page=1'; then
+  ok 'search with no hits exits 1 quietly'
+else
+  not_ok 'search with no hits exits 1 quietly'
+fi
+
+if out=$("${CLIENT}" search '*.pdf' -- -l); then
+  not_ok 'search -- ends flags, so a word can start with -'
+elif [ "$?" -eq 1 ] && [ -z "${out}" ] &&
+  [ "$("${CLIENT}" search -- '*.PDF')" = 'other/topos.pdf  2.00 KiB' ]; then
+  ok 'search -- ends flags, so a word can start with -'
+else
+  not_ok 'search -- ends flags, so a word can start with -'
+fi
+
+: > "${LOG}"
+out=$(MOCK_SEARCH_MANY=1205 "${CLIENT}" search -s bulk item 2>"${ROOT}/search-err")
+log=$(cat "${LOG}")
+[ "$(printf '%s\n' "${out}" | awk 'END{print NR}')" -eq 1205 ] &&
+  [ "$(printf '%s\n' "${out}" | LC_ALL=C sort -u | awk 'END{print NR}')" -eq 1205 ] &&
+  contains "${out}" 'bulk/item-1204.txt  1.18 KiB   2026-10-06 14:03Z' &&
+  [ ! -s "${ROOT}/search-err" ] &&
+  contains "${log}" 'q=item&site=bulk&limit=1000&page=1' &&
+  contains "${log}" 'q=item&site=bulk&limit=1000&page=2' &&
+  ! contains "${log}" 'page=3' &&
+  ok 'piped search is never paged and follows every server page' ||
+  not_ok 'piped search is never paged and follows every server page'
+
+: > "${LOG}"
+out=$(MOCK_SEARCH_MANY=120 with_stdout_tty "${CLIENT}" search item 2>"${ROOT}/search-err")
+err=$(cat "${ROOT}/search-err")
+[ "$(printf '%s\n' "${out}" | awk 'END{print NR}')" -eq 50 ] &&
+  contains "${out}" 'bulk/item-0049.txt' &&
+  ! contains "${out}" 'bulk/item-0050.txt' &&
+  contains "$(cat "${LOG}")" 'URL=http://mock/SEARCH?q=item&limit=50&page=1' &&
+  contains "${err}" 'page 1 of 3 (120 matches): symbol search item -p 2 for more, --all for everything' &&
+  ok 'search in a terminal shows one page and how to see the next' ||
+  not_ok 'search in a terminal shows one page and how to see the next'
+
+out=$(MOCK_SEARCH_MANY=120 with_stdout_tty "${CLIENT}" search --limit 40 -s bulk -p 2 \
+  -- 'item-*' -0 2>"${ROOT}/search-err")
+err=$(cat "${ROOT}/search-err")
+[ "$(printf '%s\n' "${out}" | awk 'END{print NR}')" -eq 40 ] &&
+  contains "${out}" 'bulk/item-0040.txt' &&
+  contains "${err}" "page 2 of 3 (120 matches): symbol search -s bulk --limit 40 -p 3 -- 'item-*' -0 for more" &&
+  ok 'search paging hint quotes words and keeps -- for dashed words' ||
+  not_ok 'search paging hint quotes words and keeps -- for dashed words'
+
+out=$(MOCK_SEARCH_MANY=120 with_stdout_tty "${CLIENT}" search --all item 2>"${ROOT}/search-err")
+[ "$(printf '%s\n' "${out}" | awk 'END{print NR}')" -eq 120 ] &&
+  [ ! -s "${ROOT}/search-err" ] &&
+  ok 'search --all in a terminal shows every match' ||
+  not_ok 'search --all in a terminal shows every match'
+
+: > "${LOG}"
+out=$("${CLIENT}" search --json -s hello -n 2 -p 2 topos)
+log=$(cat "${LOG}")
+printf '%s' "${out}" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert d["total"] == 3 and d["page"] == 2 and d["limit"] == 2, d
+assert [r["path"] for r in d["results"]] == ["notes/topos notes.txt"], d
+assert d["results"][0]["url"] == "/hello/notes/topos%20notes.txt", d
+' &&
+  contains "${log}" 'URL=http://mock/SEARCH?q=topos&site=hello&limit=2&page=2' &&
+  contains "${log}" 'Accept: application/json' &&
+  ok 'search --json writes the server JSON for the chosen page' ||
+  not_ok 'search --json writes the server JSON for the chosen page'
+
+if "${CLIENT}" search --json -s hello -n 2 -p 3 topos >/dev/null; then
+  not_ok 'search --json past the last hit exits 1'
+else
+  [ "$?" -eq 1 ] && ok 'search --json past the last hit exits 1' ||
+    not_ok 'search --json past the last hit exits 1'
+fi
+
+if out=$("${CLIENT}" search a b c d e f g h i j k l m n o p q 2>"${ROOT}/search-err"); then
+  not_ok 'search reports a rejected query and exits 2'
+elif [ "$?" -eq 2 ] && [ -z "${out}" ] &&
+  [ "$(cat "${ROOT}/search-err")" = 'error: q must have at most 16 words' ]; then
+  ok 'search reports a rejected query and exits 2'
+else
+  not_ok 'search reports a rejected query and exits 2'
+fi
+
+if "${CLIENT}" search -s nowhere topos >/dev/null 2>"${ROOT}/search-err"; then
+  not_ok 'search in an unknown site exits 2'
+elif [ "$?" -eq 2 ] && [ "$(cat "${ROOT}/search-err")" = 'error: site not found' ]; then
+  ok 'search in an unknown site exits 2'
+else
+  not_ok 'search in an unknown site exits 2'
+fi
+
+search_usage_ok=1
+: > "${LOG}"
+for search_args in '' '-s' '-p 0 x' '--limit x y' '-s bad.name x' '--all --json x' '-z x'; do
+  # shellcheck disable=SC2086
+  if "${CLIENT}" search ${search_args} >/dev/null 2>&1; then
+    search_usage_ok=0
+  elif [ "$?" -ne 2 ]; then
+    search_usage_ok=0
+  fi
+done
+"${CLIENT}" search -p 2 topos >/dev/null 2>&1 && search_usage_ok=0
+[ "${search_usage_ok}" -eq 1 ] && [ ! -s "${LOG}" ] &&
+  ok 'search usage errors exit 2 before any request' ||
+  not_ok 'search usage errors exit 2 before any request'
+
+help=$("${CLIENT}" help search)
+usage_text=$("${CLIENT}" help)
+contains "${help}" 'usage: symbol search [-l] [-s SITE[/DIR]] [-p PAGE] [--limit N | --all]' &&
+  contains "${help}" 'exits 0 with matches, 1 with none, and 2 on errors.' &&
+  contains "${usage_text}" 'symbol search [-l] [-s SITE[/DIR]] [-p PAGE] [--limit N|--all] [--json] QUERY...' &&
+  [ "$(SYMBOL_TEST_RESOLVE_ONLY=1 "${CLIENT}" sea)" = search ] &&
+  ok 'search has help and resolves from a prefix' ||
+  not_ok 'search has help and resolves from a prefix'
 
 out=$("${CLIENT}" stats --json)
 contains "${out}" '"sites":1' &&

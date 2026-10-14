@@ -122,6 +122,60 @@ with tempfile.TemporaryDirectory() as root:
         assert alias.mutation.status == 201
         assert symbol.site("python-sdk").file("latest").text() == "<h1>python</h1>"
 
+        searched = symbol.site("python-search")
+        for path in (
+            "docs/topos.txt",
+            "docs/Topos Theory.md",
+            "other/topos.txt",
+            "topos/readme.txt",
+        ):
+            searched.file(path).put("x", api.MediaTypes.TEXT)
+        results = searched.search("topos", limit=2)
+        assert (results.site, results.path, results.total) == ("python-search", None, 4)
+        assert (results.page, results.limit, len(results.results)) == (1, 2, 2)
+        folder = next(hit for hit in results.results if hit.kind == "directory")
+        assert (folder.path, folder.url, folder.files) == (
+            "topos",
+            "/python-search/topos/",
+            1,
+        )
+        assert folder.modified is not None
+        scoped = symbol.search("TOPOS theory", site="python-search", path="docs")
+        assert scoped.path == "docs/"
+        (theory,) = scoped.results
+        assert (theory.kind, theory.name, theory.files) == (
+            "file",
+            "Topos Theory.md",
+            None,
+        )
+        assert theory.url == "/python-search/docs/Topos%20Theory.md"
+        assert [hit.path for hit in symbol.search("*.md").results] == [
+            "docs/Topos Theory.md"
+        ]
+        assert {hit.path for hit in symbol.search("docs/topos").results} == {
+            "docs/topos.txt",
+            "docs/Topos Theory.md",
+        }
+        assert sorted(hit.path for hit in searched.search_all("topos", limit=1)) == [
+            "docs/Topos Theory.md",
+            "docs/topos.txt",
+            "other/topos.txt",
+            "topos",
+        ]
+        assert searched.search("topos", page=99).results == ()
+        try:
+            symbol.site("python-search-missing").search("topos")
+        except api.NotFoundError as error:
+            assert str(error) == "error: site not found"
+        else:
+            raise AssertionError("search in an unknown site succeeded")
+        try:
+            symbol.search(" ".join("w" * 17))
+        except api.ValidationError:
+            pass
+        else:
+            raise AssertionError("server accepted a 17-word search")
+
         for index, client in enumerate(
             (
                 api.HttpClient.requests(),
@@ -174,6 +228,15 @@ with tempfile.TemporaryDirectory() as root:
                     0
                 ].kind is api.DirectoryKind.BUILTIN
                 assert (await site.files()).site == "python-sdk"
+                found = await async_symbol.search("topos", site="python-search")
+                assert found.total == 4
+                async_paths = [
+                    hit.path
+                    async for hit in async_symbol.site("python-search").search_all(
+                        "topos", path="docs/", limit=1
+                    )
+                ]
+                assert sorted(async_paths) == ["docs/Topos Theory.md", "docs/topos.txt"]
                 scratch = site.file("scratch.bin")
                 await scratch.put(b"abcdef")
                 base_hash = await scratch.hash()

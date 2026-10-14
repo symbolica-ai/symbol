@@ -93,6 +93,47 @@ try {
     assert.equal(generated.status, 200);
     assert.equal(generated.entries.length >= 1, true);
 
+    await site.file("notes/Topos Theory.md").put("# topos");
+    await site.file("notes/sheaf.txt").put("sheaf");
+    await symbol.site("sdk-other").file("topos.txt").put("t");
+    const found = await symbol.search("topos");
+    assert.equal(found.total, 2);
+    assert.equal(found.site, null);
+    assert.equal(found.nextPage, null);
+    assert.deepEqual(
+        found.results.map((hit) => `${hit.site}/${hit.path}`),
+        ["sdk-other/topos.txt", "sdk-real/notes/Topos Theory.md"],
+    );
+    assert.equal(found.results[1].url.href, `${origin}/sdk-real/notes/Topos%20Theory.md`);
+    assert(found.results[1].modified instanceof Date);
+    const scoped = await site.search("TOPOS theory", { path: "notes" });
+    assert.equal(scoped.path, "notes/");
+    assert.deepEqual(scoped.results.map((hit) => hit.name), ["Topos Theory.md"]);
+    const folder = (await symbol.search("notes")).results[0];
+    assert.equal(folder.kind, "directory");
+    assert.equal(folder.files, 2);
+    assert.equal(folder.url.pathname, "/sdk-real/notes/");
+    assert.deepEqual((await site.search("*.md")).results.map((hit) => hit.path), [
+        "notes/Topos Theory.md",
+    ]);
+    assert.equal((await site.search("notes/")).total, 3);
+    const firstPage = await symbol.search("topos", { limit: 1 });
+    assert.equal(firstPage.nextPage, 2);
+    const everything = [];
+    for await (const hit of symbol.searchAll("topos", { limit: 1 })) {
+        everything.push(hit.path);
+    }
+    assert.deepEqual(everything, found.results.map((hit) => hit.path));
+    assert.equal((await symbol.search("topos", { page: 5 })).results.length, 0);
+    await assert.rejects(
+        Promise.resolve(symbol.search("topos", { site: "missing-site" })),
+        sdk.NotFoundError,
+    );
+    await assert.rejects(
+        Promise.resolve(symbol.search(Array(17).fill("a").join(" "))),
+        sdk.ValidationError,
+    );
+
     const archive = await site.archive("tar.gz");
     assert.equal((await archive.blob()).size > 0, true);
     await archive[Symbol.asyncDispose]();

@@ -12,6 +12,9 @@ JavaScript, Python 3.14, POSIX shell, and raw HTTP.
 Publishing documents? [Markdown pages](/API/MARKDOWN) covers how `.md` files
 render in a browser: syntax, front matter, theming, and scripts.
 
+Looking for something? [`/SEARCH`](/SEARCH) finds files and folders by name
+across every site.
+
 Downloadable clients:
 
 - [`/symbol.ts`](/symbol.ts), [`/symbol.js`](/symbol.js),
@@ -124,6 +127,31 @@ if (listing.status === 200) {
 }
 ```
 
+### `search(query, options?)` and `searchAll(query, options?)`
+
+`search` finds files and folders by name and returns one page of
+`SearchResults`: `query`, the `site` and `path` scope (or `null`), `total`,
+`page`, `limit`, `nextPage` (or `null`), and `results`. Every word of the query
+must match, ignoring case: a word matches part of a name, a word with `*` or
+`?` matches the whole name, and a word with `/` matches the whole path. The
+best matches come first.
+
+Each `SearchHit` has `kind` (`"directory"` or `"file"`), `site`, `path`,
+`name`, an absolute `url`, `files` (a folder's file count, `null` for a file),
+`bytes`, and `modified` (`Date` or `null`). Options are `site`, `path` (a
+directory within `site`), `limit` (1 to 1000, default 50), and `page`.
+`searchAll` takes the same options except `page`, and fetches pages as you
+iterate.
+
+```ts
+const { total, results } = await symbol.search("topos");
+for (const hit of results) console.log(hit.kind, hit.url.href);
+
+for await (const hit of symbol.searchAll("*.pdf", { site: "nlab" })) {
+  if (hit.kind === "directory") console.log(`${hit.url} (${hit.files} files)`);
+}
+```
+
 ### `create(body, options)`
 
 Creates a random site. The SDK generates one idempotency key per logical
@@ -167,6 +195,15 @@ delete omitted paths. `ifMatch` provides optimistic whole-site concurrency.
 With no path, returns the exact inventory: files, aliases, content revision,
 tree hash, creation/update timestamps, the publish timeline, and cache
 metadata. With a path, returns a browsable subtree.
+
+### `search(query, options?)` and `searchAll(query, options?)`
+
+The root methods with `site` fixed to this site; `path` narrows them to one
+directory.
+
+```ts
+const notes = await symbol.site("nlab").search("sheaf", { path: "files/", limit: 20 });
+```
 
 ### `archive(format?)` and `pop(format?)`
 
@@ -435,8 +472,16 @@ to the hierarchy. Leaving a `with` block closes only owned transports.
 
 `stats` returns exact `SymbolStats`, including `SizeDistribution`,
 `ServingStats`, `CacheStats`, and `ReaderStats`. `sites` returns
-`DirectoryListing`. `create` publishes an unnamed site. `site` constructs a
-site client. `api_client`, `api_client_hash`, `api_manual`, and `api_version`
+`DirectoryListing`. `search` finds files and folders by name and returns one
+page of `SearchResults` (`query`, `site`, `path`, `total`, `page`, `limit`,
+`results`); `search_all` yields every `SearchHit`, fetching pages lazily.
+Every query word must match, ignoring case: a word matches part of a name, a
+word with `*` or `?` the whole name, and a word with `/` the whole path. A hit
+has `kind` (`"directory"` or `"file"`), `site`, `path`, `name`, a
+root-relative `url`, `files` (`None` for a file), `bytes`, and `modified`.
+Both take `site`, `path` (a directory within `site`), and `limit` (1 to
+1000); `search` also takes `page`. `create` publishes an unnamed site. `site`
+constructs a site client. `api_client`, `api_client_hash`, `api_manual`, and `api_version`
 read built-in resources. `api_version` returns `ApiVersionDocument`, including
 the server git commit and dirty bit. `request` is the raw escape hatch.
 
@@ -447,11 +492,14 @@ with Symbol(origin=origin) as symbol:
     print(symbol.stats().serving.readers.query_micros)
     print(symbol.api_client_hash(ApiClientAsset.PYTHON))
     print(symbol.api_manual(ApiManual.PROTOCOL).text())
+    for hit in symbol.search_all("topos *.md", site="nlab"):
+        print(hit.kind, hit.url, hit.bytes)
 ```
 
 ### Site operations
 
-`files` returns the exact file/alias inventory. `archive` downloads without
+`files` returns the exact file/alias inventory. `search` and `search_all` are
+the root methods with `site` fixed. `archive` downloads without
 mutation; `pop` downloads and removes. `copy` and `move` refuse occupied
 destinations. `alias` creates one live path alias and `aliases` commits a typed
 batch atomically. `undo` applies a retained operation; `undo_stack` lists
@@ -923,6 +971,28 @@ distributions, cache, and reader metrics. `url` prints one canonical site
 URL for scripting. `api` prints the live `/API/VERSION` document: semantic
 version, absolute revision, source hash, git commit, and dirty bit. `--json`
 writes the server JSON.
+
+### `search`
+
+```sh
+symbol search topos
+symbol search '*.pdf'
+symbol search -s nlab files-web/ cell
+symbol search -s nlab/files topos
+symbol search -l --limit 20 -p 2 kan extension
+symbol search topos | grep -v pagefind
+symbol search --json topos
+```
+
+`search` finds files and folders by name across every site, best matches
+first. Every word must match, ignoring case: a word matches part of a name, a
+word with `*` or `?` matches the whole name, and a word with `/` matches the
+whole path. `-s SITE` searches one site and `-s SITE/DIR` one directory of
+it. Output has the columns of `ls`, each name written `site/path`; `-l` adds
+URLs. In a terminal it shows 50 matches a page; `-p`, `--limit`, and `--all`
+work as in `ls`, and piped output is never paged. `--` ends the flags, so a
+query can start with `-`. `--json` writes the server's JSON for one page. It
+exits `0` with matches, `1` with none, and `2` on errors.
 
 ### `rm`
 
@@ -1566,6 +1636,96 @@ Headers: body `ETag`, `Cache-Control: no-cache`,
 `Vary: Accept, User-Agent`.
 
 Canonical client: `symbol ls` / `symbol ls -l`.
+
+<!-- contract:search -->
+### `GET /SEARCH` and `GET /SEARCH/`
+
+Finds files and folders by name across every site. There is no index: each
+request searches the live paths, so a change shows up in the next search.
+
+```http
+GET /SEARCH?q=topos&site=hello HTTP/1.1
+Accept: application/json
+```
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+Cache-Control: no-cache
+Entry-Count: 2
+```
+
+```json
+{"query": "topos", "site": "hello", "path": null, "total": 2, "page": 1, "limit": 50,
+ "results": [
+  {"kind": "directory", "site": "hello", "path": "topos", "name": "topos", "url": "/hello/topos/", "files": 3, "bytes": 81234, "modified": "2026-10-06T14:03:12Z"},
+  {"kind": "file", "site": "hello", "path": "files/topos.pdf", "name": "topos.pdf", "url": "/hello/files/topos.pdf", "files": null, "bytes": 5120, "modified": "2026-09-30T08:15:00Z"}
+ ]}
+```
+
+Query parameters:
+
+`q`
+: Required; at most 256 bytes and 16 words, separated by spaces. Every word
+  must match, ignoring case. A word matches part of an entry's name, the last
+  segment of its path. A word with `*` (any run of characters) or `?` (any one)
+  matches the whole name instead, so `*.pdf` finds PDFs. A word with `/`
+  matches the whole path, written `/path` for a file and `/path/` for a
+  folder: `files/` finds everything below any `files` folder, and
+  `/topos/index.html` one file exactly.
+
+`site`
+: Searches one site. An unknown site returns `404`.
+
+`path`
+: Searches one directory of `site`, given with or without slashes; only
+  entries below it match. Requires `site`.
+
+`limit` and `page`
+: Page size, from 1 to 1000 (default 50), and which page, from 1. A page past
+  the end is empty, not an error.
+
+Results come best first: an exact name, then a name that starts with a word,
+then the rest; then shallower paths, shorter names, folders before files, and
+site and path order. A folder that matches is one hit, with the count, size,
+and newest change of every file below it; its files are hits only if they
+match too. `kind` is `directory` or `file`; `path` is site-relative, with no
+trailing slash; `url` is where the entry is served, percent-encoded, ending in
+`/` for a folder; `files` is `null` for a file; `modified` is UTC RFC 3339, or
+`null` if never stamped. Generated `symbol.toml` never matches.
+
+Negotiation follows `/FILES`. Exact `Accept: application/json` selects the
+JSON above and `Accept: text/tab-separated-values` selects TSV, with the
+listing promise that no field needs quoting:
+
+```text
+kind	site	path	files	bytes	modified
+directory	hello	topos	3	81234	2026-10-06T14:03:12Z
+file	hello	files/topos.pdf		5120	2026-09-30T08:15:00Z
+```
+
+Browsers get an HTML page with a search form, which also opens without `q`,
+and results that update as you type; curl gets aligned plain text. Every
+listing page carries a search box scoped to the directory it shows, and `/`
+focuses it.
+
+Success: `200`, including when nothing matches. Every response carries
+`Entry-Count`, the number of matches before paging; `Link` with `rel="prev"`
+and `rel="next"` points at the neighbouring pages, keeping the other
+parameters. `Cache-Control: no-cache`, `Vary: Accept, User-Agent`. A missing or
+invalid parameter returns `400`.
+
+Canonical client: `symbol search`.
+
+<!-- contract:search descriptor -->
+### `GET /SEARCH/opensearch.xml`
+
+An OpenSearch description, so a browser can add Symbol as a search engine
+pointed at `/SEARCH?q=`. HTML listings and the search page link it with
+`rel="search"`.
+
+Success: `200`, `Content-Type: application/opensearchdescription+xml`,
+`Cache-Control: no-cache`.
 
 <!-- contract:site redirect -->
 ### `GET /{name}`
@@ -2370,7 +2530,7 @@ The current service does **not** implement:
 
 - a versioned `/api` namespace, OpenAPI endpoint, or JSON error envelope;
 - access-controlled reads or private sites;
-- listing search, quotas, or per-site upload limits;
+- full-text search of file contents, quotas, or per-site upload limits;
 - WebDAV PROPFIND, multi-range responses, resumable multipart upload sessions,
   or server-side multipart upload;
 - automatic remote deletion from `symbol sync`;
@@ -2379,7 +2539,7 @@ The current service does **not** implement:
 - idempotency for named PUT, named COPY, MOVE, DELETE, EXPIRE, UNDO, management
   status, or management release;
 - conditional `If-None-Match` handling for inventory JSON, stats, hash
-  endpoints, expiry reports, undo stacks, or management status;
+  endpoints, search, expiry reports, undo stacks, or management status;
 - gzip response compression in the application itself (the sample Caddy proxy
   supplies it).
 <!-- API:PROTOCOL:END -->
