@@ -312,6 +312,11 @@ async fn serve_from(
             if !rel.is_empty() && !rel.ends_with('/') {
                 return Ok(Redirect::temporary(&format!("/{name}/{rel}/")).into_response());
             }
+            // Past the redirect the slash has done its job. The listing and
+            // the links it renders take the bare directory path, as the FILES
+            // route passes it; `docs/` would give `docs//a.txt` rows and a
+            // `..` that points back at `docs/` itself.
+            let rel = rel.trim_end_matches('/');
             let index = app
                 .run_store({
                     let name = name.to_string();
