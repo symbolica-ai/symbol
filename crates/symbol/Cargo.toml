@@ -35,6 +35,8 @@ pulldown-cmark = { version = "0.13.4", default-features = false, features = ["ht
 toml = "1.1.4"
 saphyr = { version = "0.3", default-features = false }
 saphyr-parser = { version = "0.3", default-features = false }
+scraper = { version = "0.29", default-features = false }
+ego-tree = "0.11"
 
 [dev-dependencies]
 proptest = "1.11.0"

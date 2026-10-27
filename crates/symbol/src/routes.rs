@@ -53,6 +53,7 @@ pub fn router(app: App) -> Router {
         provider: app.identity_provider.clone(),
         audit_trusted_proxy: Arc::clone(&app.audit_trusted_proxy),
     };
+    let search_indexer = Arc::clone(&app.search_indexer);
     Router::new()
         .route(contract::ROOT, get(docs).put(put_site_unnamed))
         .route(contract::HASH, get(docs_hash))
@@ -134,6 +135,10 @@ pub fn router(app: App) -> Router {
         .layer(middleware::from_fn_with_state(
             identity_config,
             resolve_creator,
+        ))
+        .layer(middleware::from_fn_with_state(
+            search_indexer,
+            search::index::wake_after_mutation,
         ))
         .layer(middleware::from_fn(log_mutation_activity))
         .layer(middleware::from_fn(attach_api_identity))

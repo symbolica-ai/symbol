@@ -169,6 +169,15 @@ form.search.mini input[type=search] {
 
 .hint a { color: var(--mark); }
 
+/* The text around a content hit, under its row. */
+.snippet {
+  grid-column: 1 / -1;
+  margin: -.25rem 0 .7rem;
+  padding: 0 .7rem 0 calc(.7rem + 3px);
+  color: var(--dim);
+  overflow-wrap: anywhere;
+}
+
 .dim { color: var(--dim); }
 
 mark {

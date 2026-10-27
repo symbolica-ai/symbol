@@ -15,6 +15,7 @@ use tokio::sync::Semaphore;
 
 use crate::docs::{API_REVISION, API_SOURCE_HASH, API_VERSION};
 use crate::page;
+use crate::search;
 use crate::store::{Store, StoreError};
 
 pub const DEFAULT_MAX_ARCHIVE_UPLOAD: u64 = 50 * 1024 * 1024;
@@ -114,6 +115,9 @@ pub struct App {
     pub pages: Arc<page::Rendered>,
     pub identity_provider: IdentityProvider,
     pub audit_trusted_proxy: Arc<[IpAddr]>,
+    /// The content indexer's wake-up and progress; its task is
+    /// `search::index::worker`.
+    pub search_indexer: Arc<search::index::Indexer>,
 }
 
 #[derive(Clone)]
@@ -187,6 +191,7 @@ impl App {
             public_url: public_url.into(),
             identity_provider,
             audit_trusted_proxy: Arc::from([]),
+            search_indexer: Arc::default(),
         }
     }
 

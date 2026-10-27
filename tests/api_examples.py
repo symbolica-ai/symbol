@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import urllib.parse
 
 
@@ -218,6 +219,43 @@ def execute_raw_http(example: HttpExample, managed_token: str, etag: str) -> Non
             removed = request("DELETE", f"/hello/{fixture}", headers=auth)
             require_status("raw SEARCH cleanup", removed, 200)
         return
+    elif (
+        example.request_line
+        == "GET /SEARCH?q=kan%20extension&by=content&site=hello HTTP/1.1"
+    ):
+        auth = (("Authorization", f"Bearer {managed_token}"),)
+        page = (
+            b"<title>Kan extension</title><nav>menu</nav>"
+            b"<p>Why are Kan extensions more frequently mentioned than Kan lifts?</p>"
+        )
+        created = request("PUT", "/hello/kan-extension/index.html", page, auth)
+        require_status("raw content SEARCH fixture", created, 200)
+        # The indexer wakes after the write; wait for it to catch up.
+        deadline = time.monotonic() + 15
+        while True:
+            observed = request(method, path, headers=(("Accept", "application/json"),))
+            require_status(example.request_line, observed, example.expected_status)
+            if observed.header("Search-Pending") == "0" and observed.header("Entry-Count") == "1":
+                break
+            if time.monotonic() > deadline:
+                raise AssertionError(
+                    f"documented content SEARCH was never indexed: {observed.body!r}"
+                )
+            time.sleep(0.1)
+        found = json.loads(observed.body)
+        hit = found["results"][0]
+        marked = [part["text"] for part in hit["snippet"] if part.get("hit")]
+        if (found["by"], found["pending"], hit["url"], hit["title"], marked) != (
+            "content",
+            0,
+            "/hello/kan-extension/",
+            "Kan extension",
+            ["Kan", "extensions", "Kan"],
+        ):
+            raise AssertionError(f"documented content SEARCH returned {found}")
+        removed = request("DELETE", "/hello/kan-extension", headers=auth)
+        require_status("raw content SEARCH cleanup", removed, 200)
+        return
     else:
         raise AssertionError(f"unmapped normative raw HTTP request: {example.request_line}")
     require_status(example.request_line, observed, example.expected_status)
@@ -233,6 +271,7 @@ def raw_http_examples() -> tuple[HttpExample, ...]:
         "GET /hello/notes.md/RAW HTTP/1.1": 200,
         "PATCH /hello/data.bin HTTP/1.1": 200,
         "GET /SEARCH?q=topos&site=hello HTTP/1.1": 200,
+        "GET /SEARCH?q=kan%20extension&by=content&site=hello HTTP/1.1": 200,
     }
     found: list[HttpExample] = []
     for block in re.findall(r"```http\s*\n(.*?)\n```", API, re.DOTALL):

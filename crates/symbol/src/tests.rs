@@ -2297,6 +2297,269 @@ async fn search_finds_names_across_sites_in_every_representation() {
     }
 }
 
+/// Two sites of text and one binary file, indexed, with the app that did it.
+async fn indexed_corpus() -> (tempfile::TempDir, Store, App, Router) {
+    let (root, store) = temp_store();
+    put_text_files(
+        &store,
+        "nlab",
+        &[
+            (
+                "kan-extension/index.html",
+                "<title>Kan extension</title><nav>menu</nav><p>Why are Kan extensions \
+                 mentioned more than Kan lifts?</p>",
+            ),
+            (
+                "sheaf.md",
+                "---\ntitle: Sheaf\n---\nA sheaf glues local data.\n",
+            ),
+            ("files/topos.pdf", "%PDF-1.4 \u{0}binary"),
+        ],
+    );
+    put_text_files(
+        &store,
+        "other",
+        &[("a b/notes.txt", "Notes\n\nkan lifts, again")],
+    );
+    let state = test_app(store.clone());
+    let app = router(state.clone());
+    // Until the indexer runs, nothing matches.
+    let waiting = get_with(&app, "/SEARCH?q=kan&by=content", &JSON).await;
+    assert_eq!(waiting.status(), StatusCode::OK);
+    assert_eq!(waiting.headers()["entry-count"], "0");
+    assert_eq!(
+        crate::search::index::index_pending(&state).await.unwrap(),
+        4
+    );
+    assert_eq!(
+        crate::search::index::index_pending(&state).await.unwrap(),
+        0,
+        "everything was indexed in one pass"
+    );
+    (root, store, state, app)
+}
+
+const JSON: [(&str, &str); 1] = [("accept", "application/json")];
+
+/// The URLs a content search for `query` (plus any other parameters) finds.
+async fn content_urls(app: &Router, query: &str) -> Vec<String> {
+    let uri = format!("/SEARCH?q={query}&by=content");
+    let results: serde_json::Value = body_json(get_with(app, &uri, &JSON).await).await;
+    results["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|hit| hit["url"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn search_finds_page_text_once_indexed() {
+    let (_root, _store, _state, app) = indexed_corpus().await;
+    let response = get_with(&app, "/SEARCH?q=kan%20extension&by=content", &JSON).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["entry-count"], "1");
+    assert_eq!(response.headers()["search-pending"], "0");
+    assert_eq!(response.headers()["cache-control"], "no-cache");
+    let results: serde_json::Value = body_json(response).await;
+    assert_eq!(results["by"], "content");
+    assert_eq!(results["pending"], 0);
+    assert_eq!(results["total"], 1);
+    let hit = &results["results"][0];
+    assert_eq!(hit["site"], "nlab");
+    assert_eq!(hit["path"], "kan-extension/index.html");
+    assert_eq!(hit["url"], "/nlab/kan-extension/");
+    assert_eq!(hit["title"], "Kan extension");
+    assert_eq!(
+        hit["snippet"],
+        serde_json::json!([
+            {"text": "Why are "},
+            {"text": "Kan", "hit": true},
+            {"text": " "},
+            {"text": "extensions", "hit": true},
+            {"text": " mentioned more than "},
+            {"text": "Kan", "hit": true},
+            {"text": " lifts?"}
+        ])
+    );
+    assert!(hit["modified"].as_str().unwrap().ends_with('Z'));
+
+    // Every word must match; exclusion, phrases and prefixes work; the
+    // Markdown title comes from its front matter.
+    assert_eq!(
+        content_urls(&app, "kan").await,
+        ["/nlab/kan-extension/", "/other/a%20b/notes.txt"]
+    );
+    assert_eq!(
+        content_urls(&app, "kan%20-extension").await,
+        ["/other/a%20b/notes.txt"]
+    );
+    // Both hold the phrase in the body; the shorter text ranks first.
+    assert_eq!(
+        content_urls(&app, "%22kan%20lifts%22").await,
+        ["/other/a%20b/notes.txt", "/nlab/kan-extension/"]
+    );
+    assert_eq!(content_urls(&app, "glu*").await, ["/nlab/sheaf.md"]);
+    let mut either = content_urls(&app, "kan%20OR%20sheaf&site=nlab").await;
+    either.sort();
+    assert_eq!(either, ["/nlab/kan-extension/", "/nlab/sheaf.md"]);
+    assert_eq!(
+        content_urls(&app, "kan&site=nlab&path=kan-extension").await,
+        ["/nlab/kan-extension/"]
+    );
+    assert!(
+        content_urls(&app, "binary").await.is_empty(),
+        "a binary file is not indexed"
+    );
+    let sheaf: serde_json::Value =
+        body_json(get_with(&app, "/SEARCH?q=glues&by=content", &JSON).await).await;
+    assert_eq!(sheaf["results"][0]["title"], "Sheaf");
+
+    // Name search is untouched by the mode's existence.
+    let names: serde_json::Value = body_json(get_with(&app, "/SEARCH?q=notes", &JSON).await).await;
+    assert_eq!(names.get("by"), None);
+    assert_eq!(names.get("pending"), None);
+}
+
+#[tokio::test]
+async fn content_search_renders_tsv_plain_text_and_html() {
+    let (_root, _store, _state, app) = indexed_corpus().await;
+    // TSV marks hits with U+E000/U+E001; plain text with asterisks.
+    let tsv = body_string(
+        get_with(
+            &app,
+            "/SEARCH?q=lifts&by=content&site=other",
+            &[("accept", "text/tab-separated-values")],
+        )
+        .await,
+    )
+    .await;
+    let mut lines = tsv.lines();
+    assert_eq!(
+        lines.next(),
+        Some("site\tpath\tbytes\tmodified\ttitle\tsnippet")
+    );
+    let row = lines.next().unwrap();
+    assert!(row.starts_with("other\ta b/notes.txt\t23\t20"), "{row}");
+    assert!(
+        row.ends_with("\tNotes\tNotes kan \u{E000}lifts\u{E001}, again"),
+        "{row}"
+    );
+    assert_eq!(lines.next(), None);
+    let plain = body_string(
+        get_with(
+            &app,
+            "/SEARCH?q=lifts&by=content&site=other",
+            &[("user-agent", "curl/8")],
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        plain,
+        "other/a b/notes.txt  Notes\n    Notes kan *lifts*, again\n1 match\n"
+    );
+
+    // The HTML page keeps the mode in its form and marks the snippet.
+    let html = body_string(
+        get_with(
+            &app,
+            "/SEARCH?q=lifts&by=content",
+            &[("accept", "text/html")],
+        )
+        .await,
+    )
+    .await;
+    assert!(
+        html.contains("<input type=\"hidden\" name=\"by\" value=\"content\">"),
+        "{html}"
+    );
+    assert!(html.contains("<mark>lifts</mark>"), "{html}");
+    assert!(html.contains("href=\"/nlab/kan-extension/\""), "{html}");
+    let empty =
+        body_string(get_with(&app, "/SEARCH?by=content", &[("accept", "text/html")]).await).await;
+    assert!(empty.contains("Type words from a page"), "{empty}");
+}
+
+#[tokio::test]
+async fn content_search_pages_follows_mutations_and_validates() {
+    let (_root, store, state, app) = indexed_corpus().await;
+    // Paging keeps the mode.
+    let response = get_with(&app, "/SEARCH?q=kan&by=content&limit=1", &JSON).await;
+    assert_eq!(
+        response.headers()["link"],
+        "</SEARCH?q=kan&by=content&limit=1&page=2>; rel=\"next\""
+    );
+
+    // Deletes and moves show at once, with no reindexing; new content is
+    // pending until the next pass.
+    store
+        .delete_file("nlab", "kan-extension/index.html")
+        .unwrap();
+    assert_eq!(content_urls(&app, "extension").await, Vec::<String>::new());
+    store
+        .put_file(
+            "nlab",
+            "moved/index.html",
+            b"<title>Kan extension</title><p>Kan lifts</p>",
+        )
+        .unwrap();
+    assert_eq!(content_urls(&app, "extension").await, Vec::<String>::new());
+    assert_eq!(
+        get_with(&app, "/SEARCH?q=extension&by=content", &JSON)
+            .await
+            .headers()["search-pending"],
+        "0",
+        "the count is as of the last pass"
+    );
+    assert_eq!(
+        crate::search::index::index_pending(&state).await.unwrap(),
+        1
+    );
+    assert_eq!(content_urls(&app, "extension").await, ["/nlab/moved/"]);
+
+    for (uri, status) in [
+        ("/SEARCH?q=x&by=contents", StatusCode::BAD_REQUEST),
+        ("/SEARCH?q=-x&by=content", StatusCode::BAD_REQUEST),
+        ("/SEARCH?q=%22%22&by=content", StatusCode::BAD_REQUEST),
+        ("/SEARCH?q=x&by=content&path=a", StatusCode::BAD_REQUEST),
+        ("/SEARCH?q=x&by=content&site=missing", StatusCode::NOT_FOUND),
+    ] {
+        let response = get_with(&app, uri, &JSON).await;
+        assert_eq!(response.status(), status, "{uri}");
+        assert_contract_status("search", status);
+    }
+}
+
+#[tokio::test]
+async fn the_indexer_wakes_after_a_mutation() {
+    let (_root, store) = temp_store();
+    let state = test_app(store.clone());
+    let app = router(state.clone());
+    let worker = tokio::spawn(crate::search::index::worker(state.clone()));
+    let response = send_body(
+        &app,
+        "PUT",
+        "/hello/notes.txt",
+        &[("content-type", "text/plain")],
+        Body::from("a note about yoneda"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let json = [("accept", "application/json")];
+    let mut found = false;
+    for _ in 0..200 {
+        let response = get_with(&app, "/SEARCH?q=yoneda&by=content", &json).await;
+        if response.headers()["entry-count"] == "1" {
+            found = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    worker.abort();
+    assert!(found, "the mutation woke the indexer");
+}
+
 #[tokio::test]
 async fn listings_offer_a_scoped_search_box_and_a_descriptor() {
     let (_root, store) = temp_store();

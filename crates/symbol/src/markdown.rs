@@ -138,7 +138,7 @@ pub fn render(page: &Page<'_>) -> String {
 // Front matter
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Syntax {
+pub enum Syntax {
     Yaml,
     Toml,
 }
@@ -148,7 +148,7 @@ enum Syntax {
 /// Front matter must open on the very first line (after an optional BOM) and
 /// must close, or it is not front matter at all: a lone leading `---` is an
 /// ordinary Markdown thematic break.
-fn split_front_matter(source: &str) -> (Option<(Syntax, &str)>, &str) {
+pub fn split_front_matter(source: &str) -> (Option<(Syntax, &str)>, &str) {
     let text = source.strip_prefix('\u{feff}').unwrap_or(source);
     let Some((first, rest)) = text.split_once('\n') else {
         return (None, source);
@@ -258,7 +258,7 @@ fn duplicate_yaml_keys(text: &str) -> Vec<String> {
     problems
 }
 
-fn parse_front_matter(syntax: Syntax, text: &str) -> Result<Value, String> {
+pub fn parse_front_matter(syntax: Syntax, text: &str) -> Result<Value, String> {
     let value = match syntax {
         Syntax::Yaml => {
             use saphyr::LoadableYamlNode as _;

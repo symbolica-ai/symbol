@@ -151,7 +151,9 @@ pub fn classify_for_scan(bytes: &[u8]) -> ScanClass {
     }
 }
 
-#[cfg(test)]
+/// Whether `bytes` read as text: valid UTF-8 with no NUL and few control
+/// characters. The in-memory form of the rule `is_text_file` applies while
+/// streaming; the content index uses it on whole blobs.
 #[must_use]
 pub fn is_text_like(bytes: &[u8]) -> bool {
     if bytes.contains(&0) || std::str::from_utf8(bytes).is_err() {

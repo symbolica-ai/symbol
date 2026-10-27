@@ -171,6 +171,7 @@ async fn main() {
     );
     state.audit_trusted_proxy = std::mem::take(&mut args.audit_trusted_proxy).into();
     tokio::spawn(expiry_worker(state.clone()));
+    tokio::spawn(search::index::worker(state.clone()));
     let app = router(state);
     let listener = listener.expect("server mode binds a listener");
     let bound = listener.local_addr().expect("bound listener address");
