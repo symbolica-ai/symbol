@@ -19,13 +19,13 @@ serde_json = "1"
 tar = "0.4"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "io-util", "net", "process", "signal", "sync"] }
-tower-http = { version = "0.6", features = ["trace"] }
+tower-http = { version = "0.7", features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 maud = "0.27.0"
 tokio-util = { version = "0.7.19", features = ["io"] }
-futures-util = "=0.3.32"
+futures-util = "0.3.34"
 time = { version = "0.3.55", features = ["formatting"] }
 subtle = "2.6.1"
 symbol-contract = { path = "../symbol-contract" }
@@ -33,13 +33,13 @@ diesel = { version = "2.3.12", features = ["sqlite", "returning_clauses_for_sqli
 libsqlite3-sys = { version = "0.38.2", features = ["bundled"] }
 pulldown-cmark = { version = "0.13.4", default-features = false, features = ["html"] }
 toml = "1.1.4"
-saphyr = { version = "0.1.0", default-features = false }
-saphyr-parser = { version = "0.1.0", default-features = false }
+saphyr = { version = "0.3", default-features = false }
+saphyr-parser = { version = "0.3", default-features = false }
 
 [dev-dependencies]
 proptest = "1.11.0"
 pulldown-cmark = "0.13.4"
-swc_core = { version = "77.0.3", default-features = false, features = ["common", "ecma_ast", "ecma_codegen", "ecma_parser_typescript", "ecma_transforms_typescript", "ecma_transforms_module", "ecma_visit"] }
+swc_core = { version = "82", default-features = false, features = ["common", "ecma_ast", "ecma_codegen", "ecma_parser_typescript", "ecma_transforms_typescript", "ecma_transforms_module", "ecma_visit"] }
 tempfile = "3"
 toml = "1.1.4"
 tower = { version = "0.5.3", features = ["util"] }
@@ -104,7 +104,7 @@ pulldown-cmark = "0.13.4"
 sea-query = { version = "1.0.2", default-features = false, features = ["backend-sqlite", "derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-swc_core = { version = "77.0.3", default-features = false, features = ["common", "ecma_ast", "ecma_codegen", "ecma_parser_typescript", "ecma_transforms_typescript", "ecma_transforms_module", "ecma_visit"] }
+swc_core = { version = "82", default-features = false, features = ["common", "ecma_ast", "ecma_codegen", "ecma_parser_typescript", "ecma_transforms_typescript", "ecma_transforms_module", "ecma_visit"] }
 symbol-contract = { path = "../symbol-contract" }
 thiserror = "2"
 toml = "1.1.4"
