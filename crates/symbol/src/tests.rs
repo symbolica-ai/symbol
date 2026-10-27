@@ -2315,3 +2315,31 @@ async fn listings_offer_a_scoped_search_box_and_a_descriptor() {
         "{descriptor}"
     );
 }
+
+#[tokio::test]
+async fn a_directory_listing_itself_links_like_its_files_view() {
+    let (_root, store) = temp_store();
+    put_text_files(
+        &store,
+        "hello",
+        &[("docs/a.txt", "a"), ("docs/sub/b.txt", "b")],
+    );
+    let app = app_router(&store);
+    let html = [("accept", "text/html")];
+    // `docs/` has no index, so the site serves its own listing. Its links come
+    // from the directory `docs`, not from the request path `docs/`: once they
+    // read `docs//a.txt`, and `..` led back to `docs/` itself.
+    let listing = body_string(get_with(&app, "/hello/docs/", &html).await).await;
+    assert!(
+        listing.contains("<a class=\"row\" href=\"/hello/\">"),
+        "{listing}"
+    );
+    assert!(listing.contains("href=\"/hello/docs/a.txt\""), "{listing}");
+    assert!(listing.contains("href=\"/hello/docs/sub/\""), "{listing}");
+    assert!(listing.contains("<input type=\"hidden\" name=\"path\" value=\"docs/\">"));
+    assert!(
+        listing.contains("placeholder=\"search hello/docs/\""),
+        "{listing}"
+    );
+    assert!(!listing.contains("docs//"), "{listing}");
+}
