@@ -291,14 +291,14 @@ fn canonical_hash_tracks_generator_source_and_swc_resolution() {
     let workspace = copied_workspace();
     let root = workspace.path();
     let initial = canonical_source_hash(root).unwrap();
+    // Re-resolve SWC to a version other than the one the lock holds, whatever
+    // that is, so a dependency update does not have to touch this test.
     let lock_path = root.join("Cargo.lock");
     let lock = fs::read_to_string(&lock_path).unwrap();
-    let changed = lock.replacen(
-        "name = \"swc_core\"\nversion = \"77.0.3\"",
-        "name = \"swc_core\"\nversion = \"77.0.4\"",
-        1,
-    );
-    assert_ne!(changed, lock, "SWC lock entry must exist");
+    let entry = "name = \"swc_core\"\nversion = \"";
+    let version_start = lock.find(entry).expect("SWC lock entry must exist") + entry.len();
+    let version_end = version_start + lock[version_start..].find('"').unwrap();
+    let changed = format!("{}-perturbed{}", &lock[..version_end], &lock[version_end..]);
     fs::write(lock_path, changed).unwrap();
     assert_ne!(canonical_source_hash(root).unwrap(), initial);
 }
