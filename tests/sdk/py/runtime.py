@@ -1,9 +1,4 @@
 #!/usr/bin/env python3
-# The SDK under test is the generated symbol.py, loaded at runtime by load_api()
-# below, so its classes reach annotations through a module variable; since
-# basedpyright 1.40 that is "not allowed in a type expression". The annotations
-# are still right, and the checker is not the gate for this file.
-# pyright: reportInvalidTypeForm=false
 from __future__ import annotations
 
 import asyncio

@@ -11,7 +11,9 @@ dependencies = [
 
 [dependency-groups]
 dev = [
-    "basedpyright",
+    # 1.40 exits 245 before printing anything inside the Nix sandbox on
+    # Linux (the `sdk-py` check), while 1.39 runs; lift once it starts.
+    "basedpyright<1.40",
     "ruff>=0.16.4",
 ]
 
