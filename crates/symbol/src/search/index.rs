@@ -86,22 +86,21 @@ pub async fn worker(app: App) {
 /// One pass over everything pending. The first pass that succeeds is the
 /// startup backfill, which ends with an optimize and a status line; the
 /// return value says whether that has happened.
-// The tracing macros count as branches, as in `expiry_worker_iteration`.
-#[expect(clippy::cognitive_complexity)]
 async fn run_pass(app: &App, backfilled: bool) -> bool {
-    let looked = match index_pending(app).await {
-        Ok(looked) => looked,
-        Err(error) => {
-            tracing::warn!(%error, "content indexing failed; retrying later");
-            return backfilled;
+    match index_pending(app).await {
+        Ok(looked) if backfilled => {
+            report_update(looked);
+            true
         }
-    };
-    if !backfilled {
-        finish_backfill(app, looked).await;
-    } else if looked > 0 {
-        tracing::info!(blobs = looked, "content index updated");
+        Ok(looked) => {
+            finish_backfill(app, looked).await;
+            true
+        }
+        Err(error) => {
+            report_failure(&error);
+            backfilled
+        }
     }
-    true
 }
 
 async fn finish_backfill(app: &App, looked: usize) {
@@ -109,6 +108,16 @@ async fn finish_backfill(app: &App, looked: usize) {
         optimize(app).await;
     }
     report_ready(app, looked).await;
+}
+
+fn report_update(looked: usize) {
+    if looked > 0 {
+        tracing::info!(blobs = looked, "content index updated");
+    }
+}
+
+fn report_failure(error: &StoreError) {
+    tracing::warn!(%error, "content indexing failed; retrying later");
 }
 
 async fn wait_for_work(app: &App) {

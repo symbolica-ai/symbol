@@ -1672,6 +1672,37 @@ pub struct SearchResults {
     pub results: Vec<SearchHit>,
 }
 
+/// What `/SEARCH` matches a query against: file and folder names, or the
+/// text of files. On the wire, the `by` query parameter and result field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchBy {
+    Name,
+    Content,
+}
+
+impl SearchBy {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Name => "name",
+            Self::Content => "content",
+        }
+    }
+}
+
+impl std::str::FromStr for SearchBy {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, ()> {
+        match value {
+            "name" => Ok(Self::Name),
+            "content" => Ok(Self::Content),
+            _ => Err(()),
+        }
+    }
+}
+
 /// A run of a snippet: text, and whether it is one of the words that matched.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct SnippetPart {
@@ -1702,8 +1733,9 @@ pub struct ContentSearchHit {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ContentSearchResults {
     pub query: String,
-    /// Always `content`; the field tells the two result shapes apart.
-    pub by: &'static str,
+    /// Always [`SearchBy::Content`]; the field tells the two result shapes
+    /// apart.
+    pub by: SearchBy,
     pub site: Option<String>,
     /// The directory searched below, ending in `/`.
     pub path: Option<String>,

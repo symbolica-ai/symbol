@@ -24,7 +24,8 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 use symbol_contract::{
-    ContentSearchHit, ContentSearchResults, SearchHit, SearchHitKind, SearchResults, SnippetPart,
+    ContentSearchHit, ContentSearchResults, SearchBy, SearchHit, SearchHitKind, SearchResults,
+    SnippetPart,
 };
 
 use crate::api_error::ApiError;
@@ -55,20 +56,14 @@ pub struct SearchQuery {
     page: Option<String>,
 }
 
-/// What a query is matched against.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum By {
-    Name,
-    Content,
-}
-
-impl By {
-    fn parse(value: Option<&str>) -> Result<Self, ApiError> {
-        match value.map(str::trim) {
-            None | Some("" | "name") => Ok(Self::Name),
-            Some("content") => Ok(Self::Content),
-            Some(_) => Err("error: by must be name or content\n".into()),
-        }
+/// The `by` parameter: names unless it says otherwise. Parsed by hand, as
+/// `limit` and `page` are, so a bad value gets the same `error:` line.
+fn parse_by(value: Option<&str>) -> Result<SearchBy, ApiError> {
+    match value.map(str::trim) {
+        None | Some("") => Ok(SearchBy::Name),
+        Some(value) => value
+            .parse()
+            .map_err(|()| "error: by must be name or content\n".into()),
     }
 }
 
@@ -309,7 +304,7 @@ fn find(terms: &[Term], prefix: &str, candidates: &[SearchCandidate]) -> Vec<Hit
 struct Search {
     /// `q` with surrounding whitespace removed.
     query: String,
-    by: By,
+    by: SearchBy,
     /// The name words; empty for a content search.
     terms: Vec<Term>,
     /// The FTS5 expression of a content search with a query.
@@ -324,7 +319,7 @@ struct Search {
 impl Search {
     /// `allow_empty` lets a browser open the search page before typing.
     fn parse(query: SearchQuery, allow_empty: bool) -> Result<Self, ApiError> {
-        let by = By::parse(query.by.as_deref())?;
+        let by = parse_by(query.by.as_deref())?;
         let text = query.q.as_deref().unwrap_or("").trim().to_string();
         if text.is_empty() && !allow_empty {
             return Err("error: q is required\n".into());
@@ -336,9 +331,9 @@ impl Search {
             return Err("error: q must have at most 16 words\n".into());
         }
         let (terms, expression) = match by {
-            By::Name => (text.split_whitespace().map(Term::parse).collect(), None),
-            By::Content if text.is_empty() => (Vec::new(), None),
-            By::Content => (Vec::new(), Some(query::to_match(&text)?)),
+            SearchBy::Name => (text.split_whitespace().map(Term::parse).collect(), None),
+            SearchBy::Content if text.is_empty() => (Vec::new(), None),
+            SearchBy::Content => (Vec::new(), Some(query::to_match(&text)?)),
         };
         let site = query.site.filter(|site| !site.is_empty());
         let raw_path = query.path.unwrap_or_default();
@@ -388,7 +383,7 @@ impl Search {
     }
 
     /// A `/SEARCH` URL for this search with `site`, `path` and `by` replaced.
-    fn href(&self, site: Option<&str>, prefix: &str, by: By) -> String {
+    fn href(&self, site: Option<&str>, prefix: &str, by: SearchBy) -> String {
         let mut href = String::from("/SEARCH?q=");
         encode_path_segment(&mut href, &self.query);
         if let Some(site) = site {
@@ -399,8 +394,9 @@ impl Search {
                 encode_path_segment(&mut href, prefix);
             }
         }
-        if by == By::Content {
-            href.push_str("&by=content");
+        if by == SearchBy::Content {
+            href.push_str("&by=");
+            href.push_str(by.as_str());
         }
         href
     }
@@ -560,8 +556,8 @@ pub async fn search(
     let format = Format::of(&headers);
     let search = Search::parse(query, format == Format::Html)?;
     match search.by {
-        By::Name => search_names(&app, search, format, &uri).await,
-        By::Content => search_contents(&app, search, format, &uri).await,
+        SearchBy::Name => search_names(&app, search, format, &uri).await,
+        SearchBy::Content => search_contents(&app, search, format, &uri).await,
     }
 }
 
@@ -655,7 +651,7 @@ async fn search_contents(
         Format::Json => {
             let results = ContentSearchResults {
                 query: search.query.clone(),
-                by: "content",
+                by: SearchBy::Content,
                 site: search.site.clone(),
                 path: (!search.prefix.is_empty()).then(|| search.prefix.clone()),
                 total: u64::try_from(total).expect("count fits in u64"),
@@ -952,8 +948,8 @@ fn search_page(search: &Search, sites: &[String], placeholder: &str, results: &M
                         (search.prefix) " ×"
                     }
                 }
-                @if search.by == By::Content {
-                    input type="hidden" name="by" value="content";
+                @if search.by == SearchBy::Content {
+                    input type="hidden" name="by" value=(search.by.as_str());
                 }
                 button { "search" }
             }
@@ -1003,9 +999,9 @@ fn render_html(search: &Search, hits: &[Hit], total: usize, sites: &[String], ur
         } @else if total == 0 {
             p.hint {
                 "No file or folder names match “" (search.query) "”."
-                " " a href=(search.href(search.site.as_deref(), &search.prefix, By::Content)) { "Search page text instead" } "."
+                " " a href=(search.href(search.site.as_deref(), &search.prefix, SearchBy::Content)) { "Search page text instead" } "."
                 @if search.site.is_some() {
-                    " " a href=(search.href(None, "", By::Name)) { "Search all sites" } "."
+                    " " a href=(search.href(None, "", SearchBy::Name)) { "Search all sites" } "."
                 }
             }
         } @else {
@@ -1049,9 +1045,9 @@ fn render_content_html(
         } @else if total == 0 {
             p.hint {
                 "No pages contain “" (search.query) "”."
-                " " a href=(search.href(search.site.as_deref(), &search.prefix, By::Name)) { "Search names instead" } "."
+                " " a href=(search.href(search.site.as_deref(), &search.prefix, SearchBy::Name)) { "Search names instead" } "."
                 @if search.site.is_some() {
-                    " " a href=(search.href(None, "", By::Content)) { "Search all sites" } "."
+                    " " a href=(search.href(None, "", SearchBy::Content)) { "Search all sites" } "."
                 }
             }
         } @else {
