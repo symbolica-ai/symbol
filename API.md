@@ -1640,8 +1640,12 @@ Canonical client: `symbol ls` / `symbol ls -l`.
 <!-- contract:search -->
 ### `GET /SEARCH` and `GET /SEARCH/`
 
-Finds files and folders by name across every site. There is no index: each
-request searches the live paths, so a change shows up in the next search.
+Finds files and folders by name across every site, or, with `by=content`,
+the files whose text holds the query. Name search has no index: each request
+searches the live paths. Content search reads an index the server keeps in
+step with every site, so new text is findable a moment after it is
+published, and `Search-Pending` says how much is still waiting. In both,
+a delete, move or replacement shows in the next search.
 
 ```http
 GET /SEARCH?q=topos&site=hello HTTP/1.1
@@ -1674,6 +1678,17 @@ Query parameters:
   folder: `files/` finds everything below any `files` folder, and
   `/topos/index.html` one file exactly.
 
+  With `by=content`, every word must appear in a file's text, ignoring case,
+  accents and inflection, so `extension` finds `extensions` and `cech` finds
+  `Čech`. `"a phrase"` must appear as written, `-word` must not appear, `OR`
+  between two words takes either, and `ext*` matches a prefix. A hyphenated
+  word is a phrase. A query with nothing to look for, such as only
+  exclusions, returns `400`.
+
+`by`
+: `name`, the default, or `content`. The two return different result shapes,
+  below.
+
 `site`
 : Searches one site. An unknown site returns `404`.
 
@@ -1685,14 +1700,52 @@ Query parameters:
 : Page size, from 1 to 1000 (default 50), and which page, from 1. A page past
   the end is empty, not an error.
 
-Results come best first: an exact name, then a name that starts with a word,
-then the rest; then shallower paths, shorter names, folders before files, and
-site and path order. A folder that matches is one hit, with the count, size,
-and newest change of every file below it; its files are hits only if they
-match too. `kind` is `directory` or `file`; `path` is site-relative, with no
-trailing slash; `url` is where the entry is served, percent-encoded, ending in
-`/` for a folder; `files` is `null` for a file; `modified` is UTC RFC 3339, or
-`null` if never stamped. Generated `symbol.toml` never matches.
+Name results come best first: an exact name, then a name that starts with a
+word, then the rest; then shallower paths, shorter names, folders before
+files, and site and path order. A folder that matches is one hit, with the
+count, size, and newest change of every file below it; its files are hits only
+if they match too. `kind` is `directory` or `file`; `path` is site-relative,
+with no trailing slash; `url` is where the entry is served, percent-encoded,
+ending in `/` for a folder; `files` is `null` for a file; `modified` is UTC
+RFC 3339, or `null` if never stamped. Generated `symbol.toml` never matches.
+
+Content results are files, by relevance: a word in the title counts ten times
+one in the text, then site and path order keeps pages stable.
+
+```http
+GET /SEARCH?q=kan%20extension&by=content&site=hello HTTP/1.1
+Accept: application/json
+```
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+Cache-Control: no-cache
+Entry-Count: 1
+Search-Pending: 0
+```
+
+```json
+{"query": "kan extension", "by": "content", "site": "hello", "path": null, "total": 1, "page": 1, "limit": 50, "pending": 0,
+ "results": [
+  {"site": "hello", "path": "kan-extension/index.html", "url": "/hello/kan-extension/", "title": "Kan extension", "bytes": 81234, "modified": "2026-10-06T14:03:12Z",
+   "snippet": [{"text": "Why are "}, {"text": "Kan", "hit": true}, {"text": " "}, {"text": "extensions", "hit": true}, {"text": " more frequently mentioned than Kan lifts?"}]}
+ ]}
+```
+
+`by` is always `content`, which tells the two shapes apart. `pending`, like
+the `Search-Pending` header, counts the live files whose text is not indexed
+yet, so results may miss them; it is `0` once the index has caught up.
+`title` is a page's `<title>` or first heading, a Markdown file's front-matter
+`title` or first heading, or the first line of any other text file, and empty
+when there is none. `snippet` is the text around the matches, in order, each
+run marked `hit: true` when it is one; it is never HTML and never offsets, so
+no client has to count code units. `url` is where the file is served, with an
+index page as its directory. Every file whose bytes are text is indexed,
+whatever its extension; in HTML, scripts, styles, navigation and anything
+marked `data-pagefind-ignore` are left out, and when a page marks a
+`data-pagefind-body`, only that is taken. Files over 16 MiB and the first
+1 MiB of text beyond are not indexed.
 
 Negotiation follows `/FILES`. Exact `Accept: application/json` selects the
 JSON above and `Accept: text/tab-separated-values` selects TSV, with the
@@ -1704,16 +1757,26 @@ directory	hello	topos	3	81234	2026-10-06T14:03:12Z
 file	hello	files/topos.pdf		5120	2026-09-30T08:15:00Z
 ```
 
+Content TSV has its own columns, and wraps each hit in the snippet in U+E000
+and U+E001, private-use characters that never occur in indexed text:
+
+```text
+site	path	bytes	modified	title	snippet
+hello	kan-extension/index.html	81234	2026-10-06T14:03:12Z	Kan extension	Why are \uE000Kan\uE001 \uE000extensions\uE001 more frequently mentioned than Kan lifts?
+```
+
 Browsers get an HTML page with a search form, which also opens without `q`,
-and results that update as you type; curl gets aligned plain text. Every
-listing page carries a search box scoped to the directory it shows, and `/`
-focuses it.
+and results that update as you type; curl gets aligned plain text, and for
+content each hit as `site/path  title` with the snippet below it, the
+matched words between asterisks. Every listing page carries a search box
+scoped to the directory it shows, and `/` focuses it.
 
 Success: `200`, including when nothing matches. Every response carries
 `Entry-Count`, the number of matches before paging; `Link` with `rel="prev"`
 and `rel="next"` points at the neighbouring pages, keeping the other
-parameters. `Cache-Control: no-cache`, `Vary: Accept, User-Agent`. A missing or
-invalid parameter returns `400`.
+parameters; a content response also carries `Search-Pending`.
+`Cache-Control: no-cache`, `Vary: Accept, User-Agent`. A missing or invalid
+parameter returns `400`.
 
 Canonical client: `symbol search`.
 
@@ -2530,7 +2593,7 @@ The current service does **not** implement:
 
 - a versioned `/api` namespace, OpenAPI endpoint, or JSON error envelope;
 - access-controlled reads or private sites;
-- full-text search of file contents, quotas, or per-site upload limits;
+- quotas or per-site upload limits;
 - WebDAV PROPFIND, multi-range responses, resumable multipart upload sessions,
   or server-side multipart upload;
 - automatic remote deletion from `symbol sync`;

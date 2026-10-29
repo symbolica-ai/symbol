@@ -79,6 +79,10 @@ configurable with the defaults above.
 SQLite stores sites, paths, hashes, sizes, and other metadata in
 `SYMBOL_ROOT/symbol.db`. Immutable, Blake3-addressed payloads are stored under
 `SYMBOL_ROOT/blobs/`; transient uploads use `SYMBOL_ROOT/tmp/`.
+`SYMBOL_ROOT/search.sqlite` is the content-search index: derived from the
+blobs, keyed by their hashes, filled by a background task after every write,
+and rebuilt from scratch when its recorded format no longer matches the
+binary's. It can be deleted at any time while the service is stopped.
 
 Startup enables WAL, normal synchronous mode, foreign keys, and a five-second
 SQLite busy timeout. The schema is the hand-maintained SQL in
@@ -104,6 +108,8 @@ Back up before upgrading; there is no downgrade migration.
 
 Back up the complete `SYMBOL_ROOT`, not only `symbol.db`. For a directly
 copyable, consistent snapshot, stop the service and copy the entire directory.
+`search.sqlite` and its `-wal`/`-shm` files may be left out: the index is
+rebuilt from the blobs.
 
 ## Operations
 

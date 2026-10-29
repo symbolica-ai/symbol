@@ -23,6 +23,8 @@ pub enum RequestVariant {
     Finalize,
     Propose,
     Cancel,
+    /// A search with `by=content`.
+    Content,
 }
 
 impl RequestVariant {
@@ -34,6 +36,7 @@ impl RequestVariant {
             Self::Finalize => "finalize",
             Self::Propose => "propose",
             Self::Cancel => "cancel",
+            Self::Content => "content",
         }
     }
 }
@@ -235,6 +238,7 @@ pub enum WireSchema {
     FileReplaceReceipt,
     SpliceReceipt,
     SearchResults,
+    ContentSearchResults,
     Error,
 }
 
@@ -687,6 +691,7 @@ pub static ENDPOINTS: &[EndpointContract] = &[
             "Cache-Control",
             "Entry-Count",
             "Link",
+            "Search-Pending",
             "Vary",
         ],
         outcomes: &[
@@ -695,6 +700,18 @@ pub static ENDPOINTS: &[EndpointContract] = &[
                 WireSchema::SearchResults,
                 &["Content-Type", "Cache-Control", "Entry-Count"],
             )
+            .optional(&["Link"]),
+            json(
+                200,
+                WireSchema::ContentSearchResults,
+                &[
+                    "Content-Type",
+                    "Cache-Control",
+                    "Entry-Count",
+                    "Search-Pending",
+                ],
+            )
+            .variant(RequestVariant::Content)
             .optional(&["Link"]),
             err(400),
             err(404),
@@ -1653,6 +1670,81 @@ pub struct SearchResults {
     pub page: u64,
     pub limit: u64,
     pub results: Vec<SearchHit>,
+}
+
+/// What `/SEARCH` matches a query against: file and folder names, or the
+/// text of files. On the wire, the `by` query parameter and result field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchBy {
+    Name,
+    Content,
+}
+
+impl SearchBy {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Name => "name",
+            Self::Content => "content",
+        }
+    }
+}
+
+impl std::str::FromStr for SearchBy {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, ()> {
+        match value {
+            "name" => Ok(Self::Name),
+            "content" => Ok(Self::Content),
+            _ => Err(()),
+        }
+    }
+}
+
+/// A run of a snippet: text, and whether it is one of the words that matched.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SnippetPart {
+    pub text: String,
+    /// Present, and `true`, only on a matched run.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub hit: bool,
+}
+
+/// One file whose text matched a content search.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ContentSearchHit {
+    pub site: String,
+    /// Site-relative, without a trailing slash.
+    pub path: String,
+    /// Where the file is served: its directory URL for an index page.
+    pub url: String,
+    /// From the document; empty when it has none.
+    pub title: String,
+    pub bytes: u64,
+    /// When the content last changed, UTC RFC 3339.
+    pub modified: Option<String>,
+    /// Text around the matches, in order. Never HTML, never offsets.
+    pub snippet: Vec<SnippetPart>,
+}
+
+/// One page of content-search results, for `by=content`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ContentSearchResults {
+    pub query: String,
+    /// Always [`SearchBy::Content`]; the field tells the two result shapes
+    /// apart.
+    pub by: SearchBy,
+    pub site: Option<String>,
+    /// The directory searched below, ending in `/`.
+    pub path: Option<String>,
+    pub total: u64,
+    pub page: u64,
+    pub limit: u64,
+    /// Live files whose text is not indexed yet; results may miss them.
+    pub pending: u64,
+    pub results: Vec<ContentSearchHit>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]

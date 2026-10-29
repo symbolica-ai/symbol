@@ -506,12 +506,42 @@ const SUCCESS_PROBES: &[Probe] = &[
     .body(b"X"),
 ];
 
+/// The `by=content` variant of the search endpoint; its primary probe is the
+/// name search above.
+const CONTENT_SEARCH_PROBE: Probe = get(
+    "search",
+    Site,
+    "/SEARCH?q=console&by=content",
+    200,
+    &[
+        header_value("content-type", "application/json"),
+        header_value("cache-control", "no-cache"),
+        header_value("entry-count", "1"),
+        header_value("search-pending", "0"),
+    ],
+)
+.headers(&[("accept", "application/json")]);
+
 const ERROR_PROBES: &[Probe] = &[
     get("search", Empty, "/SEARCH", 400, PLAIN_HEADER).headers(&[("accept", "application/json")]),
     get(
         "search",
         Empty,
         "/SEARCH?q=x&site=missing",
+        404,
+        PLAIN_HEADER,
+    ),
+    get(
+        "search",
+        Empty,
+        "/SEARCH?q=-x&by=content",
+        400,
+        PLAIN_HEADER,
+    ),
+    get(
+        "search",
+        Empty,
+        "/SEARCH?q=x&by=content&site=missing",
         404,
         PLAIN_HEADER,
     ),
@@ -936,7 +966,10 @@ async fn fixture(kind: Fixture) -> (tempfile::TempDir, Store, Router) {
     if matches!(kind, Fixture::Managed) {
         store.operator_claim("hello").unwrap();
     }
-    let app = router(App::new(store.clone()));
+    let state = App::new(store.clone());
+    // Content search needs the fixture's text indexed, as the task would.
+    crate::search::index::index_pending(&state).await.unwrap();
+    let app = router(state);
     if matches!(kind, Fixture::Undo) {
         let response = send(&app, "PUT", "/hello/undo.txt", &[], "undo me").await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -1125,6 +1158,14 @@ async fn assert_exact_outcome(probe: Probe, response: Response) {
 }
 
 fn probe_variant(probe: Probe) -> contract::RequestVariant {
+    if probe.endpoint == "search" {
+        return match probe.target {
+            Target::Literal(path) if path.contains("by=content") => {
+                contract::RequestVariant::Content
+            }
+            _ => contract::RequestVariant::Default,
+        };
+    }
     if probe.endpoint != "allocated file" {
         return contract::RequestVariant::Default;
     }
@@ -1313,6 +1354,20 @@ async fn every_contract_endpoint_executes_success_and_normative_error_probes() {
     for probe in SUCCESS_PROBES.iter().chain(ERROR_PROBES) {
         execute(*probe).await;
     }
+}
+
+#[tokio::test]
+async fn content_search_executes_its_contract_variant() {
+    assert!(
+        endpoint("search")
+            .exact_outcome(
+                contract::OutcomeKind::Success,
+                200,
+                contract::RequestVariant::Content
+            )
+            .is_some()
+    );
+    execute(CONTENT_SEARCH_PROBE).await;
 }
 
 #[tokio::test]

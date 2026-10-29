@@ -1,11 +1,19 @@
-//! Name search: `GET /SEARCH` and its `OpenSearch` descriptor.
+//! Search: `GET /SEARCH` and its `OpenSearch` descriptor.
 //!
-//! A query is words separated by spaces, and an entry must match every word,
-//! ignoring case. A word matches the last segment of a file or folder path:
-//! as a substring, or, when it holds `*` or `?`, as a glob over the whole
-//! name. A word holding `/` matches the path instead, written `/path` for a
-//! file and `/path/` for a folder: as a substring, or as a glob that ends the
-//! path and starts at a folder boundary.
+//! By default, `by=name`, a query is words separated by spaces, and an entry
+//! must match every word, ignoring case. A word matches the last segment of a
+//! file or folder path: as a substring, or, when it holds `*` or `?`, as a
+//! glob over the whole name. A word holding `/` matches the path instead,
+//! written `/path` for a file and `/path/` for a folder: as a substring, or
+//! as a glob that ends the path and starts at a folder boundary.
+//!
+//! With `by=content` the query is the language in [`query`], and the hits
+//! are the live files whose text matches, from the index that [`index`]
+//! keeps and [`extract`] fills; `store::search` holds the SQL.
+
+pub mod extract;
+pub mod index;
+pub mod query;
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -15,7 +23,10 @@ use axum::extract::{OriginalUri, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use maud::{DOCTYPE, Markup, PreEscaped, html};
-use symbol_contract::{SearchHit, SearchHitKind, SearchResults};
+use symbol_contract::{
+    ContentSearchHit, ContentSearchResults, SearchBy, SearchHit, SearchHitKind, SearchResults,
+    SnippetPart,
+};
 
 use crate::api_error::ApiError;
 use crate::app::App;
@@ -24,21 +35,36 @@ use crate::browse::{
 };
 use crate::mutation_http::encode_path_segment;
 use crate::page;
-use crate::store::{SearchCandidate, normalize_search_prefix};
+use crate::store::{self, SearchCandidate, normalize_search_prefix};
 
 pub const DEFAULT_LIMIT: usize = 50;
 pub const MAX_LIMIT: usize = 1000;
 const MAX_QUERY_BYTES: usize = 256;
 const MAX_WORDS: usize = 16;
 const TSV_HEADER: &str = "kind\tsite\tpath\tfiles\tbytes\tmodified";
+const CONTENT_TSV_HEADER: &str = "site\tpath\tbytes\tmodified\ttitle\tsnippet";
+/// Files whose text is not yet searchable, on every content response.
+const PENDING_HEADER: &str = "search-pending";
 
 #[derive(Debug, Default, serde::Deserialize)]
 pub struct SearchQuery {
     q: Option<String>,
     site: Option<String>,
     path: Option<String>,
+    by: Option<String>,
     limit: Option<String>,
     page: Option<String>,
+}
+
+/// The `by` parameter: names unless it says otherwise. Parsed by hand, as
+/// `limit` and `page` are, so a bad value gets the same `error:` line.
+fn parse_by(value: Option<&str>) -> Result<SearchBy, ApiError> {
+    match value.map(str::trim) {
+        None | Some("") => Ok(SearchBy::Name),
+        Some(value) => value
+            .parse()
+            .map_err(|()| "error: by must be name or content\n".into()),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -278,7 +304,11 @@ fn find(terms: &[Term], prefix: &str, candidates: &[SearchCandidate]) -> Vec<Hit
 struct Search {
     /// `q` with surrounding whitespace removed.
     query: String,
+    by: SearchBy,
+    /// The name words; empty for a content search.
     terms: Vec<Term>,
+    /// The FTS5 expression of a content search with a query.
+    expression: Option<String>,
     site: Option<String>,
     /// `dir/`, or empty.
     prefix: String,
@@ -289,6 +319,7 @@ struct Search {
 impl Search {
     /// `allow_empty` lets a browser open the search page before typing.
     fn parse(query: SearchQuery, allow_empty: bool) -> Result<Self, ApiError> {
+        let by = parse_by(query.by.as_deref())?;
         let text = query.q.as_deref().unwrap_or("").trim().to_string();
         if text.is_empty() && !allow_empty {
             return Err("error: q is required\n".into());
@@ -296,10 +327,14 @@ impl Search {
         if text.len() > MAX_QUERY_BYTES {
             return Err("error: q must be at most 256 bytes\n".into());
         }
-        let terms: Vec<Term> = text.split_whitespace().map(Term::parse).collect();
-        if terms.len() > MAX_WORDS {
+        if text.split_whitespace().count() > MAX_WORDS {
             return Err("error: q must have at most 16 words\n".into());
         }
+        let (terms, expression) = match by {
+            SearchBy::Name => (text.split_whitespace().map(Term::parse).collect(), None),
+            SearchBy::Content if text.is_empty() => (Vec::new(), None),
+            SearchBy::Content => (Vec::new(), Some(query::to_match(&text)?)),
+        };
         let site = query.site.filter(|site| !site.is_empty());
         let raw_path = query.path.unwrap_or_default();
         if site.is_none() && !raw_path.trim_matches('/').is_empty() {
@@ -320,7 +355,9 @@ impl Search {
             .ok_or("error: page must be a whole number of at least 1\n")?;
         Ok(Self {
             query: text,
+            by,
             terms,
+            expression,
             site,
             prefix,
             limit,
@@ -336,13 +373,17 @@ impl Search {
         total.div_ceil(self.limit).max(1)
     }
 
+    const fn offset(&self) -> usize {
+        (self.page - 1).saturating_mul(self.limit)
+    }
+
     fn slice<'a>(&self, hits: &'a [Hit]) -> &'a [Hit] {
-        let start = (self.page - 1).saturating_mul(self.limit).min(hits.len());
+        let start = self.offset().min(hits.len());
         &hits[start..(start + self.limit).min(hits.len())]
     }
 
-    /// A `/SEARCH` URL for this search with `site` and `path` replaced.
-    fn href(&self, site: Option<&str>, prefix: &str) -> String {
+    /// A `/SEARCH` URL for this search with `site`, `path` and `by` replaced.
+    fn href(&self, site: Option<&str>, prefix: &str, by: SearchBy) -> String {
         let mut href = String::from("/SEARCH?q=");
         encode_path_segment(&mut href, &self.query);
         if let Some(site) = site {
@@ -353,8 +394,134 @@ impl Search {
                 encode_path_segment(&mut href, prefix);
             }
         }
+        if by == SearchBy::Content {
+            href.push_str("&by=");
+            href.push_str(by.as_str());
+        }
         href
     }
+
+    fn scope_label(&self) -> String {
+        match (&self.site, self.prefix.as_str()) {
+            (None, _) => "all sites".to_string(),
+            (Some(site), prefix) => format!("{site}/{prefix}"),
+        }
+    }
+
+    fn title(&self) -> String {
+        if self.query.is_empty() {
+            "search".to_string()
+        } else {
+            format!("{} · search", self.query)
+        }
+    }
+}
+
+/// One content hit as rendered: the store's row with its URL and the
+/// snippet split into runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContentHit {
+    site: String,
+    path: String,
+    bytes: u64,
+    modified: i64,
+    title: String,
+    snippet: Vec<SnippetPart>,
+}
+
+impl ContentHit {
+    fn from_store(hit: store::ContentHit) -> Self {
+        Self {
+            site: hit.site,
+            path: hit.path,
+            bytes: hit.bytes.cast_unsigned(),
+            modified: hit.modified,
+            title: hit.title,
+            snippet: snippet_parts(hit.snippet.as_deref().unwrap_or_default()),
+        }
+    }
+
+    fn name(&self) -> &str {
+        self.path.rsplit('/').next().unwrap_or(&self.path)
+    }
+
+    /// Where the file is served, with an index page as its directory, the
+    /// way a listing links it.
+    fn url(&self) -> String {
+        let mut url = format!("/{}", self.site);
+        let index = matches!(self.name(), "index.html" | "index.htm");
+        let segments: Vec<&str> = self.path.split('/').collect();
+        let kept = if index {
+            &segments[..segments.len() - 1]
+        } else {
+            &segments[..]
+        };
+        for segment in kept {
+            url.push('/');
+            encode_path_segment(&mut url, segment);
+        }
+        if index {
+            url.push('/');
+        }
+        url
+    }
+
+    fn to_wire(&self) -> ContentSearchHit {
+        ContentSearchHit {
+            site: self.site.clone(),
+            path: self.path.clone(),
+            url: self.url(),
+            title: self.title.clone(),
+            bytes: self.bytes,
+            modified: browse::known_time(self.modified).map(browse::rfc3339),
+            snippet: self.snippet.clone(),
+        }
+    }
+
+    /// The snippet as the store marks it, for TSV.
+    fn marked_snippet(&self) -> String {
+        let mut out = String::new();
+        for part in &self.snippet {
+            if part.hit {
+                out.push(extract::HIT_START);
+                out.push_str(&part.text);
+                out.push(extract::HIT_END);
+            } else {
+                out.push_str(&part.text);
+            }
+        }
+        out
+    }
+}
+
+/// Splits a snippet into runs at the hit markers.
+fn snippet_parts(snippet: &str) -> Vec<SnippetPart> {
+    let mut parts = Vec::new();
+    let mut text = String::new();
+    let mut hit = false;
+    for character in snippet.chars() {
+        let boundary = match character {
+            extract::HIT_START => Some(true),
+            extract::HIT_END => Some(false),
+            _ => None,
+        };
+        match boundary {
+            Some(next) => {
+                if !text.is_empty() {
+                    parts.push(SnippetPart {
+                        text: std::mem::take(&mut text),
+                        hit,
+                    });
+                }
+                hit = next;
+            }
+            None => text.push(character),
+        }
+    }
+    if !text.is_empty() {
+        parts.push(SnippetPart { text, hit });
+    }
+    parts
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -388,6 +555,18 @@ pub async fn search(
 ) -> Result<Response, ApiError> {
     let format = Format::of(&headers);
     let search = Search::parse(query, format == Format::Html)?;
+    match search.by {
+        SearchBy::Name => search_names(&app, search, format, &uri).await,
+        SearchBy::Content => search_contents(&app, search, format, &uri).await,
+    }
+}
+
+async fn search_names(
+    app: &App,
+    search: Search,
+    format: Format,
+    uri: &Uri,
+) -> Result<Response, ApiError> {
     let site = search.site.clone();
     let prefix = search.prefix.clone();
     let fragments = search.fragments();
@@ -428,14 +607,94 @@ pub async fn search(
         }
         Format::Tsv => (render_tsv(page), TSV_TYPE),
         Format::Plain => (
-            render_plain(&search, page, total, &uri),
+            render_plain(&search, page, total, uri),
             "text/plain; charset=utf-8",
         ),
         Format::Html => (
-            render_html(&search, page, total, &sites, &uri),
+            render_html(&search, page, total, &sites, uri),
             "text/html; charset=utf-8",
         ),
     };
+    Ok(respond(&search, body, content_type, uri, total, None))
+}
+
+async fn search_contents(
+    app: &App,
+    search: Search,
+    format: Format,
+    uri: &Uri,
+) -> Result<Response, ApiError> {
+    let site = search.site.clone();
+    let prefix = search.prefix.clone();
+    let expression = search.expression.clone();
+    let (limit, offset) = (search.limit, search.offset());
+    let ((total, hits), sites) = app
+        .run_store(move |store| {
+            let page = match &expression {
+                Some(expression) => {
+                    store.search_content(site.as_deref(), &prefix, expression, limit, offset)?
+                }
+                None => (0, Vec::new()),
+            };
+            let sites = if format == Format::Html {
+                store.site_names()?
+            } else {
+                Vec::new()
+            };
+            Ok((page, sites))
+        })
+        .await?;
+    let total = usize::try_from(total).expect("count fits in usize");
+    let hits: Vec<ContentHit> = hits.into_iter().map(ContentHit::from_store).collect();
+    let pending = app.search_indexer.pending();
+    let (body, content_type) = match format {
+        Format::Json => {
+            let results = ContentSearchResults {
+                query: search.query.clone(),
+                by: SearchBy::Content,
+                site: search.site.clone(),
+                path: (!search.prefix.is_empty()).then(|| search.prefix.clone()),
+                total: u64::try_from(total).expect("count fits in u64"),
+                page: u64::try_from(search.page).expect("page fits in u64"),
+                limit: u64::try_from(search.limit).expect("limit fits in u64"),
+                pending,
+                results: hits.iter().map(ContentHit::to_wire).collect(),
+            };
+            (
+                serde_json::to_string(&results).expect("search results serialize"),
+                "application/json",
+            )
+        }
+        Format::Tsv => (render_content_tsv(&hits), TSV_TYPE),
+        Format::Plain => (
+            render_content_plain(&search, &hits, total, uri),
+            "text/plain; charset=utf-8",
+        ),
+        Format::Html => (
+            render_content_html(&search, &hits, total, pending, &sites, uri),
+            "text/html; charset=utf-8",
+        ),
+    };
+    Ok(respond(
+        &search,
+        body,
+        content_type,
+        uri,
+        total,
+        Some(pending),
+    ))
+}
+
+/// The response every format shares: the negotiation and paging headers,
+/// and `Search-Pending` for a content search.
+fn respond(
+    search: &Search,
+    body: String,
+    content_type: &'static str,
+    uri: &Uri,
+    total: usize,
+    pending: Option<u64>,
+) -> Response {
     let mut response = (
         StatusCode::OK,
         [
@@ -446,16 +705,22 @@ pub async fn search(
         Body::from(body),
     )
         .into_response();
+    if let Some(pending) = pending {
+        response.headers_mut().insert(
+            PENDING_HEADER,
+            HeaderValue::from_str(&pending.to_string()).expect("a number is a header value"),
+        );
+    }
     browse::add_paging_headers(
         &mut response,
-        &uri,
+        uri,
         Paging {
             limit: Some(search.limit),
             page: search.page,
         },
         total,
     );
-    Ok(response)
+    response
 }
 
 /// Lets a browser add Symbol as a search engine.
@@ -540,6 +805,12 @@ fn render_plain(search: &Search, hits: &[Hit], total: usize, uri: &Uri) -> Strin
         }
         .push(&mut out, layout);
     }
+    push_plain_footer(&mut out, search, total, uri);
+    out
+}
+
+/// The count, page and next-page line that ends a plain listing.
+fn push_plain_footer(out: &mut String, search: &Search, total: usize, uri: &Uri) {
     let pages = search.pages(total);
     match total {
         0 => out.push_str("no matches\n"),
@@ -555,6 +826,54 @@ fn render_plain(search: &Search, hits: &[Hit], total: usize, uri: &Uri) -> Strin
             out.push('\n');
         }
     }
+}
+
+/// Content hits for the shell client. The title and snippet are one line
+/// each with no tab or control character, and the hits in the snippet are
+/// wrapped in U+E000 and U+E001, which never occur in indexed text.
+fn render_content_tsv(hits: &[ContentHit]) -> String {
+    let mut out = format!("{CONTENT_TSV_HEADER}\n");
+    for hit in hits {
+        let modified = browse::known_time(hit.modified)
+            .map(browse::rfc3339)
+            .unwrap_or_default();
+        writeln!(
+            out,
+            "{}\t{}\t{}\t{modified}\t{}\t{}",
+            hit.site,
+            hit.path,
+            hit.bytes,
+            hit.title,
+            hit.marked_snippet()
+        )
+        .unwrap();
+    }
+    out
+}
+
+/// Content hits for curl: like grep, the file and its title, then the
+/// snippet with the matched words between asterisks.
+fn render_content_plain(search: &Search, hits: &[ContentHit], total: usize, uri: &Uri) -> String {
+    let mut out = String::new();
+    for hit in hits {
+        write!(out, "{}/{}", hit.site, hit.path).unwrap();
+        if !hit.title.is_empty() {
+            write!(out, "  {}", hit.title).unwrap();
+        }
+        out.push('\n');
+        if !hit.snippet.is_empty() {
+            out.push_str("    ");
+            for part in &hit.snippet {
+                if part.hit {
+                    write!(out, "*{}*", part.text).unwrap();
+                } else {
+                    out.push_str(&part.text);
+                }
+            }
+            out.push('\n');
+        }
+    }
+    push_plain_footer(&mut out, search, total, uri);
     out
 }
 
@@ -588,22 +907,14 @@ fn highlight<'a>(name: &'a str, terms: &[Term]) -> Vec<(bool, &'a str)> {
     runs
 }
 
-fn render_html(search: &Search, hits: &[Hit], total: usize, sites: &[String], uri: &Uri) -> String {
-    let scope = match (&search.site, search.prefix.as_str()) {
-        (None, _) => "all sites".to_string(),
-        (Some(site), prefix) => format!("{site}/{prefix}"),
-    };
-    let title = if search.query.is_empty() {
-        "search".to_string()
-    } else {
-        format!("{} · search", search.query)
-    };
-    let pages = search.pages(total);
+/// The page frame both kinds of search share: the header, the form and the
+/// results region, which the script swaps as the reader types.
+fn search_page(search: &Search, sites: &[String], placeholder: &str, results: &Markup) -> String {
     html! {
         (DOCTYPE)
         meta charset="utf-8";
         meta name="viewport" content="width=device-width, initial-scale=1";
-        title { (title) }
+        title { (search.title()) }
         (descriptor_link())
         style {
             (PreEscaped(BASE_STYLE))
@@ -612,7 +923,7 @@ fn render_html(search: &Search, hits: &[Hit], total: usize, sites: &[String], ur
         main {
             header {
                 span { "SEARCH" }
-                span { (scope) }
+                span { (search.scope_label()) }
                 span {
                     a href="/FILES/" { "files" }
                     " · "
@@ -621,7 +932,7 @@ fn render_html(search: &Search, hits: &[Hit], total: usize, sites: &[String], ur
             }
             form.search role="search" method="get" action="/SEARCH" {
                 input type="search" name="q" value=(search.query)
-                    placeholder="file or folder name" aria-label="file or folder name"
+                    placeholder=(placeholder) aria-label=(placeholder)
                     autocomplete="off" spellcheck="false" autofocus[search.query.is_empty()];
                 select name="site" aria-label="site" {
                     option value="" selected[search.site.is_none()] { "all sites" }
@@ -633,60 +944,146 @@ fn render_html(search: &Search, hits: &[Hit], total: usize, sites: &[String], ur
                 }
                 @if !search.prefix.is_empty() {
                     input type="hidden" name="path" value=(search.prefix);
-                    a.chip href=(search.href(search.site.as_deref(), "")) title="search the whole site" {
+                    a.chip href=(search.href(search.site.as_deref(), "", search.by)) title="search the whole site" {
                         (search.prefix) " ×"
                     }
                 }
+                @if search.by == SearchBy::Content {
+                    input type="hidden" name="by" value=(search.by.as_str());
+                }
                 button { "search" }
             }
-            #results aria-live="polite" {
-                @if search.query.is_empty() {
-                    p.hint {
-                        "Type part of a file or folder name. "
-                        code { "*.pdf" } " matches by pattern; a word with a "
-                        code { "/" } " matches whole paths. Press " kbd { "/" } " to search from any listing."
-                    }
-                } @else if total == 0 {
-                    p.hint {
-                        "No file or folder names match “" (search.query) "”."
-                        @if search.site.is_some() {
-                            " " a href=(search.href(None, "")) { "Search all sites" } "."
-                        }
-                    }
-                } @else {
-                    .summary {
-                        span {
-                            (total) @if total == 1 { " match" } @else { " matches" }
-                            @if pages > 1 { " · page " (search.page) " of " (pages) }
-                        }
-                    }
-                    .list {
-                        .row.head role="row" {
-                            span { "name" }
-                            span.meta.files { "files" }
-                            span.meta { "size" }
-                            span.meta { "modified" }
-                        }
-                        @for hit in hits {
-                            (result_row(hit, &search.terms))
-                        }
-                    }
-                    @if pages > 1 {
-                        nav.pager {
-                            @if search.page > 1 {
-                                a href=(browse::page_href(uri, search.page - 1)) rel="prev" { "‹ prev" }
-                            }
-                            @if search.page < pages {
-                                a href=(browse::page_href(uri, search.page + 1)) rel="next" { "next ›" }
-                            }
-                        }
-                    }
-                }
-            }
+            #results aria-live="polite" { (results) }
         }
         (PreEscaped(SEARCH_SCRIPT))
     }
     .into_string()
+}
+
+fn pager(search: &Search, total: usize, uri: &Uri) -> Markup {
+    let pages = search.pages(total);
+    html! {
+        @if pages > 1 {
+            nav.pager {
+                @if search.page > 1 {
+                    a href=(browse::page_href(uri, search.page - 1)) rel="prev" { "‹ prev" }
+                }
+                @if search.page < pages {
+                    a href=(browse::page_href(uri, search.page + 1)) rel="next" { "next ›" }
+                }
+            }
+        }
+    }
+}
+
+fn summary(search: &Search, total: usize) -> Markup {
+    let pages = search.pages(total);
+    html! {
+        .summary {
+            span {
+                (total) @if total == 1 { " match" } @else { " matches" }
+                @if pages > 1 { " · page " (search.page) " of " (pages) }
+            }
+        }
+    }
+}
+
+fn render_html(search: &Search, hits: &[Hit], total: usize, sites: &[String], uri: &Uri) -> String {
+    let results = html! {
+        @if search.query.is_empty() {
+            p.hint {
+                "Type part of a file or folder name. "
+                code { "*.pdf" } " matches by pattern; a word with a "
+                code { "/" } " matches whole paths. Press " kbd { "/" } " to search from any listing."
+            }
+        } @else if total == 0 {
+            p.hint {
+                "No file or folder names match “" (search.query) "”."
+                " " a href=(search.href(search.site.as_deref(), &search.prefix, SearchBy::Content)) { "Search page text instead" } "."
+                @if search.site.is_some() {
+                    " " a href=(search.href(None, "", SearchBy::Name)) { "Search all sites" } "."
+                }
+            }
+        } @else {
+            (summary(search, total))
+            .list {
+                .row.head role="row" {
+                    span { "name" }
+                    span.meta.files { "files" }
+                    span.meta { "size" }
+                    span.meta { "modified" }
+                }
+                @for hit in hits {
+                    (result_row(hit, &search.terms))
+                }
+            }
+            (pager(search, total, uri))
+        }
+    };
+    search_page(search, sites, "file or folder name", &results)
+}
+
+fn render_content_html(
+    search: &Search,
+    hits: &[ContentHit],
+    total: usize,
+    pending: u64,
+    sites: &[String],
+    uri: &Uri,
+) -> String {
+    let results = html! {
+        @if pending > 0 {
+            p.hint { "Indexing " (pending) " new files — results may be incomplete." }
+        }
+        @if search.query.is_empty() {
+            p.hint {
+                "Type words from a page. Every word must appear; "
+                code { "\"a phrase\"" } " must appear together, "
+                code { "-word" } " must not, " code { "OR" } " takes either, and "
+                code { "ext*" } " matches a prefix."
+            }
+        } @else if total == 0 {
+            p.hint {
+                "No pages contain “" (search.query) "”."
+                " " a href=(search.href(search.site.as_deref(), &search.prefix, SearchBy::Name)) { "Search names instead" } "."
+                @if search.site.is_some() {
+                    " " a href=(search.href(None, "", SearchBy::Content)) { "Search all sites" } "."
+                }
+            }
+        } @else {
+            (summary(search, total))
+            .list {
+                @for hit in hits {
+                    (content_row(hit))
+                }
+            }
+            (pager(search, total, uri))
+        }
+    };
+    search_page(search, sites, "words in page text", &results)
+}
+
+fn content_row(hit: &ContentHit) -> Markup {
+    let name = hit.name();
+    let parent = &hit.path[..hit.path.len() - name.len()];
+    html! {
+        a.row href=(hit.url()) {
+            span.name {
+                @if hit.title.is_empty() { (name) } @else { (hit.title) }
+                " " span.dim { (hit.site) "/" (parent) (name) }
+            }
+            span.meta.files {}
+            span.meta { (browse::size_label(hit.bytes)) }
+            (browse::date_cell(Some(hit.modified)))
+        }
+        @if !hit.snippet.is_empty() {
+            p.snippet {
+                @for part in &hit.snippet {
+                    @if part.hit { mark { (part.text) } } @else { (part.text) }
+                }
+            }
+        }
+    }
 }
 
 fn result_row(hit: &Hit, terms: &[Term]) -> Markup {

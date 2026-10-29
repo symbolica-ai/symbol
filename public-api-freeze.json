@@ -169,7 +169,7 @@
         "success_statuses": [200],
         "error_statuses": [400, 404, 500],
         "request_headers": ["Accept"],
-        "response_headers": ["Content-Type", "Cache-Control", "Entry-Count", "Link", "Vary"]
+        "response_headers": ["Content-Type", "Cache-Control", "Entry-Count", "Link", "Search-Pending", "Vary"]
       },
       {
         "name": "search descriptor",

@@ -89,7 +89,7 @@ use mutation::*;
 mod rows;
 
 mod search;
-pub use search::{SearchCandidate, normalize_search_prefix};
+pub use search::{ContentHit, SEARCH_FILE, SearchCandidate, Unindexed, normalize_search_prefix};
 
 mod undo;
 #[allow(clippy::wildcard_imports)] // see the note in the child module
@@ -122,6 +122,9 @@ struct Inner {
     root: PathBuf,
     writer: Mutex<SqliteConnection>,
     readers: ReaderPool,
+    /// The indexer's connection to the content index, `search.sqlite`, with
+    /// the main database attached read-only as `live`; see `store::search`.
+    search: Mutex<SqliteConnection>,
     blobs: BlobCache,
     blob_files: BlobFiles,
     metrics: Arc<Metrics>,
@@ -521,12 +524,20 @@ struct SiteArchive {
 }
 
 impl ReaderPool {
-    fn open(path: &Path, count: usize, metrics: Arc<Metrics>) -> Result<Self, StoreError> {
+    /// Read-only connections to the database at `path`, each with the
+    /// content index at `search` attached read-only under that name.
+    fn open(
+        path: &Path,
+        search: &Path,
+        count: usize,
+        metrics: Arc<Metrics>,
+    ) -> Result<Self, StoreError> {
         let mut available = Vec::with_capacity(count);
         for _ in 0..count {
             let database_url = format!("file:{}?mode=ro", path.display());
             let mut connection = SqliteConnection::establish(&database_url)?;
             connection.batch_execute("PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON;")?;
+            connection.batch_execute(&search::attach_read_only(search, "search"))?;
             available.push(connection);
         }
         Ok(Self {
@@ -786,6 +797,9 @@ impl Store {
              PRAGMA foreign_keys = ON;",
         )?;
         run_migrations(&mut db)?;
+        // The index file and its tables must exist before the readers attach it.
+        let search = search::open_search_index(&root, &path)
+            .map_err(|error| StoreError::startup("open content index", error))?;
         let reader_count = std::thread::available_parallelism()
             .map_or(4, std::num::NonZeroUsize::get)
             .clamp(2, MAX_READ_CONNECTIONS);
@@ -793,9 +807,15 @@ impl Store {
         let blob_files = BlobFiles::new(root.join("blobs"))?;
         let store = Self {
             inner: Arc::new(Inner {
+                readers: ReaderPool::open(
+                    &path,
+                    &root.join(SEARCH_FILE),
+                    reader_count,
+                    Arc::clone(&metrics),
+                )?,
                 root,
                 writer: Mutex::new(db),
-                readers: ReaderPool::open(&path, reader_count, Arc::clone(&metrics))?,
+                search: Mutex::new(search),
                 blobs: BlobCache::new(
                     DEFAULT_BLOB_CACHE_BYTES,
                     DEFAULT_BLOB_CACHE_ENTRIES,
